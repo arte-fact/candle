@@ -572,6 +572,78 @@ impl candle::CustomOp2 for RmsNorm {
         Ok((dst, l1.shape().clone()))
     }
 
+    #[cfg(feature = "hip")]
+    fn hip_fwd(
+        &self,
+        s1: &candle::HipStorage,
+        l1: &Layout,
+        s2: &candle::HipStorage,
+        l2: &Layout,
+    ) -> Result<(candle::HipStorage, Shape)> {
+        use candle::hip_backend::hipdarc::driver::{
+            DeviceRepr, HipSlice, LaunchConfig, ValidAsZeroBits,
+        };
+        use candle::hip_backend::{kernels, Map2, WrapErr};
+        use candle::{hip_backend::HipDevice, WithDType};
+
+        struct S {
+            eps: f32,
+        }
+        impl Map2 for S {
+            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+                &self,
+                src: &HipSlice<T>,
+                layout: &Layout,
+                alpha: &HipSlice<T>,
+                alpha_layout: &Layout,
+                dev: &HipDevice,
+            ) -> Result<HipSlice<T>> {
+                let src = match layout.contiguous_offsets() {
+                    None => candle::bail!("input has to be contiguous"),
+                    Some((o1, o2)) => src.slice(o1..o2),
+                };
+                let alpha = match alpha_layout.contiguous_offsets() {
+                    None => candle::bail!("alpha has to be contiguous"),
+                    Some((o1, o2)) => alpha.slice(o1..o2),
+                };
+                let el = layout.shape().elem_count();
+                let dims = layout.shape().dims();
+                let dim_m1 = dims[dims.len() - 1];
+                let (n_rows, n_cols) = (el / dim_m1, dim_m1);
+
+                let block_size = if n_cols < 1024 { 32 } else { 1024 };
+                let cfg = LaunchConfig {
+                    grid_dim: (n_rows as u32, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let kernel_name = format!("rmsnorm_{}", T::DTYPE.as_str());
+                let func = dev.get_or_load_func(&kernel_name, &kernels::REDUCE)?;
+                let dst = unsafe { dev.alloc::<T>(el)? };
+                let mut builder = func.builder();
+                builder.arg(&src);
+                builder.arg(&dst);
+                builder.arg(&alpha);
+                let n_cols_i32 = n_cols as i32;
+                let block_size_i32 = block_size as i32;
+                builder.arg(&n_cols_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(&self.eps);
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(dst)
+            }
+        }
+
+        use candle::backend::BackendStorage;
+        let dev = s1.device();
+        let slice = S { eps: self.eps }.map(&s1.slice, l1, &s2.slice, l2, dev)?;
+        let dst = candle::HipStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
