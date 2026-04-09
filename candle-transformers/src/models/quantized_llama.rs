@@ -502,8 +502,7 @@ impl ModelWeights {
         if devices.is_empty() {
             candle::bail!("at least one device required");
         }
-        // Don't shortcut to from_gguf — the sharded path keeps embeddings
-        // on CPU which avoids device mismatches with the inference loop.
+        // Even with 1 GPU, use the sharded path for consistent behavior.
 
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
@@ -535,20 +534,19 @@ impl ModelWeights {
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
-        // Embeddings and output stay on CPU to save GPU VRAM.
-        // Embedding lookup is cheap; the result gets transferred to the first GPU.
-        let cpu = &Device::Cpu;
+        // Embeddings and output on the first GPU (same device as token tensors).
+        let dev0 = &devices[0];
 
-        let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, cpu)?;
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, cpu)?;
+        let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, dev0)?;
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, dev0)?;
 
-        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", cpu)?;
-        let tok_embeddings = tok_embeddings_q.dequantize(cpu)?;
+        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", dev0)?;
+        let tok_embeddings = tok_embeddings_q.dequantize(dev0)?;
         let norm = RmsNorm::from_qtensor(
-            ct.tensor(reader, "output_norm.weight", cpu)?,
+            ct.tensor(reader, "output_norm.weight", dev0)?,
             rms_norm_eps,
         )?;
-        let output = match ct.tensor(reader, "output.weight", cpu) {
+        let output = match ct.tensor(reader, "output.weight", dev0) {
             Ok(tensor) => tensor,
             Err(_) => tok_embeddings_q,
         };
@@ -708,13 +706,7 @@ impl ModelWeights {
             Some(self.mask(seq_len, index_pos, x.device())?)
         };
         let _enter = self.span.enter();
-        // Embedding is on CPU — move token IDs to CPU if needed
-        let x_for_embed = if x.device().is_cpu() {
-            x.clone()
-        } else {
-            x.to_device(&Device::Cpu)?
-        };
-        let mut layer_in = self.tok_embeddings.forward(&x_for_embed)?;
+        let mut layer_in = self.tok_embeddings.forward(x)?;
         for layer in self.layers.iter_mut() {
             // Transfer activations to this layer's device if needed
             if !layer_in.device().same_device(&layer.device) {
@@ -740,10 +732,12 @@ impl ModelWeights {
             let x = (x + residual)?;
             layer_in = x
         }
-        // In layer-split mode, norm and output are on CPU.
-        // Move final activations to CPU if needed.
-        if !layer_in.device().is_cpu() {
-            layer_in = layer_in.to_device(&Device::Cpu)?;
+        // Norm/output are on the embedding device (first GPU).
+        // Transfer if last layer was on a different device.
+        // Hip→Hip goes via CPU automatically in to_device.
+        let embed_device = self.tok_embeddings.embeddings().device();
+        if !layer_in.device().same_device(embed_device) {
+            layer_in = layer_in.to_device(embed_device)?;
         }
         let x = self.norm.forward(&layer_in)?;
         let x = x.i((.., seq_len - 1, ..))?;

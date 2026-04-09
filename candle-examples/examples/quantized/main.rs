@@ -472,7 +472,18 @@ fn main() -> anyhow::Result<()> {
     let model_path = args.model()?;
     let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
-    let device = candle_examples::device(args.cpu)?;
+
+    // For multi-GPU, create all devices and use GPU 0 as the primary device.
+    // Token tensors and embeddings both live on the primary device.
+    let (device, gpu_devices) = if args.num_gpus > 1 {
+        let devices: Vec<candle::Device> = (0..args.num_gpus)
+            .map(|g| candle::Device::new_hip(g).or_else(|_| candle::Device::new_cuda(g)))
+            .collect::<candle::Result<_>>()?;
+        let primary = devices[0].clone();
+        (primary, Some(devices))
+    } else {
+        (candle_examples::device(args.cpu)?, None)
+    };
 
     let mut model = match model_path.extension().and_then(|v| v.to_str()) {
         Some("gguf") => {
@@ -489,13 +500,9 @@ fn main() -> anyhow::Result<()> {
                 &format_size(total_size_in_bytes),
                 start.elapsed().as_secs_f32(),
             );
-            if args.num_gpus > 1 {
-                let devices: Vec<_> = (0..args.num_gpus)
-                    .map(|g| candle::Device::new_hip(g).or_else(|_| candle::Device::new_cuda(g)))
-                    .collect::<candle::Result<_>>()?;
-                ModelWeights::from_gguf_sharded(model, &mut file, &devices)?
-            } else {
-                ModelWeights::from_gguf(model, &mut file, &device)?
+            match &gpu_devices {
+                Some(devices) => ModelWeights::from_gguf_sharded(model, &mut file, devices)?,
+                None => ModelWeights::from_gguf(model, &mut file, &device)?,
             }
         }
         Some("ggml" | "bin") | Some(_) | None => {
