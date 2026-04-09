@@ -735,6 +735,11 @@ impl ModelWeights {
             let x = (x + residual)?;
             layer_in = x
         }
+        // In layer-split mode, norm and output are on CPU.
+        // Move final activations to CPU if needed.
+        if !layer_in.device().is_cpu() {
+            layer_in = layer_in.to_device(&Device::Cpu)?;
+        }
         let x = self.norm.forward(&layer_in)?;
         let x = x.i((.., seq_len - 1, ..))?;
         let _enter = self.span_output.enter();
