@@ -65,11 +65,111 @@ fn main() -> Result<()> {
         println!("  GPU {g}: 64x64 matmul [0][0] = {val:.4}");
     }
 
-    // Test 5: RCCL AllReduce (multi-process)
-    println!("\n=== Test 5: RCCL AllReduce ===");
-    println!("  Skipped — requires iommu=pt kernel boot parameter.");
-    println!("  Add 'iommu=pt' to GRUB_CMDLINE_LINUX in /etc/default/grub,");
-    println!("  then: sudo update-grub && sudo reboot");
+    // Test 5: RCCL AllReduce (multi-process, requires iommu=pt)
+    println!("\n=== Test 5: RCCL AllReduce ({num_gpus} GPUs) ===");
+    {
+        use hipdarc::rccl::{Comm, DataType, NcclUniqueId, ReduceOp};
+        use std::sync::Arc;
+
+        // Single-process multi-device: init all comms in one process
+        let id = NcclUniqueId::new().map_err(|e| anyhow::anyhow!("RCCL: {e}"))?;
+
+        // CommInitRank is a blocking collective — all ranks must call it
+        // concurrently. Use threads to avoid deadlock.
+        let handles: Vec<_> = (0..num_gpus)
+            .map(|g| {
+                let id = id;
+                std::thread::spawn(move || -> Result<(Device, Arc<Comm>)> {
+                    let dev = Device::new_hip(g)?;
+                    let hip = dev.as_hip_device()?;
+                    let comm = Comm::new(num_gpus, id, g, hip.stream())
+                        .map_err(|e| anyhow::anyhow!("RCCL init GPU {g}: {e}"))?;
+                    Ok((dev, Arc::new(comm)))
+                })
+            })
+            .collect();
+
+        let mut devs = Vec::new();
+        let mut comms = Vec::new();
+        for (g, h) in handles.into_iter().enumerate() {
+            let (dev, comm) = h.join().map_err(|_| anyhow::anyhow!("Thread {g} panicked"))??;
+            devs.push(dev);
+            comms.push(comm);
+        }
+        println!("  All {num_gpus} communicators initialized");
+
+        // Use CustomOp1 to access storage internals
+        struct AllReduceTest(Arc<Comm>);
+        impl candle_core::CustomOp1 for AllReduceTest {
+            fn name(&self) -> &'static str { "allreduce_test" }
+            fn cpu_fwd(&self, _: &candle_core::CpuStorage, _: &candle_core::Layout)
+                -> candle_core::Result<(candle_core::CpuStorage, candle_core::Shape)> {
+                candle_core::bail!("cpu not supported")
+            }
+            fn hip_fwd(&self, s: &candle_core::HipStorage, l: &candle_core::Layout)
+                -> candle_core::Result<(candle_core::HipStorage, candle_core::Shape)> {
+                use candle_core::backend::BackendStorage;
+                let dev = s.device();
+                let n = l.shape().elem_count();
+                let src_slice = match &s.slice {
+                    candle_core::hip_backend::HipStorageSlice::F32(sl) => sl,
+                    _ => candle_core::bail!("f32 only"),
+                };
+                // Ensure correct GPU context in this thread
+                dev.stream().device().set_current()
+                    .map_err(|e| candle_core::Error::Msg(format!("set_current: {e}")))?;
+                // Out-of-place AllReduce: separate src and dst buffers
+                let dst_slice = dev.alloc_zeros::<f32>(n)?;
+                dev.stream().synchronize().map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+                unsafe {
+                    self.0.all_reduce(
+                        src_slice.device_ptr() as *const _,
+                        dst_slice.device_ptr() as *mut _,
+                        n,
+                        DataType::Float32, ReduceOp::Sum, dev.stream())
+                        .map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+                }
+                dev.stream().synchronize().map_err(|e| candle_core::Error::Msg(format!("{e}")))?;
+                Ok((candle_core::HipStorage {
+                    slice: candle_core::hip_backend::HipStorageSlice::F32(dst_slice),
+                    device: dev.clone(),
+                }, l.shape().clone()))
+            }
+        }
+
+        // AllReduce is also a collective — all ranks must call concurrently.
+        let expected: f32 = (1..=num_gpus).map(|r| r as f32).sum();
+
+        // Create inputs on each GPU
+        let mut inputs = Vec::new();
+        for g in 0..num_gpus {
+            let v = (g + 1) as f32;
+            inputs.push(Tensor::new(&[v, v * 10.0, v * 100.0], &devs[g])?);
+        }
+
+        // Launch AllReduce on all GPUs concurrently via threads
+        let ar_handles: Vec<_> = (0..num_gpus)
+            .map(|g| {
+                let input = inputs[g].clone();
+                let comm = comms[g].clone();
+                std::thread::spawn(move || -> Result<Vec<f32>> {
+                    let op = AllReduceTest(comm);
+                    let output = input.apply_op1_no_bwd(&op)?;
+                    Ok(output.to_vec1::<f32>()?)
+                })
+            })
+            .collect();
+
+        for (g, h) in ar_handles.into_iter().enumerate() {
+            let result = h.join().map_err(|_| anyhow::anyhow!("AR thread {g} panicked"))??;
+            println!(
+                "  GPU {g}: allreduce = {:?} (expected [{expected}, {}, {}])",
+                result, expected * 10.0, expected * 100.0,
+            );
+            assert!((result[0] - expected).abs() < 0.01, "Mismatch on GPU {g}");
+        }
+        println!("  RCCL AllReduce verified!");
+    }
 
     println!("\nAll multi-GPU tests passed!");
     Ok(())

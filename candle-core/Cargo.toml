@@ -85,3 +85,7 @@ required-features = ["hip"]
 [[example]]
 name = "hip_multi_gpu_test"
 required-features = ["hip"]
+
+[[example]]
+name = "hip_rccl_raw_test"
+required-features = ["hip"]

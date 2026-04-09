@@ -62,6 +62,8 @@ pub enum DataType {
 }
 
 extern "C" {
+    fn ncclGroupStart() -> NcclResult;
+    fn ncclGroupEnd() -> NcclResult;
     fn ncclGetUniqueId(id: *mut NcclUniqueId) -> NcclResult;
     fn ncclCommInitRank(
         comm: *mut NcclComm,
@@ -194,6 +196,18 @@ impl Comm {
             stream.raw(),
         ))
     }
+}
+
+/// Start a group of RCCL operations. All collective calls between
+/// `group_start` and `group_end` are batched and launched together.
+/// This allows calling AllReduce for multiple communicators from a single thread.
+pub fn group_start() -> Result<(), RcclError> {
+    unsafe { check(ncclGroupStart()) }
+}
+
+/// End a group of RCCL operations and launch them.
+pub fn group_end() -> Result<(), RcclError> {
+    unsafe { check(ncclGroupEnd()) }
 }
 
 impl Drop for Comm {
