@@ -41,22 +41,32 @@ are already compiled, they just need to be wired into Candle's `QStorage` system
 
 ---
 
-## Phase 2 — Multi-GPU & Tensor Parallelism
+## Phase 2 — Multi-GPU & Layer-Split Parallelism
 
-**Goal**: Run large models across 4×MI50 (64GB total). RCCL for collectives,
-tensor-parallel sharding following candle's existing `llama_multiprocess` pattern.
-MI50 has no P2P — RCCL routes AllReduce through host memory automatically.
+**Goal**: Run large models across 4×MI50 (64GB total). Use **layer-split**
+parallelism (not tensor-parallel) following llamacpp-turbo's default approach.
+Each GPU gets N/4 layers, activations flow GPU→CPU→GPU between stages.
+
+> **RCCL status**: RCCL 2.27.7 AllReduce segfaults on gfx906 PCIe — confirmed
+> in pure C. RCCL bindings are implemented in hipdarc but unusable until a
+> working RCCL version is found or ROCm fixes the issue. Layer-split avoids
+> RCCL entirely.
 
 | # | Task | Reference |
 |---|------|-----------|
-| 2.1 | **RCCL FFI bindings**: Add `rccl` module to hipdarc — `rcclCommInitRank`, `rcclAllReduce`, `rcclGetUniqueId`, `rcclCommDestroy`. Same API as NCCL (drop-in compatible). ~200 lines. | `cudarc::nccl` |
-| 2.2 | **AllReduce CustomOp**: Port the `AllReduce` struct from `llama_multiprocess/model.rs` — wraps `rcclAllReduce` as a `CustomOp1` with `hip_fwd`. ~100 lines. | `llama_multiprocess/model.rs:40-82` |
-| 2.3 | **Tensor-parallel LLaMA model**: Port `llama_multiprocess/model.rs` to use HIP devices + RCCL. Column-parallel linear for QKV, row-parallel for output, AllReduce after each TP layer. | `llama_multiprocess/model.rs` |
-| 2.4 | **Multi-process launcher**: Spawn N processes (one per GPU), each creates `HipDevice::new(rank)`, shares RCCL unique ID via env var. | `llama_multiprocess/main.rs` |
-| 2.5 | **Quantized TP**: Extend QMatMul to shard quantized weights across GPUs. Each GPU holds 1/N of the weight matrix. | — |
-| 2.6 | **Test with Devstral 24B**: 14GB model split across 2×MI50. Verify correct output and measure throughput. | — |
+| 2.1 | **DONE** — RCCL FFI bindings in hipdarc (group API, CommInitRank, AllReduce). Blocked by RCCL segfault. | `hipdarc/src/rccl.rs` |
+| 2.2 | **DONE** — Multi-device support: create tensors, matmul, transfer via CPU on all 4 GPUs. | `hip_multi_gpu_test` |
+| 2.3 | **Layer-split model runner**: Assign layers to GPUs by index range. GPU 0 gets layers 0..N/4, GPU 1 gets N/4..N/2, etc. Forward pass moves activations between stages via CPU. | llamacpp-turbo `LLAMA_SPLIT_MODE_LAYER` |
+| 2.4 | **Sharded GGUF loader**: Each GPU loads only its layer range from the GGUF file. Parse metadata once, seek to tensor offsets per device. Avoid OOM from loading full model. | — |
+| 2.5 | **Pipeline driver**: Orchestrate forward pass across devices. Token embeddings on GPU 0, final norm + output on last GPU, intermediate activations transferred via `to_device(Cpu).to_device(next_gpu)`. | — |
+| 2.6 | **Test with Devstral 24B**: 14GB model split across 2-3 MI50s. Verify correct output. | — |
 
 **Exit criteria**: Devstral-24B-Q4 runs across 2+ MI50s with correct output.
+
+> **Future**: When RCCL is fixed (newer ROCm or different RCCL build), tensor
+> parallelism with AllReduce can be enabled using the existing hipdarc::rccl
+> bindings. This would give better throughput than layer-split for latency-bound
+> generation.
 
 ---
 
@@ -202,6 +212,7 @@ Phases 3 and 4 can proceed in parallel after Phase 2.
 | **No FP8 support** | F8E4M3 gated out (`UnsupportedDtype`). GFX906 has no FP8 hardware. | No impact — FP8 is CDNA2+ only. | Never for gfx906; add for gfx90a+ if targeting MI250X. |
 | **BF16 emulated** | All bf16 math goes through f32 promotion. Correct but ~3× slower than native. | Acceptable for Phase 0-1. | Phase 2 — consider keeping activations in f16 instead of bf16. |
 | **Raw ELF HSACO** | `--no-gpu-bundle-output` to avoid Clang offload bundle. | Works but limits to single arch per build. | Multi-arch support: remove flag, let runtime unbundle. |
+| **RCCL broken on gfx906** | RCCL 2.27.7 (ROCm 7.1.1) segfaults in ncclAllReduce on MI50 PCIe, even in pure C with iommu=pt. 2-GPU and 4-GPU both crash. | No tensor parallelism via AllReduce. Layer-split used instead. | Try RCCL from ROCm 6.x, or build RCCL from source with gfx906 fixes. |
 | **PASCAL-era MMQ tiles** | All quantized MMQ kernels use 64×64 tiles (renamed to GFX906). | Correctness OK, not perf-optimal. | Phase 2 — tune tile sizes per quant type for gfx906 LDS. |
 
 ---
