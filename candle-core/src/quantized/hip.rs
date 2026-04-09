@@ -43,7 +43,8 @@ pub const WARP_SIZE: usize = 64;
 pub const MMQ_X_Q4_0_GFX906: usize = 64;
 pub const MMQ_Y_Q4_0_GFX906: usize = 64;
 pub const NWARPS_Q4_0_GFX906: usize = 8;
-pub const GGML_CUDA_MMV_X: usize = 64;
+// Must match GGML_CUDA_DMMV_X in quantized.cu (hardcoded 32, not WARP_SIZE).
+pub const GGML_CUDA_MMV_X: usize = 32;
 pub const GGML_CUDA_MMV_Y: usize = 1;
 pub const CUDA_QUANTIZE_BLOCK_SIZE: usize = 256;
 pub const CUDA_DEQUANTIZE_BLOCK_SIZE: usize = 256;
@@ -267,7 +268,7 @@ fn dequantize_mul_mat_vec(
     let block_num_y = ceil_div(nrows, GGML_CUDA_MMV_Y);
     let cfg = hipdarc::driver::LaunchConfig {
         grid_dim: (block_num_y as u32, 1, 1),
-        block_dim: (WARP_SIZE as u32, GGML_CUDA_MMV_Y as u32, 1),
+        block_dim: (GGML_CUDA_MMV_X as u32, GGML_CUDA_MMV_Y as u32, 1),
         shared_mem_bytes: 0,
     };
 

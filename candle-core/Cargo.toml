@@ -89,3 +89,7 @@ required-features = ["hip"]
 [[example]]
 name = "hip_rccl_raw_test"
 required-features = ["hip"]
+
+[[example]]
+name = "hip_correctness_test"
+required-features = ["hip"]
