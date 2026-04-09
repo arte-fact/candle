@@ -41,54 +41,59 @@ are already compiled, they just need to be wired into Candle's `QStorage` system
 
 ---
 
-## Phase 2 — GFX906 Wave64 Kernel Optimizations
+## Phase 2 — Multi-GPU & Tensor Parallelism
 
-**Goal**: Replace hipified baseline kernels with tuned GFX906 variants, porting
-proven optimizations from llamacpp-turbo.
+**Goal**: Run large models across 4×MI50 (64GB total). RCCL for collectives,
+tensor-parallel sharding following candle's existing `llama_multiprocess` pattern.
+MI50 has no P2P — RCCL routes AllReduce through host memory automatically.
 
-| # | Task | Source (llamacpp-turbo) |
-|---|------|------------------------|
-| 2.1 | **DPP warp primitives library**: Port `gfx906-common.cuh` — DPP-based shuffles (`hip_add_xor{1,2,8}_f32`, `hip_shuffle_xor{4,16}_f32`), `__builtin_amdgcn_readfirstlane`, inline ASM for `v_exp_f32`, `v_log_f32`, `v_rcp_f32`. Build as shared header for all gfx906 kernels. | `gfx906-common.cuh` |
-| 2.2 | **Reduction kernels**: Replace generic warp shuffles with 6-stage Wave64 DPP unrolled reduction (xor1→xor2→xor8→xor16→xor32→shift). Apply to `reduce.cu` (sum, max, min, argmax, argmin, softmax). | `gfx906/quantize/vecdotq.cuh` |
-| 2.3 | **Unary fast-math**: Use GCN ISA intrinsics (`v_exp_f32`, `v_log_f32`, `v_rcp_f32`, `v_rsq_f32`) for exp, log, recip, rsqrt paths when precision allows. Keep f64 on generic path. | `gfx906-common.cuh` |
-| 2.4 | **Matmul tuning**: Tune rocBLAS GEMM tile sizes. For small/medium batches (M<2048), implement custom SGEMM with 32×64×64 tiles and 2-warp register pressure sweet spot. Add gfx906-specific `ROCBLAS_GEMM_FLAGS` env override. | `gfx906/matmul/mmf-sgemm.cuh` |
-| 2.5 | **Memory access patterns**: Add shared-memory padding (+4 elements) to avoid LDS bank conflicts. Enforce 64KB LDS limit (not 160KB). Use vectorized 32-bit loads where applicable. | `gfx906-config.h` |
-| 2.6 | **Launch config tuning**: Create `gfx906-config.h` with tuned launch bounds — 64-thread blocks for MMVQ, 256 threads for bandwidth-bound ops, `num_warps=2` default for register pressure. | `gfx906-config.h` |
-| 2.7 | **Warp-cooperative MMVQ kernels**: Port `gfx906_mul_mat_vec_q4_0_warp_coop` for Q4_0, Q4_1, Q8_0. | `gfx906/matmul/mmvq-q4_0.cuh` |
-| 2.8 | **VecDotQ with DPP**: Port dot-product accumulation using DPP reductions. | `gfx906/quantize/vecdotq.cuh` |
+| # | Task | Reference |
+|---|------|-----------|
+| 2.1 | **RCCL FFI bindings**: Add `rccl` module to hipdarc — `rcclCommInitRank`, `rcclAllReduce`, `rcclGetUniqueId`, `rcclCommDestroy`. Same API as NCCL (drop-in compatible). ~200 lines. | `cudarc::nccl` |
+| 2.2 | **AllReduce CustomOp**: Port the `AllReduce` struct from `llama_multiprocess/model.rs` — wraps `rcclAllReduce` as a `CustomOp1` with `hip_fwd`. ~100 lines. | `llama_multiprocess/model.rs:40-82` |
+| 2.3 | **Tensor-parallel LLaMA model**: Port `llama_multiprocess/model.rs` to use HIP devices + RCCL. Column-parallel linear for QKV, row-parallel for output, AllReduce after each TP layer. | `llama_multiprocess/model.rs` |
+| 2.4 | **Multi-process launcher**: Spawn N processes (one per GPU), each creates `HipDevice::new(rank)`, shares RCCL unique ID via env var. | `llama_multiprocess/main.rs` |
+| 2.5 | **Quantized TP**: Extend QMatMul to shard quantized weights across GPUs. Each GPU holds 1/N of the weight matrix. | — |
+| 2.6 | **Test with Devstral 24B**: 14GB model split across 2×MI50. Verify correct output and measure throughput. | — |
 
-**Exit criteria**: Benchmark suite shows measurable throughput improvement over Phase 0/1 hipified kernels on MI50.
+**Exit criteria**: Devstral-24B-Q4 runs across 2+ MI50s with correct output.
 
 ---
 
-## Phase 3 — Flash Attention for GCN
+## Phase 3 — GFX906 Kernel Optimizations & Tradeoff Resolution
+
+**Goal**: Maximum performance. Replace baseline kernels with tuned GFX906
+variants from llamacpp-turbo. Resolve all Phase 0/1 tradeoffs.
+
+| # | Task | Source |
+|---|------|--------|
+| 3.1 | **DPP warp primitives**: Port `gfx906-common.cuh` — DPP shuffles, `__builtin_amdgcn_readfirstlane`, GCN ISA intrinsics. | `gfx906-common.cuh` |
+| 3.2 | **Wave64 tuned reductions**: 6-stage DPP unrolled reduction for reduce.cu. | `gfx906/quantize/vecdotq.cuh` |
+| 3.3 | **Fast-math unary**: GCN ISA intrinsics (`v_exp_f32`, `v_log_f32`, `v_rcp_f32`). | `gfx906-common.cuh` |
+| 3.4 | **MMVQ warp-cooperative kernels**: Port half-warp MVMs for Q4_0, Q4_1, Q8_0. | `gfx906/matmul/mmvq-q4_0.cuh` |
+| 3.5 | **VecDotQ with DPP**: DPP-based dot-product accumulation. | `gfx906/quantize/vecdotq.cuh` |
+| 3.6 | **MMQ tile tuning**: Profile per-quant-type tile sizes for gfx906 64KB LDS. | `gfx906-config.h` |
+| 3.7 | **Resolve CPU RNG**: Fix hiprand/rocrand segfault or implement GPU-side RNG. | Phase 0 tradeoff |
+| 3.8 | **BF16 strategy**: Profile bf16 emulation overhead, decide f16 vs bf16 for activations. | Phase 0 tradeoff |
+| 3.9 | **rocBLAS GEMM tuning**: Custom SGEMM for small batches, `ROCBLAS_GEMM_FLAGS` override. | `gfx906/matmul/mmf-sgemm.cuh` |
+| 3.10 | **HIP graphs**: Capture repeated kernel sequences for 8-10% throughput gain. | llamacpp-turbo `GGML_HIP_GRAPHS` |
+
+**Exit criteria**: Measurable throughput improvement over Phase 0/1. Quantized tg64 within 80% of llamacpp-turbo on same model.
+
+---
+
+## Phase 4 — Flash Attention for GCN
 
 **Goal**: Performant attention for long-context inference on GFX906.
 
 | # | Task | Source |
 |---|------|--------|
-| 3.1 | Create `candle-flash-attn-hip` crate. Cannot use CUTLASS (NVIDIA-only) — implement tile-based attention from scratch or adapt Composable Kernel (CK) library from AMD. | — |
-| 3.2 | **Q8 tile attention kernels**: Port tile-based FA kernels for head sizes 64, 96, 128, 256 from llamacpp-turbo. GCN-specific tile dimensions, 64KB LDS limit, Wave64 reductions. | `gfx906/attention/` |
-| 3.3 | **RoPE kernel**: Port custom `__sincosf()`-based RoPE with YaRN extended context and multi-RoPE section support. 256 threads/block for bandwidth. | `gfx906/attention/rope.cu` |
-| 3.4 | **Attention dispatch**: Integrate into Candle's `ScaledDotProductAttention` custom op. GQA support (gqa2, gqa4, gqa8). | `candle-nn/src/ops.rs` |
-| 3.5 | **Causal mask + ALiBi**: Support causal masking and ALiBi position bias within the fused kernel. | — |
+| 4.1 | Create `candle-flash-attn-hip` crate. Custom tile-based attention (no CUTLASS). | — |
+| 4.2 | **Q8 tile attention kernels**: Port from llamacpp-turbo for head sizes 64, 96, 128, 256. | `gfx906/attention/` |
+| 4.3 | **RoPE kernel**: Custom `__sincosf()`-based RoPE with YaRN support. | `gfx906/attention/rope.cu` |
+| 4.4 | **GQA + causal mask**: Grouped query attention dispatch. | `candle-nn/src/ops.rs` |
 
-**Exit criteria**: Flash attention benchmark within 2× of CUDA FA on equivalent compute, supports 32K+ context on 16GB MI50.
-
----
-
-## Phase 4 — Multi-GPU & Tensor Parallelism
-
-**Goal**: Scale across multiple MI50s (PCIe, no P2P).
-
-| # | Task | Notes |
-|---|------|-------|
-| 4.1 | **RCCL integration**: Add `rccl` feature flag. Implement AllReduce, AllGather, ReduceScatter over PCIe (no P2P on MI50). | Analogous to `nccl` feature |
-| 4.2 | **Pipeline parallelism**: Layer-wise distribution across GPUs. No row-split (requires P2P). | llamacpp-turbo uses `--split-mode row` over pipeline |
-| 4.3 | **KV cache sharding**: Distribute KV cache across GPU memories for extended context. | — |
-| 4.4 | **HIP graphs**: Implement graph capture for repeated kernel sequences (+8-10% throughput from llamacpp-turbo measurements). | llamacpp-turbo `GGML_HIP_GRAPHS` |
-
-**Exit criteria**: 4×MI50 tensor-parallel inference with linear-ish scaling on memory-bound models.
+**Exit criteria**: 32K+ context on 16GB MI50, within 2× of CUDA FA perf.
 
 ---
 
@@ -98,13 +103,13 @@ proven optimizations from llamacpp-turbo.
 
 | # | Task | Source |
 |---|------|--------|
-| 5.1 | **Fused RMS-norm + quantize**: Single kernel for norm→quantize path, eliminating intermediate global memory round-trip. | `gfx906/fused/norm-fused-q8.cu` |
-| 5.2 | **Fused MoE dispatch**: Reduce kernel launch count for MoE models — port `moe_gguf.cu` patterns with GFX906 tuning. | `candle-kernels/src/moe/` |
-| 5.3 | **TurboQuant (3.5-bit KV cache)**: Port WHT rotation + turbo3 dequant for extreme KV compression (3.3× more context than f16). | llamacpp-turbo turbo3 system |
-| 5.4 | **Operator fusion pass**: Identify and fuse common subgraphs (layernorm→linear, attention→output projection) using HIP graph capture. | — |
-| 5.5 | **Software pipelining**: Overlap memory loads with compute in MMQ kernels. Double-buffered shared memory. | `gfx906/matmul/` |
+| 5.1 | **Fused RMS-norm + quantize**: Eliminate intermediate global memory round-trip. | `gfx906/fused/norm-fused-q8.cu` |
+| 5.2 | **Fused MoE dispatch**: Reduce kernel launch count for MoE models. | `candle-kernels/src/moe/` |
+| 5.3 | **TurboQuant (3.5-bit KV)**: WHT rotation + turbo3 dequant. | llamacpp-turbo turbo3 system |
+| 5.4 | **Operator fusion**: Fuse layernorm→linear, attention→output via HIP graphs. | — |
+| 5.5 | **Software pipelining**: Double-buffered shared memory in MMQ kernels. | `gfx906/matmul/` |
 
-**Exit criteria**: Token generation throughput matches or exceeds llamacpp-turbo fork numbers on equivalent models.
+**Exit criteria**: Token generation throughput matches or exceeds llamacpp-turbo.
 
 ---
 
@@ -175,17 +180,17 @@ candle (workspace)
 ## Estimated Complexity & Dependencies
 
 ```
-Phase 0  ██████████████████████████  [Large]   — DONE ✓
-Phase 1  ████████████                [Medium]  — Phase 0 (quantized inference wiring)
-Phase 2  ████████████████            [Medium]  — Phase 0 (kernel optimizations)
-Phase 3  ██████████████████████████  [Large]   — Phase 0 (flash attention)
-Phase 4  ████████████████            [Medium]  — Phase 0 + Phase 3
-Phase 5  ████████████████████        [Med-Lrg] — Phase 2-3
+Phase 0  ██████████████████████████  [Large]   — DONE ✓  HIP backend + dense ops
+Phase 1  ████████████                [Medium]  — DONE ✓  Quantized inference on GPU
+Phase 2  ████████████                [Medium]  — Phase 1 (multi-GPU, RCCL)
+Phase 3  ████████████████            [Medium]  — Phase 1 (kernel optimizations + tradeoffs)
+Phase 4  ██████████████████████████  [Large]   — Phase 1 (flash attention)
+Phase 5  ████████████████████        [Med-Lrg] — Phase 3-4
 Phase 6  ████████████                [Small]   — All phases (incremental)
 ```
 
-Phase 1 is the critical path to real-world usability.
-Phases 2 and 3 can proceed in parallel after Phase 1.
+Phase 2 (multi-GPU) unlocks large model inference on 4×MI50 (64GB).
+Phases 3 and 4 can proceed in parallel after Phase 2.
 
 ---
 
