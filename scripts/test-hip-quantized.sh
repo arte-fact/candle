@@ -10,15 +10,13 @@ MODELS_DIR="${CANDLE_MODELS_DIR:-/home/artefact/models}"
 echo "=== Candle HIP Quantized Inference Test ==="
 echo "Models dir: $MODELS_DIR"
 
-# Pick a compatible model — prefer smaller ones.
-# Note: Qwen3.5 uses different metadata keys than Qwen3, skip for now.
+# Pick a compatible model — prefer smaller llama/mistral-arch models that work
+# with the generic `quantized` example. Qwen3.5 and Gemma4 need dedicated
+# examples that don't exist yet in upstream candle.
 MODEL=""
 for candidate in \
-    "$MODELS_DIR/gemma-4-E4B-it-Q4_0.gguf" \
-    "$MODELS_DIR/gemma-4-31B-it-Q4_0.gguf" \
     "$MODELS_DIR/Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf" \
-    "$MODELS_DIR/Qwen3.5-9B-Q4_1.gguf" \
-    "$MODELS_DIR/Qwen3.5-27B-Q4_0.gguf" \
+    "$MODELS_DIR/Devstral-Small-2-24B-Instruct-2512-Q8_0.gguf" \
 ; do
     if [ -f "$candidate" ]; then
         MODEL="$candidate"
@@ -39,9 +37,10 @@ echo ""
 # Detect the right example based on model name
 EXAMPLE="quantized"
 case "$MODEL" in
-    *[Qq]wen3*) EXAMPLE="quantized-qwen3" ;;
-    *[Qq]wen2*) EXAMPLE="quantized-qwen2-instruct" ;;
-    *gemma*)    EXAMPLE="quantized-gemma" ;;
+    *[Qq]wen3-[0-9]*)  EXAMPLE="quantized-qwen3" ;;
+    *[Qq]wen2*)        EXAMPLE="quantized-qwen2-instruct" ;;
+    *gemma-[23]*)      EXAMPLE="quantized-gemma" ;;
+    # Devstral (Mistral), Llama, and other llama-arch models use generic `quantized`
 esac
 echo "Example: $EXAMPLE"
 echo ""

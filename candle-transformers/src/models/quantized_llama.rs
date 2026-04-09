@@ -365,22 +365,29 @@ impl ModelWeights {
             Some(v) => Ok(v),
         };
 
-        // Parameter extraction from metadata.
-        let n_expert = md_get("llama.expert_count")
-            .and_then(|v| v.to_u32())
-            .unwrap_or(0) as usize;
-        let n_expert_used = md_get("llama.expert_used_count")
-            .and_then(|v| v.to_u32())
-            .unwrap_or(0) as usize;
-        let head_count = md_get("llama.attention.head_count")?.to_u32()? as usize;
-        let head_count_kv = md_get("llama.attention.head_count_kv")?.to_u32()? as usize;
-        let block_count = md_get("llama.block_count")?.to_u32()? as usize;
-        let embedding_length = md_get("llama.embedding_length")?.to_u32()? as usize;
-        let rope_dim = md_get("llama.rope.dimension_count")?.to_u32()? as usize;
-        // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
-        let rms_norm_eps = md_get("llama.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
+        // Auto-detect architecture prefix from GGUF metadata.
+        // Supports llama, mistral, devstral, and other llama-compatible architectures.
+        let arch = match md_get("general.architecture").and_then(|v| v.to_string()) {
+            Ok(a) => a.to_string(),
+            Err(_) => "llama".to_string(),
+        };
 
-        let rope_freq_base = md_get("llama.rope.freq_base")
+        // Parameter extraction from metadata.
+        let n_expert = md_get(&format!("{arch}.expert_count"))
+            .and_then(|v| v.to_u32())
+            .unwrap_or(0) as usize;
+        let n_expert_used = md_get(&format!("{arch}.expert_used_count"))
+            .and_then(|v| v.to_u32())
+            .unwrap_or(0) as usize;
+        let head_count = md_get(&format!("{arch}.attention.head_count"))?.to_u32()? as usize;
+        let head_count_kv = md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
+        let block_count = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
+        let embedding_length = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
+        let rope_dim = md_get(&format!("{arch}.rope.dimension_count"))?.to_u32()? as usize;
+        // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
+        let rms_norm_eps = md_get(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
+
+        let rope_freq_base = md_get(&format!("{arch}.rope.freq_base"))
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
         let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, device)?;
