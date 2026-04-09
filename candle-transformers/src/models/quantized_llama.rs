@@ -502,9 +502,8 @@ impl ModelWeights {
         if devices.is_empty() {
             candle::bail!("at least one device required");
         }
-        if devices.len() == 1 {
-            return Self::from_gguf(ct, reader, &devices[0]);
-        }
+        // Don't shortcut to from_gguf — the sharded path keeps embeddings
+        // on CPU which avoids device mismatches with the inference loop.
 
         let md_get = |s: &str| match ct.metadata.get(s) {
             None => candle::bail!("cannot find {s} in metadata"),
