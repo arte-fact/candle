@@ -7,6 +7,7 @@ use std::borrow::Cow;
 #[cfg(target_feature = "avx2")]
 pub mod avx;
 mod dummy_cuda;
+mod dummy_hip;
 mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
@@ -25,6 +26,12 @@ pub mod cuda;
 #[cfg(not(feature = "cuda"))]
 mod cuda {
     pub use super::dummy_cuda::*;
+}
+#[cfg(feature = "hip")]
+pub mod hip;
+#[cfg(not(feature = "hip"))]
+mod hip {
+    pub use super::dummy_hip::*;
 }
 
 #[cfg(target_feature = "neon")]
@@ -72,8 +79,9 @@ impl Device {
                 let storage = cuda::QCudaStorage::zeros(cuda, elem_count, dtype)?;
                 Ok(QStorage::Cuda(storage))
             }
-            Device::Hip(_) => {
-                Err(crate::Error::NotCompiledWithHipSupport)
+            Device::Hip(hip_dev) => {
+                let storage = hip::QHipStorage::zeros(hip_dev, elem_count, dtype)?;
+                Ok(QStorage::Hip(storage))
             }
         }
     }
@@ -83,6 +91,7 @@ pub enum QStorage {
     Cpu(Box<dyn QuantizedType>),
     Metal(metal::QMetalStorage),
     Cuda(cuda::QCudaStorage),
+    Hip(hip::QHipStorage),
 }
 
 impl QStorage {
@@ -123,9 +132,23 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
             },
-            Device::Hip(_) => {
-                Err(crate::Error::NotCompiledWithHipSupport)
-            }
+            Device::Hip(d) => match dtype {
+                GgmlDType::F32 => hip::load_quantized(d, as_t_slice::<f32>(data)),
+                GgmlDType::F16 => hip::load_quantized(d, as_t_slice::<f16>(data)),
+                GgmlDType::Q4_0 => hip::load_quantized(d, as_t_slice::<BlockQ4_0>(data)),
+                GgmlDType::Q4_1 => hip::load_quantized(d, as_t_slice::<BlockQ4_1>(data)),
+                GgmlDType::Q5_0 => hip::load_quantized(d, as_t_slice::<BlockQ5_0>(data)),
+                GgmlDType::Q5_1 => hip::load_quantized(d, as_t_slice::<BlockQ5_1>(data)),
+                GgmlDType::Q8_0 => hip::load_quantized(d, as_t_slice::<BlockQ8_0>(data)),
+                GgmlDType::Q8_1 => hip::load_quantized(d, as_t_slice::<BlockQ8_1>(data)),
+                GgmlDType::Q2K => hip::load_quantized(d, as_t_slice::<BlockQ2K>(data)),
+                GgmlDType::Q3K => hip::load_quantized(d, as_t_slice::<BlockQ3K>(data)),
+                GgmlDType::Q4K => hip::load_quantized(d, as_t_slice::<BlockQ4K>(data)),
+                GgmlDType::Q5K => hip::load_quantized(d, as_t_slice::<BlockQ5K>(data)),
+                GgmlDType::Q6K => hip::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
+                GgmlDType::Q8K => hip::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
+                GgmlDType::BF16 => hip::load_quantized(d, as_t_slice::<bf16>(data)),
+            },
         }
     }
 
@@ -134,6 +157,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.block_size(),
             QStorage::Metal(storage) => storage.dtype().block_size(),
             QStorage::Cuda(storage) => storage.dtype().block_size(),
+            QStorage::Hip(storage) => storage.dtype().block_size(),
         }
     }
 
@@ -142,6 +166,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.dtype(),
             QStorage::Metal(storage) => storage.dtype(),
             QStorage::Cuda(storage) => storage.dtype(),
+            QStorage::Hip(storage) => storage.dtype(),
         }
     }
 
@@ -150,6 +175,7 @@ impl QStorage {
             QStorage::Cpu(_storage) => Device::Cpu,
             QStorage::Metal(storage) => Device::Metal(storage.device().clone()),
             QStorage::Cuda(storage) => Device::Cuda(storage.device().clone()),
+            QStorage::Hip(storage) => Device::Hip(storage.device().clone()),
         }
     }
 
@@ -158,6 +184,7 @@ impl QStorage {
             QStorage::Cpu(storage) => storage.storage_size_in_bytes(),
             QStorage::Metal(storage) => storage.storage_size_in_bytes(),
             QStorage::Cuda(storage) => storage.storage_size_in_bytes(),
+            QStorage::Hip(storage) => storage.storage_size_in_bytes(),
         }
     }
 
@@ -168,6 +195,7 @@ impl QStorage {
             }
             (QStorage::Metal(storage), Storage::Metal(src)) => storage.quantize(src)?,
             (QStorage::Cuda(storage), Storage::Cuda(src)) => storage.quantize(src)?,
+            (QStorage::Hip(storage), Storage::Hip(src)) => storage.quantize(src)?,
             _ => crate::bail!("Invalid quantize storage locations do not match"),
         }
         Ok(())
@@ -189,6 +217,9 @@ impl QStorage {
             (QStorage::Cuda(storage), Storage::Cuda(src)) => {
                 storage.quantize_imatrix(src, imatrix_weights, n_per_row)?
             }
+            (QStorage::Hip(storage), Storage::Hip(src)) => {
+                storage.quantize_imatrix(src, imatrix_weights, n_per_row)?
+            }
             _ => crate::bail!("Invalid quantize storage locations do not match"),
         }
         Ok(())
@@ -201,6 +232,7 @@ impl QStorage {
             }
             (QStorage::Metal(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::Cuda(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
+            (QStorage::Hip(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             _ => crate::bail!("Invalid quantize source storage locations: not on cpu"),
         }
         Ok(())
@@ -222,6 +254,9 @@ impl QStorage {
             (QStorage::Cuda(storage), Storage::Cpu(src)) => {
                 storage.quantize_imatrix_onto(src, imatrix_weights, n_per_row)?
             }
+            (QStorage::Hip(storage), Storage::Cpu(src)) => {
+                storage.quantize_imatrix_onto(src, imatrix_weights, n_per_row)?
+            }
             _ => crate::bail!("Invalid quantize storage locations do not match"),
         }
         Ok(())
@@ -232,6 +267,7 @@ impl QStorage {
             QStorage::Cpu(storage) => Ok(Storage::Cpu(storage.dequantize(elem_count)?)),
             QStorage::Metal(storage) => Ok(Storage::Metal(storage.dequantize(elem_count)?)),
             QStorage::Cuda(storage) => Ok(Storage::Cuda(storage.dequantize(elem_count)?)),
+            QStorage::Hip(storage) => Ok(Storage::Hip(storage.dequantize(elem_count)?)),
         }
     }
 
@@ -245,12 +281,14 @@ impl QStorage {
             }
             QStorage::Cuda(storage) => Ok(Cow::from(storage.data()?)),
             QStorage::Metal(storage) => Ok(Cow::from(storage.data()?)),
+            QStorage::Hip(storage) => Ok(Cow::from(storage.data()?)),
         }
     }
 
     pub fn device_ptr(&self) -> Result<*const u8> {
         match self {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            QStorage::Hip(storage) => storage.device_ptr(),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -636,13 +674,17 @@ impl QTensor {
     }
 
     pub fn dequantize_f16(&self, device: &Device) -> Result<Tensor> {
-        // In the CUDA case, we have a specialized kernel as this can be useful for volta
-        // architectures. https://github.com/huggingface/candle/issues/2136
         match &self.storage {
             QStorage::Cuda(s) => {
                 let s = s.dequantize_f16(self.shape.elem_count())?;
                 let none = crate::op::BackpropOp::none();
                 crate::tensor::from_storage(Storage::Cuda(s), self.shape.clone(), none, false)
+                    .to_device(device)
+            }
+            QStorage::Hip(s) => {
+                let s = s.dequantize_f16(self.shape.elem_count())?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(Storage::Hip(s), self.shape.clone(), none, false)
                     .to_device(device)
             }
             _ => {
@@ -691,6 +733,7 @@ impl QTensor {
     pub fn device_ptr(&self) -> Result<*const u8> {
         match &self.storage {
             QStorage::Cuda(storage) => storage.device_ptr(),
+            QStorage::Hip(storage) => storage.device_ptr(),
             QStorage::Metal(_) | QStorage::Cpu(_) => {
                 crate::bail!("not implemented");
             }
@@ -807,7 +850,9 @@ impl crate::CustomOp1 for QTensor {
         #[allow(clippy::infallible_destructuring_match)]
         let self_storage = match &self.storage {
             QStorage::Cpu(storage) => storage,
-            QStorage::Metal(_) | QStorage::Cuda(_) => crate::bail!("Invalid storage"),
+            QStorage::Metal(_) | QStorage::Cuda(_) | QStorage::Hip(_) => {
+                crate::bail!("Invalid storage")
+            }
         };
         match storage.dtype() {
             DType::F32 => {
@@ -858,6 +903,18 @@ impl crate::CustomOp1 for QTensor {
         let self_storage = match &self.storage {
             QStorage::Cuda(cuda) => cuda,
             _ => unreachable!("Cannot call cuda matmul on non cuda QTensor"),
+        };
+        self_storage.fwd(&self.shape, storage, layout)
+    }
+
+    fn hip_fwd(
+        &self,
+        storage: &crate::HipStorage,
+        layout: &crate::Layout,
+    ) -> Result<(crate::HipStorage, Shape)> {
+        let self_storage = match &self.storage {
+            QStorage::Hip(hip) => hip,
+            _ => unreachable!("Cannot call hip matmul on non hip QTensor"),
         };
         self_storage.fwd(&self.shape, storage, layout)
     }

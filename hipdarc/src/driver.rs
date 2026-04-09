@@ -399,7 +399,7 @@ pub struct HipView<'a, T> {
 unsafe impl<T> Send for HipView<'_, T> {}
 unsafe impl<T> Sync for HipView<'_, T> {}
 
-impl<T> HipView<'_, T> {
+impl<'a, T> HipView<'a, T> {
     pub fn len(&self) -> usize {
         self.len
     }
@@ -410,6 +410,17 @@ impl<T> HipView<'_, T> {
 
     pub fn device_ptr(&self) -> sys::hipDeviceptr_t {
         self.ptr
+    }
+
+    /// Create a sub-view into a sub-range of this view.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> HipView<'a, T> {
+        assert!(range.end <= self.len, "slice out of bounds");
+        let offset = range.start * std::mem::size_of::<T>();
+        HipView {
+            ptr: unsafe { (self.ptr as *const u8).add(offset) as sys::hipDeviceptr_t },
+            len: range.end - range.start,
+            _marker: PhantomData,
+        }
     }
 }
 
