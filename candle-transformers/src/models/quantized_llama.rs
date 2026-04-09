@@ -389,6 +389,9 @@ impl ModelWeights {
         // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
         let rms_norm_eps = md_get(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
 
+        let head_dim = md_get(&format!("{arch}.attention.key_length"))
+            .and_then(|v| v.to_u32())
+            .unwrap_or((embedding_length / head_count) as u32) as usize;
         let rope_freq_base = md_get(&format!("{arch}.rope.freq_base"))
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
@@ -464,7 +467,7 @@ impl ModelWeights {
                 ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
-                head_dim: embedding_length / head_count,
+                head_dim,
                 cos: cos.clone(),
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
@@ -526,6 +529,9 @@ impl ModelWeights {
         let rope_dim = md_get(&format!("{arch}.rope.dimension_count"))?.to_u32()? as usize;
         let rms_norm_eps =
             md_get(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
+        let head_dim = md_get(&format!("{arch}.attention.key_length"))
+            .and_then(|v| v.to_u32())
+            .unwrap_or((embedding_length / head_count) as u32) as usize;
         let rope_freq_base = md_get(&format!("{arch}.rope.freq_base"))
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
@@ -638,7 +644,7 @@ impl ModelWeights {
                 ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,
                 n_kv_head: head_count_kv,
-                head_dim: embedding_length / head_count,
+                head_dim,
                 cos: layer_cos,
                 sin: layer_sin,
                 neg_inf: layer_neg_inf,
