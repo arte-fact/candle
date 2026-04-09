@@ -302,6 +302,10 @@ struct Args {
     /// Use the slower dmmv cuda kernel.
     #[arg(long)]
     force_dmmv: bool,
+
+    /// Number of GPUs for layer-split parallelism (default: 1).
+    #[arg(long, default_value_t = 1)]
+    num_gpus: usize,
 }
 
 impl Args {
@@ -485,7 +489,14 @@ fn main() -> anyhow::Result<()> {
                 &format_size(total_size_in_bytes),
                 start.elapsed().as_secs_f32(),
             );
-            ModelWeights::from_gguf(model, &mut file, &device)?
+            if args.num_gpus > 1 {
+                let devices: Vec<_> = (0..args.num_gpus)
+                    .map(|g| candle::Device::new_hip(g).or_else(|_| candle::Device::new_cuda(g)))
+                    .collect::<candle::Result<_>>()?;
+                ModelWeights::from_gguf_sharded(model, &mut file, &devices)?
+            } else {
+                ModelWeights::from_gguf(model, &mut file, &device)?
+            }
         }
         Some("ggml" | "bin") | Some(_) | None => {
             let model = ggml_file::Content::read(&mut file, &device)
