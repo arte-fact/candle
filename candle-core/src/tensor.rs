@@ -2391,6 +2391,11 @@ impl Tensor {
                     Storage::Hip(hip.storage_from_cpu_storage(storage)?)
                 }
                 (Storage::Hip(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
+                (Storage::Hip(storage), Device::Hip(hip)) => {
+                    // Hip-to-Hip transfer via CPU (no P2P on MI50 PCIe)
+                    let cpu = storage.to_cpu_storage()?;
+                    Storage::Hip(hip.storage_from_cpu_storage(&cpu)?)
+                }
                 (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
                 _ => {
                     bail!(
