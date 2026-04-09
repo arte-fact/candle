@@ -158,6 +158,7 @@ struct LayerWeights {
     sin: Tensor,
     neg_inf: Tensor,
     kv_cache: Option<(Tensor, Tensor)>,
+    device: Device,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
     span_mlp: tracing::Span,
@@ -337,6 +338,7 @@ impl ModelWeights {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 kv_cache: None,
+                device: Device::Cpu,
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -467,6 +469,181 @@ impl ModelWeights {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 kv_cache: None,
+                device: device.clone(),
+                span_attn,
+                span_rot,
+                span_mlp,
+            })
+        }
+        let span = tracing::span!(tracing::Level::TRACE, "model");
+        let span_output = tracing::span!(tracing::Level::TRACE, "output");
+        Ok(Self {
+            tok_embeddings: Embedding::new(tok_embeddings, embedding_length),
+            layers,
+            norm,
+            output: QMatMul::from_qtensor(output)?,
+            masks: HashMap::new(),
+            span,
+            span_output,
+        })
+    }
+
+    /// Load a GGUF model with layer-split across multiple devices.
+    /// Layers are distributed evenly across the provided devices.
+    /// Embeddings and output go on the first device.
+    pub fn from_gguf_sharded<R: std::io::Seek + std::io::Read>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        devices: &[Device],
+    ) -> Result<Self> {
+        if devices.is_empty() {
+            candle::bail!("at least one device required");
+        }
+        if devices.len() == 1 {
+            return Self::from_gguf(ct, reader, &devices[0]);
+        }
+
+        let md_get = |s: &str| match ct.metadata.get(s) {
+            None => candle::bail!("cannot find {s} in metadata"),
+            Some(v) => Ok(v),
+        };
+
+        let arch = match md_get("general.architecture").and_then(|v| v.to_string()) {
+            Ok(a) => a.to_string(),
+            Err(_) => "llama".to_string(),
+        };
+
+        let n_expert = md_get(&format!("{arch}.expert_count"))
+            .and_then(|v| v.to_u32())
+            .unwrap_or(0) as usize;
+        let n_expert_used = md_get(&format!("{arch}.expert_used_count"))
+            .and_then(|v| v.to_u32())
+            .unwrap_or(0) as usize;
+        let head_count = md_get(&format!("{arch}.attention.head_count"))?.to_u32()? as usize;
+        let head_count_kv = md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
+        let block_count = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
+        let embedding_length = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
+        let rope_dim = md_get(&format!("{arch}.rope.dimension_count"))?.to_u32()? as usize;
+        let rms_norm_eps =
+            md_get(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
+        let rope_freq_base = md_get(&format!("{arch}.rope.freq_base"))
+            .and_then(|m| m.to_f32())
+            .unwrap_or(10000f32);
+
+        // Embeddings and output on first device
+        let dev0 = &devices[0];
+        let dev_last = &devices[devices.len() - 1];
+
+        let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, dev0)?;
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, dev0)?;
+
+        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", dev0)?;
+        let tok_embeddings = tok_embeddings_q.dequantize(dev0)?;
+        let norm = RmsNorm::from_qtensor(
+            ct.tensor(reader, "output_norm.weight", dev_last)?,
+            rms_norm_eps,
+        )?;
+        let output = match ct.tensor(reader, "output.weight", dev_last) {
+            Ok(tensor) => tensor,
+            Err(_) => tok_embeddings_q,
+        };
+
+        // Distribute layers across devices
+        let n_devices = devices.len();
+        println!(
+            "Layer-split: {block_count} layers across {n_devices} devices"
+        );
+
+        let mut layers = Vec::with_capacity(block_count);
+        for layer_idx in 0..block_count {
+            let dev_idx = layer_idx * n_devices / block_count;
+            let layer_device = &devices[dev_idx];
+            let prefix = format!("blk.{layer_idx}");
+
+            if layer_idx == 0 || dev_idx != (layer_idx.wrapping_sub(1)) * n_devices / block_count {
+                println!("  layers {layer_idx}+ → {:?}", layer_device.location());
+            }
+
+            // Load cos/sin/neg_inf on this layer's device
+            let layer_cos = cos.to_device(layer_device)?;
+            let layer_sin = sin.to_device(layer_device)?;
+            let layer_neg_inf = neg_inf.to_device(layer_device)?;
+
+            let attention_wq =
+                ct.tensor(reader, &format!("{prefix}.attn_q.weight"), layer_device)?;
+            let attention_wk =
+                ct.tensor(reader, &format!("{prefix}.attn_k.weight"), layer_device)?;
+            let attention_wv =
+                ct.tensor(reader, &format!("{prefix}.attn_v.weight"), layer_device)?;
+            let attention_wo =
+                ct.tensor(reader, &format!("{prefix}.attn_output.weight"), layer_device)?;
+            let mlp_or_moe = if n_expert <= 1 {
+                let feed_forward_w1 =
+                    ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), layer_device)?;
+                let feed_forward_w2 =
+                    ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), layer_device)?;
+                let feed_forward_w3 =
+                    ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), layer_device)?;
+                MlpOrMoe::Mlp(Mlp {
+                    feed_forward_w1: QMatMul::from_qtensor(feed_forward_w1)?,
+                    feed_forward_w2: QMatMul::from_qtensor(feed_forward_w2)?,
+                    feed_forward_w3: QMatMul::from_qtensor(feed_forward_w3)?,
+                })
+            } else {
+                let feed_forward_gate_inp =
+                    ct.tensor(reader, &format!("{prefix}.ffn_gate_inp.weight"), layer_device)?;
+                let mut experts = Vec::with_capacity(n_expert);
+                for i in 0..n_expert {
+                    let feed_forward_w1 = ct.tensor(
+                        reader,
+                        &format!("{prefix}.ffn_gate.{i}.weight"),
+                        layer_device,
+                    )?;
+                    let feed_forward_w2 = ct.tensor(
+                        reader,
+                        &format!("{prefix}.ffn_down.{i}.weight"),
+                        layer_device,
+                    )?;
+                    let feed_forward_w3 = ct.tensor(
+                        reader,
+                        &format!("{prefix}.ffn_up.{i}.weight"),
+                        layer_device,
+                    )?;
+                    experts.push(Mlp {
+                        feed_forward_w1: QMatMul::from_qtensor(feed_forward_w1)?,
+                        feed_forward_w2: QMatMul::from_qtensor(feed_forward_w2)?,
+                        feed_forward_w3: QMatMul::from_qtensor(feed_forward_w3)?,
+                    })
+                }
+                MlpOrMoe::MoE {
+                    n_expert_used,
+                    feed_forward_gate_inp: QMatMul::from_qtensor(feed_forward_gate_inp)?,
+                    experts,
+                }
+            };
+            let attention_norm =
+                ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), layer_device)?;
+            let ffn_norm =
+                ct.tensor(reader, &format!("{prefix}.ffn_norm.weight"), layer_device)?;
+            let span_attn = tracing::span!(tracing::Level::TRACE, "attn");
+            let span_rot = tracing::span!(tracing::Level::TRACE, "attn-rot");
+            let span_mlp = tracing::span!(tracing::Level::TRACE, "attn-mlp");
+            layers.push(LayerWeights {
+                attention_wq: QMatMul::from_qtensor(attention_wq)?,
+                attention_wk: QMatMul::from_qtensor(attention_wk)?,
+                attention_wv: QMatMul::from_qtensor(attention_wv)?,
+                attention_wo: QMatMul::from_qtensor(attention_wo)?,
+                attention_norm: RmsNorm::from_qtensor(attention_norm, rms_norm_eps)?,
+                mlp_or_moe,
+                ffn_norm: RmsNorm::from_qtensor(ffn_norm, rms_norm_eps)?,
+                n_head: head_count,
+                n_kv_head: head_count_kv,
+                head_dim: embedding_length / head_count,
+                cos: layer_cos,
+                sin: layer_sin,
+                neg_inf: layer_neg_inf,
+                kv_cache: None,
+                device: layer_device.clone(),
                 span_attn,
                 span_rot,
                 span_mlp,
@@ -519,6 +696,7 @@ impl ModelWeights {
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (_b_sz, seq_len) = x.dims2()?;
+        // Pre-compute masks per device to avoid borrow conflict in the layer loop
         let mask = if seq_len == 1 {
             None
         } else {
@@ -527,10 +705,20 @@ impl ModelWeights {
         let _enter = self.span.enter();
         let mut layer_in = self.tok_embeddings.forward(x)?;
         for layer in self.layers.iter_mut() {
+            // Transfer activations to this layer's device if needed
+            if !layer_in.device().same_device(&layer.device) {
+                layer_in = layer_in.to_device(&layer.device)?;
+            }
+            let layer_mask = match &mask {
+                Some(m) if !m.device().same_device(&layer.device) => {
+                    Some(m.to_device(&layer.device)?)
+                }
+                other => other.clone(),
+            };
             let x = layer_in;
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;
-            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos)?;
+            let attn = layer.forward_attn(&x, layer_mask.as_ref(), index_pos)?;
             let x = (attn + residual)?;
 
             // MLP
