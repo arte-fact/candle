@@ -58,30 +58,56 @@ fn main() -> Result<()> {
     let gpu_sum = gpu_t.reshape((8, 64))?.sum(1)?;
     check("sum_dim1", &cpu_sum, &gpu_sum)?;
 
-    // Test 5: Quantized matmul
+    // Test 5: Quantized dequantize (no matmul)
+    println!("\n=== Quantized dequantize ===");
+    {
+        use candle_core::quantized::{GgmlDType, QTensor};
+
+        let w_data: Vec<f32> = (0..256).map(|i| ((i % 19) as f32 - 9.0) / 10.0).collect();
+        let w_cpu = Tensor::new(w_data.as_slice(), &cpu)?;
+        let qw_cpu = QTensor::quantize(&w_cpu, GgmlDType::Q4_0)?;
+        let deq_cpu = qw_cpu.dequantize(&cpu)?;
+
+        let w_gpu = Tensor::new(w_data.as_slice(), &gpu)?;
+        let qw_gpu = QTensor::quantize(&w_gpu, GgmlDType::Q4_0)?;
+        let deq_gpu = qw_gpu.dequantize(&gpu)?;
+        check("dequant_q4_0", &deq_cpu.flatten_all()?, &deq_gpu.flatten_all()?)?;
+    }
+
+    // Test 6: Quantized matmul
     println!("\n=== Quantized matmul ===");
     {
         use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
         use candle_core::Module;
 
+        // Quantize on CPU, then test both CPU and GPU forward
         let w_data: Vec<f32> = (0..256 * 64)
             .map(|i| ((i % 19) as f32 - 9.0) / 50.0)
             .collect();
         let w_cpu = Tensor::new(w_data.as_slice(), &cpu)?.reshape((256, 64))?;
+        // CPU forward
         let qw_cpu = QTensor::quantize(&w_cpu, GgmlDType::Q4_0)?;
         let qm_cpu = QMatMul::from_qtensor(qw_cpu)?;
+        let inp_data: Vec<f32> = (0..2 * 64).map(|i| (i as f32) / 64.0).collect();
+        let cpu_inp = Tensor::new(inp_data.as_slice(), &cpu)?.reshape((2, 64))?;
+        let cpu_out = qm_cpu.forward(&cpu_inp)?;
 
+        // GPU forward — quantize on GPU separately
         let w_gpu = Tensor::new(w_data.as_slice(), &gpu)?.reshape((256, 64))?;
         let qw_gpu = QTensor::quantize(&w_gpu, GgmlDType::Q4_0)?;
         let qm_gpu = QMatMul::from_qtensor(qw_gpu)?;
-
-        let inp_data: Vec<f32> = (0..2 * 64).map(|i| (i as f32) / 64.0).collect();
-        let cpu_inp = Tensor::new(inp_data.as_slice(), &cpu)?.reshape((2, 64))?;
         let gpu_inp = Tensor::new(inp_data.as_slice(), &gpu)?.reshape((2, 64))?;
-
-        let cpu_out = qm_cpu.forward(&cpu_inp)?;
         let gpu_out = qm_gpu.forward(&gpu_inp)?;
         check("qmatmul_q4_0", &cpu_out.flatten_all()?, &gpu_out.flatten_all()?)?;
+
+        // Compare dequantized weights too
+        let qw_gpu2 = QTensor::quantize(
+            &Tensor::new(w_data.as_slice(), &gpu)?.reshape((256, 64))?,
+            GgmlDType::Q4_0,
+        )?;
+        let deq_cpu = QTensor::quantize(&w_cpu, GgmlDType::Q4_0)?.dequantize(&cpu)?;
+        let deq_gpu = qw_gpu2.dequantize(&gpu)?;
+        check("deq_weights", &deq_cpu.flatten_all()?, &deq_gpu.flatten_all()?)?;
     }
 
     println!("\nDone!");

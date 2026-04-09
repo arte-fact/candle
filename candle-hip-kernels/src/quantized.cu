@@ -3236,8 +3236,13 @@ extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __
     float amax = fabsf(xi);
     float sum = xi;
 
-    amax = warp_reduce_max(amax);
-    sum = warp_reduce_sum(sum);
+    // QK8_1=32: reduce within half-warp (32 threads) not full warp.
+    // On Wave64, a full warp_reduce would mix two adjacent Q8_1 blocks.
+#pragma unroll
+    for (int mask = QK8_1/2; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, mask));
+        sum += __shfl_xor(sum, mask);
+    }
 
     const float d = amax / 127;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
