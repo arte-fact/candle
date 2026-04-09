@@ -530,20 +530,20 @@ impl ModelWeights {
             .and_then(|m| m.to_f32())
             .unwrap_or(10000f32);
 
-        // Embeddings and output on first device
-        let dev0 = &devices[0];
-        let dev_last = &devices[devices.len() - 1];
+        // Embeddings and output stay on CPU to save GPU VRAM.
+        // Embedding lookup is cheap; the result gets transferred to the first GPU.
+        let cpu = &Device::Cpu;
 
-        let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, dev0)?;
-        let neg_inf = Tensor::new(f32::NEG_INFINITY, dev0)?;
+        let (cos, sin) = precomput_freqs_cis(rope_dim, rope_freq_base, cpu)?;
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, cpu)?;
 
-        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", dev0)?;
-        let tok_embeddings = tok_embeddings_q.dequantize(dev0)?;
+        let tok_embeddings_q = ct.tensor(reader, "token_embd.weight", cpu)?;
+        let tok_embeddings = tok_embeddings_q.dequantize(cpu)?;
         let norm = RmsNorm::from_qtensor(
-            ct.tensor(reader, "output_norm.weight", dev_last)?,
+            ct.tensor(reader, "output_norm.weight", cpu)?,
             rms_norm_eps,
         )?;
-        let output = match ct.tensor(reader, "output.weight", dev_last) {
+        let output = match ct.tensor(reader, "output.weight", cpu) {
             Ok(tensor) => tensor,
             Err(_) => tok_embeddings_q,
         };
@@ -551,7 +551,7 @@ impl ModelWeights {
         // Distribute layers across devices
         let n_devices = devices.len();
         println!(
-            "Layer-split: {block_count} layers across {n_devices} devices"
+            "Layer-split: {block_count} layers across {n_devices} devices (embed={embedding_length})"
         );
 
         let mut layers = Vec::with_capacity(block_count);
@@ -564,7 +564,7 @@ impl ModelWeights {
                 println!("  layers {layer_idx}+ → {:?}", layer_device.location());
             }
 
-            // Load cos/sin/neg_inf on this layer's device
+            // Transfer cos/sin/neg_inf from CPU to this layer's device
             let layer_cos = cos.to_device(layer_device)?;
             let layer_sin = sin.to_device(layer_device)?;
             let layer_neg_inf = neg_inf.to_device(layer_device)?;
