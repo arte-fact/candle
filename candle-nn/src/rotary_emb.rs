@@ -166,6 +166,92 @@ impl candle::CustomOp3 for RotaryEmbI {
         Ok((dst, l1.shape().clone()))
     }
 
+    #[cfg(feature = "hip")]
+    fn hip_fwd(
+        &self,
+        s1: &candle::HipStorage,
+        l1: &Layout,
+        s2: &candle::HipStorage,
+        l2: &Layout,
+        s3: &candle::HipStorage,
+        l3: &Layout,
+    ) -> Result<(candle::HipStorage, Shape)> {
+        use candle::hip_backend::hipdarc::driver::{
+            DeviceRepr, HipSlice, LaunchConfig, ValidAsZeroBits,
+        };
+        use candle::hip_backend::{kernels, WrapErr};
+        use candle::{hip_backend::HipDevice, WithDType};
+
+        fn inner<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+            src: &HipSlice<T>,
+            l_src: &Layout,
+            cos: &HipSlice<T>,
+            l_cos: &Layout,
+            sin: &HipSlice<T>,
+            l_sin: &Layout,
+            dev: &HipDevice,
+        ) -> Result<HipSlice<T>> {
+            let src = match l_src.contiguous_offsets() {
+                None => candle::bail!("src input has to be contiguous"),
+                Some((o1, o2)) => src.slice(o1..o2),
+            };
+            let cos = match l_cos.contiguous_offsets() {
+                None => candle::bail!("cos input has to be contiguous"),
+                Some((o1, o2)) => cos.slice(o1..o2),
+            };
+            let sin = match l_sin.contiguous_offsets() {
+                None => candle::bail!("sin input has to be contiguous"),
+                Some((o1, o2)) => sin.slice(o1..o2),
+            };
+            let (b, h, t, d) = l_src.shape().dims4()?;
+            let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
+                (h * t * d) as u32
+            } else {
+                0u32
+            };
+            let el = b * h * t * d;
+            let cfg = LaunchConfig::for_num_elems((el / 2) as u32);
+            let kernel_name = format!("rope_i_{}", T::DTYPE.as_str());
+            let func = dev.get_or_load_func(&kernel_name, &kernels::REDUCE)?;
+            // SAFETY: Set later by running the kernel.
+            let dst = unsafe { dev.alloc::<T>(el)? };
+            let mut builder = func.builder();
+            builder.arg(&src);
+            builder.arg(&cos);
+            builder.arg(&sin);
+            builder.arg(&dst);
+            let bh = (b * h) as u32;
+            let td = (t * d) as u32;
+            builder.arg(&bh);
+            builder.arg(&td);
+            builder.arg(&stride_b);
+            // SAFETY: ffi.
+            unsafe { builder.launch(cfg) }.w()?;
+            Ok(dst)
+        }
+
+        use candle::backend::BackendStorage;
+        use candle::hip_backend::HipStorageSlice::{BF16, F16, F32, F64};
+        let dev = s1.device();
+        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+            (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            _ => candle::bail!(
+                "unsupported dtype for rope {:?} {:?} {:?}",
+                s1.dtype(),
+                s2.dtype(),
+                s3.dtype()
+            ),
+        };
+        let dst = candle::HipStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
@@ -449,6 +535,94 @@ impl candle::CustomOp3 for RotaryEmb {
         Ok((dst, l1.shape().clone()))
     }
 
+    #[cfg(feature = "hip")]
+    fn hip_fwd(
+        &self,
+        s1: &candle::HipStorage,
+        l1: &Layout,
+        s2: &candle::HipStorage,
+        l2: &Layout,
+        s3: &candle::HipStorage,
+        l3: &Layout,
+    ) -> Result<(candle::HipStorage, Shape)> {
+        use candle::hip_backend::hipdarc::driver::{
+            DeviceRepr, HipSlice, LaunchConfig, ValidAsZeroBits,
+        };
+        use candle::hip_backend::{kernels, WrapErr};
+        use candle::{hip_backend::HipDevice, WithDType};
+
+        fn inner<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+            src: &HipSlice<T>,
+            l_src: &Layout,
+            cos: &HipSlice<T>,
+            l_cos: &Layout,
+            sin: &HipSlice<T>,
+            l_sin: &Layout,
+            dev: &HipDevice,
+        ) -> Result<HipSlice<T>> {
+            let src = match l_src.contiguous_offsets() {
+                None => candle::bail!("src input has to be contiguous"),
+                Some((o1, o2)) => src.slice(o1..o2),
+            };
+            let cos = match l_cos.contiguous_offsets() {
+                None => candle::bail!("cos input has to be contiguous"),
+                Some((o1, o2)) => cos.slice(o1..o2),
+            };
+            let sin = match l_sin.contiguous_offsets() {
+                None => candle::bail!("sin input has to be contiguous"),
+                Some((o1, o2)) => sin.slice(o1..o2),
+            };
+            let (b, h, t, d) = l_src.shape().dims4()?;
+            let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
+                (h * t * d) as u32
+            } else {
+                0u32
+            };
+            let el = b * h * t * d;
+            let cfg = LaunchConfig::for_num_elems((el / 2) as u32);
+            let kernel_name = format!("rope_{}", T::DTYPE.as_str());
+            let func = dev.get_or_load_func(&kernel_name, &kernels::REDUCE)?;
+            // SAFETY: Set later by running the kernel.
+            let dst = unsafe { dev.alloc::<T>(el)? };
+            let mut builder = func.builder();
+            builder.arg(&src);
+            builder.arg(&cos);
+            builder.arg(&sin);
+            builder.arg(&dst);
+            let bh = (b * h) as u32;
+            let td = (t * d) as u32;
+            let d_u32 = d as u32;
+            builder.arg(&bh);
+            builder.arg(&td);
+            builder.arg(&d_u32);
+            builder.arg(&stride_b);
+            // SAFETY: ffi.
+            unsafe { builder.launch(cfg) }.w()?;
+            Ok(dst)
+        }
+
+        use candle::backend::BackendStorage;
+        use candle::hip_backend::HipStorageSlice::{BF16, F16, F32, F64};
+        let dev = s1.device();
+        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+            (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            _ => candle::bail!(
+                "unsupported dtype for rope {:?} {:?} {:?}",
+                s1.dtype(),
+                s2.dtype(),
+                s3.dtype()
+            ),
+        };
+        let dst = candle::HipStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+
     #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
@@ -713,6 +887,96 @@ impl candle::CustomOp3 for RotaryEmbThd {
             ),
         };
         let dst = candle::cuda_backend::CudaStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+
+    #[cfg(feature = "hip")]
+    fn hip_fwd(
+        &self,
+        s1: &candle::HipStorage,
+        l1: &Layout,
+        s2: &candle::HipStorage,
+        l2: &Layout,
+        s3: &candle::HipStorage,
+        l3: &Layout,
+    ) -> Result<(candle::HipStorage, Shape)> {
+        use candle::hip_backend::hipdarc::driver::{
+            DeviceRepr, HipSlice, LaunchConfig, ValidAsZeroBits,
+        };
+        use candle::hip_backend::{kernels, WrapErr};
+        use candle::{hip_backend::HipDevice, WithDType};
+
+        fn inner<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+            src: &HipSlice<T>,
+            l_src: &Layout,
+            cos: &HipSlice<T>,
+            l_cos: &Layout,
+            sin: &HipSlice<T>,
+            l_sin: &Layout,
+            dev: &HipDevice,
+        ) -> Result<HipSlice<T>> {
+            let src = match l_src.contiguous_offsets() {
+                None => candle::bail!("src input has to be contiguous"),
+                Some((o1, o2)) => src.slice(o1..o2),
+            };
+            let cos = match l_cos.contiguous_offsets() {
+                None => candle::bail!("cos input has to be contiguous"),
+                Some((o1, o2)) => cos.slice(o1..o2),
+            };
+            let sin = match l_sin.contiguous_offsets() {
+                None => candle::bail!("sin input has to be contiguous"),
+                Some((o1, o2)) => sin.slice(o1..o2),
+            };
+            let (b, t, h, d) = l_src.shape().dims4()?;
+            let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
+                (h * t * d) as u32
+            } else {
+                0u32
+            };
+            let el = b * h * t * d;
+            let cfg = LaunchConfig::for_num_elems((el / 2) as u32);
+            let kernel_name = format!("rope_thd_{}", T::DTYPE.as_str());
+            let func = dev.get_or_load_func(&kernel_name, &kernels::REDUCE)?;
+            // SAFETY: Set later by running the kernel.
+            let dst = unsafe { dev.alloc::<T>(el)? };
+            let mut builder = func.builder();
+            builder.arg(&src);
+            builder.arg(&cos);
+            builder.arg(&sin);
+            builder.arg(&dst);
+            let b_u32 = b as u32;
+            let t_u32 = t as u32;
+            let h_u32 = h as u32;
+            let d_u32 = d as u32;
+            builder.arg(&b_u32);
+            builder.arg(&t_u32);
+            builder.arg(&h_u32);
+            builder.arg(&d_u32);
+            builder.arg(&stride_b);
+            // SAFETY: ffi.
+            unsafe { builder.launch(cfg) }.w()?;
+            Ok(dst)
+        }
+
+        use candle::backend::BackendStorage;
+        use candle::hip_backend::HipStorageSlice::{BF16, F16, F32, F64};
+        let dev = s1.device();
+        let slice = match (&s1.slice, &s2.slice, &s3.slice) {
+            (BF16(s1), BF16(s2), BF16(s3)) => BF16(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F16(s1), F16(s2), F16(s3)) => F16(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F32(s1), F32(s2), F32(s3)) => F32(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            (F64(s1), F64(s2), F64(s3)) => F64(inner(s1, l1, s2, l2, s3, l3, dev)?),
+            _ => candle::bail!(
+                "unsupported dtype for rope {:?} {:?} {:?}",
+                s1.dtype(),
+                s2.dtype(),
+                s3.dtype()
+            ),
+        };
+        let dst = candle::HipStorage {
             slice,
             device: dev.clone(),
         };
