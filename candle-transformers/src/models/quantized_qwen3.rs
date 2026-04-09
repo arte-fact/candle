@@ -317,14 +317,20 @@ impl ModelWeights {
             Some(v) => Ok(v),
         };
 
-        let num_attention_heads = md_get("qwen3.attention.head_count")?.to_u32()? as usize;
-        let num_kv_heads = md_get("qwen3.attention.head_count_kv")?.to_u32()? as usize;
-        let head_dim = md_get("qwen3.attention.key_length")?.to_u32()? as usize;
-        let num_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
-        let hidden_size = md_get("qwen3.embedding_length")?.to_u32()? as usize;
-        let max_position_embeddings = md_get("qwen3.context_length")?.to_u32()? as usize;
-        let rms_norm_eps = md_get("qwen3.attention.layer_norm_rms_epsilon")?.to_f32()? as f64;
-        let rope_freq_base = md_get("qwen3.rope.freq_base")?.to_f32()? as f64;
+        // Auto-detect arch prefix: supports qwen3, qwen3_5, etc.
+        let arch = match md_get("general.architecture").and_then(|v| v.to_string()) {
+            Ok(a) => a.to_string(),
+            Err(_) => "qwen3".to_string(),
+        };
+
+        let num_attention_heads = md_get(&format!("{arch}.attention.head_count"))?.to_u32()? as usize;
+        let num_kv_heads = md_get(&format!("{arch}.attention.head_count_kv"))?.to_u32()? as usize;
+        let head_dim = md_get(&format!("{arch}.attention.key_length"))?.to_u32()? as usize;
+        let num_layers = md_get(&format!("{arch}.block_count"))?.to_u32()? as usize;
+        let hidden_size = md_get(&format!("{arch}.embedding_length"))?.to_u32()? as usize;
+        let max_position_embeddings = md_get(&format!("{arch}.context_length"))?.to_u32()? as usize;
+        let rms_norm_eps = md_get(&format!("{arch}.attention.layer_norm_rms_epsilon"))?.to_f32()? as f64;
+        let rope_freq_base = md_get(&format!("{arch}.rope.freq_base"))?.to_f32()? as f64;
 
         let dtype = match gg.metadata().get("general.dtype") {
             Some(v) => match v.to_u32() {
