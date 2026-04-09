@@ -50,15 +50,15 @@ pub enum ReduceOp {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DataType {
     Int8 = 0,
-    Uint8 = 2,
-    Int32 = 3,
-    Uint32 = 4,
-    Int64 = 5,
-    Uint64 = 6,
-    Float16 = 7,
-    Float32 = 8,
-    Float64 = 9,
-    Bfloat16 = 10,
+    Uint8 = 1,
+    Int32 = 2,
+    Uint32 = 3,
+    Int64 = 4,
+    Uint64 = 5,
+    Float16 = 6,
+    Float32 = 7,
+    Float64 = 8,
+    Bfloat16 = 9,
 }
 
 extern "C" {
