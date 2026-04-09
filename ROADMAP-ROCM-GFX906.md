@@ -23,38 +23,41 @@
 
 ---
 
-## Phase 1 — GFX906 Wave64 Kernel Optimizations
+## Phase 1 — Quantized Inference (GGUF on GPU)
+
+**Goal**: Run quantized GGUF models end-to-end on MI50. This is the fastest
+path to real-world usability — the quantized kernels from Phase 0 (`quantized.cu`)
+are already compiled, they just need to be wired into Candle's `QStorage` system.
+
+| # | Task | Key files |
+|---|------|-----------|
+| 1.1 | Create `candle-core/src/quantized/hip.rs` mirroring `quantized/cuda.rs` (~1000 lines). Implement `QHipStorage` with `dequantize`, `matmul`, `fwd`, `dtype`, `device`, `to_device` methods. | `quantized/cuda.rs` → `quantized/hip.rs` |
+| 1.2 | Add `QStorage::Hip(QHipStorage)` variant. Wire `Device::Hip` arms in `qzeros()` and `from_data()`. | `quantized/mod.rs` |
+| 1.3 | Implement `load_quantized<T>()` for HIP — upload raw quantized blocks to GPU via `clone_htod`. | `quantized/hip.rs` |
+| 1.4 | Implement quantized matmul dispatch — call `dequantize_mul_mat_vec` and `mul_mat_vec_q` kernels from `quantized.cu` HSACO. | `quantized/hip.rs` |
+| 1.5 | Test with `quantized-qwen3` example on Qwen3.5-9B-Q4_1.gguf. | `scripts/test-hip-quantized.sh` |
+
+**Exit criteria**: `quantized-qwen3` generates tokens from a GGUF model on MI50.
+
+---
+
+## Phase 2 — GFX906 Wave64 Kernel Optimizations
 
 **Goal**: Replace hipified baseline kernels with tuned GFX906 variants, porting
 proven optimizations from llamacpp-turbo.
 
 | # | Task | Source (llamacpp-turbo) |
 |---|------|------------------------|
-| 1.1 | **DPP warp primitives library**: Port `gfx906-common.cuh` — DPP-based shuffles (`hip_add_xor{1,2,8}_f32`, `hip_shuffle_xor{4,16}_f32`), `__builtin_amdgcn_readfirstlane`, inline ASM for `v_exp_f32`, `v_log_f32`, `v_rcp_f32`. Build as shared header for all gfx906 kernels. | `gfx906-common.cuh` |
-| 1.2 | **Reduction kernels**: Replace generic warp shuffles with 6-stage Wave64 DPP unrolled reduction (xor1→xor2→xor8→xor16→xor32→shift). Apply to `reduce.cu` (sum, max, min, argmax, argmin, softmax). | `gfx906/quantize/vecdotq.cuh` |
-| 1.3 | **Unary fast-math**: Use GCN ISA intrinsics (`v_exp_f32`, `v_log_f32`, `v_rcp_f32`, `v_rsq_f32`) for exp, log, recip, rsqrt paths when precision allows. Keep f64 on generic path. | `gfx906-common.cuh` |
-| 1.4 | **Matmul tuning**: Tune rocBLAS GEMM tile sizes. For small/medium batches (M<2048), implement custom SGEMM with 32×64×64 tiles and 2-warp register pressure sweet spot. Add gfx906-specific `ROCBLAS_GEMM_FLAGS` env override. | `gfx906/matmul/mmf-sgemm.cuh` |
-| 1.5 | **Memory access patterns**: Add shared-memory padding (+4 elements) to avoid LDS bank conflicts. Enforce 64KB LDS limit (not 160KB). Use vectorized 32-bit loads where applicable. | `gfx906-config.h` |
-| 1.6 | **Launch config tuning**: Create `gfx906-config.h` with tuned launch bounds — 64-thread blocks for MMVQ, 256 threads for bandwidth-bound ops, `num_warps=2` default for register pressure. | `gfx906-config.h` |
+| 2.1 | **DPP warp primitives library**: Port `gfx906-common.cuh` — DPP-based shuffles (`hip_add_xor{1,2,8}_f32`, `hip_shuffle_xor{4,16}_f32`), `__builtin_amdgcn_readfirstlane`, inline ASM for `v_exp_f32`, `v_log_f32`, `v_rcp_f32`. Build as shared header for all gfx906 kernels. | `gfx906-common.cuh` |
+| 2.2 | **Reduction kernels**: Replace generic warp shuffles with 6-stage Wave64 DPP unrolled reduction (xor1→xor2→xor8→xor16→xor32→shift). Apply to `reduce.cu` (sum, max, min, argmax, argmin, softmax). | `gfx906/quantize/vecdotq.cuh` |
+| 2.3 | **Unary fast-math**: Use GCN ISA intrinsics (`v_exp_f32`, `v_log_f32`, `v_rcp_f32`, `v_rsq_f32`) for exp, log, recip, rsqrt paths when precision allows. Keep f64 on generic path. | `gfx906-common.cuh` |
+| 2.4 | **Matmul tuning**: Tune rocBLAS GEMM tile sizes. For small/medium batches (M<2048), implement custom SGEMM with 32×64×64 tiles and 2-warp register pressure sweet spot. Add gfx906-specific `ROCBLAS_GEMM_FLAGS` env override. | `gfx906/matmul/mmf-sgemm.cuh` |
+| 2.5 | **Memory access patterns**: Add shared-memory padding (+4 elements) to avoid LDS bank conflicts. Enforce 64KB LDS limit (not 160KB). Use vectorized 32-bit loads where applicable. | `gfx906-config.h` |
+| 2.6 | **Launch config tuning**: Create `gfx906-config.h` with tuned launch bounds — 64-thread blocks for MMVQ, 256 threads for bandwidth-bound ops, `num_warps=2` default for register pressure. | `gfx906-config.h` |
+| 2.7 | **Warp-cooperative MMVQ kernels**: Port `gfx906_mul_mat_vec_q4_0_warp_coop` for Q4_0, Q4_1, Q8_0. | `gfx906/matmul/mmvq-q4_0.cuh` |
+| 2.8 | **VecDotQ with DPP**: Port dot-product accumulation using DPP reductions. | `gfx906/quantize/vecdotq.cuh` |
 
-**Exit criteria**: Benchmark suite shows measurable throughput improvement over Phase 0 hipified kernels on MI50.
-
----
-
-## Phase 2 — Quantization Backend
-
-**Goal**: Full quantized inference support — Q4_0, Q4_1, Q8_0, Q8_1 — with
-GFX906-optimized dequant and matmul-vec kernels.
-
-| # | Task | Source |
-|---|------|--------|
-| 2.1 | Port GGML quantization type definitions and dequant routines to `candle-hip-kernels`. Candle's `quantized.cu` already has `CC_OFFSET_AMD` / `CC_RDNA*` defines — extend with `CC_GCN906`. | `candle-kernels/src/quantized.cu` |
-| 2.2 | **Warp-cooperative MMVQ kernels**: Port `gfx906_mul_mat_vec_q4_0_warp_coop` — half-warp (32 threads) cooperative per-row MVMs for Q4_0, Q4_1, Q8_0. Use vectorized 32-bit loads for nibble unpacking. | `gfx906/matmul/mmvq-q4_0.cuh` |
-| 2.3 | **VecDotQ with DPP**: Port dot-product accumulation using DPP reductions instead of `__shfl_xor_sync`. | `gfx906/quantize/vecdotq.cuh` |
-| 2.4 | **Q8 activation cache**: Implement fused RMS-norm + Q8_1 quantize kernel for KV cache compression. Shared-memory tile caching with adaptive loads. | `gfx906/fused/norm-fused-q8.cu` |
-| 2.5 | Wire quantized types into Candle's `GgmlDType` enum and `QStorage` trait. Ensure `candle-transformers` quantized model loaders work with HIP backend. | `candle-core/src/quantized/` |
-
-**Exit criteria**: Quantized Llama/Mistral inference runs end-to-end on MI50 with Q4_0 GGUF weights.
+**Exit criteria**: Benchmark suite shows measurable throughput improvement over Phase 0/1 hipified kernels on MI50.
 
 ---
 
@@ -160,7 +163,7 @@ candle (workspace)
 
 | Decision | Recommendation | Rationale |
 |----------|---------------|-----------|
-| HIP runtime binding | `cudarc` + HIP compat layer first, `hipdarc` later | Fastest path to working backend; HIP's CUDA compat covers ~95% of cudarc API surface |
+| HIP runtime binding | `hipdarc` (dedicated safe wrapper) | cudarc assumes CUDA types too deeply; hipdarc gives full control |
 | Kernel compilation | `hipcc` → HSACO (not hipify→PTX) | Native GCN codegen required for DPP intrinsics and ISA-level tuning |
 | BLAS | rocBLAS (not hipBLAS) | rocBLAS is the actual implementation; hipBLAS is a thin wrapper |
 | Flash attention | Custom tile kernels, not CK | CK is heavy dependency; llamacpp-turbo kernels are proven and tuned for gfx906 specifically |
@@ -172,16 +175,29 @@ candle (workspace)
 ## Estimated Complexity & Dependencies
 
 ```
-Phase 0  ██████████████████████████  [Large]   — ROCm 7.1+, hipcc, rocBLAS
-Phase 1  ████████████████            [Medium]  — Phase 0
-Phase 2  ████████████████            [Medium]  — Phase 0 + 1
-Phase 3  ██████████████████████████  [Large]   — Phase 0 + 1
+Phase 0  ██████████████████████████  [Large]   — DONE ✓
+Phase 1  ████████████                [Medium]  — Phase 0 (quantized inference wiring)
+Phase 2  ████████████████            [Medium]  — Phase 0 (kernel optimizations)
+Phase 3  ██████████████████████████  [Large]   — Phase 0 (flash attention)
 Phase 4  ████████████████            [Medium]  — Phase 0 + Phase 3
-Phase 5  ████████████████████        [Med-Lrg] — Phase 1-3
+Phase 5  ████████████████████        [Med-Lrg] — Phase 2-3
 Phase 6  ████████████                [Small]   — All phases (incremental)
 ```
 
-Phases 1, 2, and 3 can be developed in parallel after Phase 0 completes.
+Phase 1 is the critical path to real-world usability.
+Phases 2 and 3 can proceed in parallel after Phase 1.
+
+---
+
+## Known Tradeoffs & Technical Debt
+
+| Item | Current state | Impact | Revisit when |
+|------|--------------|--------|-------------|
+| **RNG on CPU** | `rand` crate generates on host, uploads to device. hiprand/rocrand segfaults on ROCm 7.1.1. | Slower for large random tensors (extra H2D copy). Doesn't affect inference perf. | ROCm update or rocrand fix. Phase 2+ if profiling shows bottleneck. |
+| **No FP8 support** | F8E4M3 gated out (`UnsupportedDtype`). GFX906 has no FP8 hardware. | No impact — FP8 is CDNA2+ only. | Never for gfx906; add for gfx90a+ if targeting MI250X. |
+| **BF16 emulated** | All bf16 math goes through f32 promotion. Correct but ~3× slower than native. | Acceptable for Phase 0-1. | Phase 2 — consider keeping activations in f16 instead of bf16. |
+| **Raw ELF HSACO** | `--no-gpu-bundle-output` to avoid Clang offload bundle. | Works but limits to single arch per build. | Multi-arch support: remove flag, let runtime unbundle. |
+| **PASCAL-era MMQ tiles** | All quantized MMQ kernels use 64×64 tiles (renamed to GFX906). | Correctness OK, not perf-optimal. | Phase 2 — tune tile sizes per quant type for gfx906 LDS. |
 
 ---
 
