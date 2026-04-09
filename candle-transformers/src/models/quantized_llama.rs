@@ -703,7 +703,13 @@ impl ModelWeights {
             Some(self.mask(seq_len, index_pos, x.device())?)
         };
         let _enter = self.span.enter();
-        let mut layer_in = self.tok_embeddings.forward(x)?;
+        // Embedding is on CPU — move token IDs to CPU if needed
+        let x_for_embed = if x.device().is_cpu() {
+            x.clone()
+        } else {
+            x.to_device(&Device::Cpu)?
+        };
+        let mut layer_in = self.tok_embeddings.forward(&x_for_embed)?;
         for layer in self.layers.iter_mut() {
             // Transfer activations to this layer's device if needed
             if !layer_in.device().same_device(&layer.device) {
