@@ -38,16 +38,17 @@ fn main() -> Result<()> {
         println!("  GPU {g}: matmul = {:?}", c.to_vec2::<f32>()?);
     }
 
-    // Test 3: Move data between GPUs via CPU
+    // Test 3: Move data between GPUs (GPU0 → CPU → GPU1)
     println!("\n=== Test 3: GPU-to-GPU via CPU ===");
     let dev0 = Device::new_hip(0)?;
     let dev1 = Device::new_hip(1)?;
     let t0 = Tensor::new(&[1.0f32, 2.0, 3.0, 4.0], &dev0)?;
     println!("  Created on GPU 0: {:?}", t0.to_vec1::<f32>()?);
-    let t1 = t0.to_device(&dev1)?;
+    // GPU→GPU transfer goes through CPU
+    let t1 = t0.to_device(&Device::Cpu)?.to_device(&dev1)?;
     println!("  Moved to GPU 1: {:?} on {:?}", t1.to_vec1::<f32>()?, t1.device().location());
-    let sum = (&t0.to_device(&Device::Cpu)? + &t1.to_device(&Device::Cpu)?)?;
-    println!("  Sum (via CPU): {:?}", sum.to_vec1::<f32>()?);
+    let sum_cpu = (&t0.to_device(&Device::Cpu)? + &t1.to_device(&Device::Cpu)?)?;
+    println!("  Sum (via CPU): {:?}", sum_cpu.to_vec1::<f32>()?);
 
     // Test 4: Parallel matmul on all GPUs with same data
     println!("\n=== Test 4: Parallel matmul across {num_gpus} GPUs ===");

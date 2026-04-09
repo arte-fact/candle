@@ -2387,6 +2387,10 @@ impl Tensor {
                     let dst_storage = storage.transfer_to_device(cuda)?;
                     Storage::Cuda(dst_storage)
                 }
+                (Storage::Cpu(storage), Device::Hip(hip)) => {
+                    Storage::Hip(hip.storage_from_cpu_storage(storage)?)
+                }
+                (Storage::Hip(storage), Device::Cpu) => Storage::Cpu(storage.to_cpu_storage()?),
                 (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
                 _ => {
                     bail!(
