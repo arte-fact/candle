@@ -274,6 +274,22 @@ impl Tensor {
                     Device::Metal(_) => {
                         return Err(Error::Msg("Metal support not compiled".to_string()));
                     }
+                    #[cfg(feature = "hip")]
+                    Device::Hip(device) => {
+                        let cpu_storage = match dtype {
+                            DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
+                            DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
+                            DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
+                            DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
+                            _ => unreachable!(),
+                        };
+                        let hip_storage = crate::backend::BackendDevice::storage_from_cpu_storage(device, &cpu_storage)?;
+                        Storage::Hip(hip_storage)
+                    }
+                    #[cfg(not(feature = "hip"))]
+                    Device::Hip(_) => {
+                        return Err(Error::Msg("Hip support not compiled".to_string()));
+                    }
                 };
 
                 let op = BackpropOp::none();
@@ -369,6 +385,22 @@ fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
         #[cfg(not(feature = "metal"))]
         Device::Metal(_) => {
             return Err(Error::Msg("Metal support not compiled".to_string()));
+        }
+        #[cfg(feature = "hip")]
+        Device::Hip(device) => {
+            let cpu_storage = match dtype {
+                DType::F6E2M3 => crate::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
+                DType::F6E3M2 => crate::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
+                DType::F4 => crate::cpu_backend::CpuStorage::F4(data.to_vec()),
+                DType::F8E8M0 => crate::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
+                _ => unreachable!(),
+            };
+            let hip_storage = crate::backend::BackendDevice::storage_from_cpu_storage(device, &cpu_storage)?;
+            Storage::Hip(hip_storage)
+        }
+        #[cfg(not(feature = "hip"))]
+        Device::Hip(_) => {
+            return Err(Error::Msg("Hip support not compiled".to_string()));
         }
     };
 

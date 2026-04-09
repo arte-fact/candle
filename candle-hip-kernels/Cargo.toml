@@ -1,0 +1,11 @@
+[package]
+name = "candle-hip-kernels"
+version = "0.10.2"
+edition = "2021"
+description = "HIP/ROCm GPU kernels for the Candle ML framework"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+half = { version = "2.5.0", features = ["num-traits"] }
+
+[build-dependencies]

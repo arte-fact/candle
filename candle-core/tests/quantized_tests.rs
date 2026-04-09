@@ -135,7 +135,7 @@ fn quantized_matmul(device: &Device) -> Result<()> {
                 [342030.0, 994630.0, 1656248.0, 2302250.0]
             ]
         ),
-        Device::Cpu => assert_eq!(
+        Device::Hip(_) | Device::Cpu => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[
                 [85120.0, 214562.0, 345455.0, 474748.0],
@@ -199,7 +199,7 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
                 [-196045.0, 63030.0, 324120.0, 587079.0]
             ]
         ),
-        Device::Cpu => assert_eq!(
+        Device::Hip(_) | Device::Cpu => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[
                 [243524.0, -19596.0, -285051.0, -549815.0],

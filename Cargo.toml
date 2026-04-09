@@ -16,8 +16,10 @@ exclude = [
     "candle-flash-attn",
     "candle-flash-attn-v3",
     "candle-kernels",
+    "candle-hip-kernels",
     "candle-metal-kernels",
     "candle-onnx",
+    "hipdarc",
 ]
 resolver = "2"
 
@@ -39,6 +41,7 @@ candle = { path = "./candle-core", package = "candle-core", version = "0.10.2" }
 candle-datasets = { path = "./candle-datasets", version = "0.10.2" }
 candle-flash-attn = { path = "./candle-flash-attn", version = "0.10.2" }
 candle-flash-attn-v3 = { path = "./candle-flash-attn-v3", version = "0.10.2" }
+candle-hip-kernels = { path = "./candle-hip-kernels", version = "0.10.2" }
 candle-kernels = { path = "./candle-kernels", version = "0.10.2" }
 candle-metal-kernels = { path = "./candle-metal-kernels", version = "0.10.2" }
 candle-nn = { path = "./candle-nn", version = "0.10.2" }
@@ -59,6 +62,7 @@ cudarc = { version = "0.19.4", features = [
     "cuda-version-from-build-system",
     "dynamic-linking",
 ], default-features = false }
+hipdarc = { path = "./hipdarc", version = "0.1.0" }
 fancy-regex = "0.17.0"
 gemm = { version = "0.19.0", features = ["wasm-simd128-enable"] }
 hf-hub = "0.4.1"

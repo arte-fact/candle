@@ -12,11 +12,13 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 byteorder = { workspace = true }
+candle-hip-kernels = { workspace = true, optional = true }
 candle-kernels = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
+hipdarc = { workspace = true, optional = true }
 gemm = { workspace = true }
 half = { workspace = true }
 float8 = { workspace = true }
@@ -48,6 +50,7 @@ criterion = { workspace = true }
 default = []
 cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
+hip = ["dep:hipdarc", "dep:candle-hip-kernels"]
 nccl = ["cuda", "cudarc/nccl"]
 mkl = ["dep:libc", "dep:intel-mkl-src"]
 accelerate = ["dep:libc", "dep:accelerate-src"]
@@ -70,3 +73,7 @@ required-features = ["metal"]
 [[example]]
 name = "cuda_basics"
 required-features = ["cuda"]
+
+[[example]]
+name = "hip_basics"
+required-features = ["hip"]

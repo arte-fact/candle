@@ -28,6 +28,10 @@ pub fn metal_is_available() -> bool {
     cfg!(feature = "metal")
 }
 
+pub fn hip_is_available() -> bool {
+    cfg!(feature = "hip")
+}
+
 pub fn with_avx() -> bool {
     cfg!(target_feature = "avx2")
 }

@@ -57,12 +57,15 @@ pub mod cpu;
 pub mod cpu_backend;
 #[cfg(feature = "cuda")]
 pub mod cuda_backend;
+#[cfg(feature = "hip")]
+pub mod hip_backend;
 mod custom_op;
 mod device;
 pub mod display;
 mod dtype;
 pub mod dummy_cuda_backend;
 pub mod dummy_dtype;
+pub mod dummy_hip_backend;
 mod dummy_metal_backend;
 pub mod error;
 mod indexer;
@@ -121,6 +124,12 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
+
+#[cfg(feature = "hip")]
+pub use hip_backend::{HipDevice, HipError, HipStorage};
+
+#[cfg(not(feature = "hip"))]
+pub use dummy_hip_backend::{HipDevice, HipError, HipStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
