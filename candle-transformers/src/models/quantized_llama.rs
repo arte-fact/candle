@@ -253,7 +253,7 @@ impl LayerWeights {
             att.matmul(&v.contiguous()?)?
         };
 
-        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?;
+        let y = y.transpose(1, 2)?.reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
         let y = self.attention_wo.forward(&y)?;
         Ok(y)
     }
