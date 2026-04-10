@@ -358,17 +358,36 @@ fn launch_mul_mat_vec_q8_1_chunk(
     };
     let kernel_name = format!("{kernel_name}{b_size}");
     let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::QUANTIZED)?;
-    // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
-    let (nblocks, nwarps) = match b_size {
-        1 => (nrows as u32, 4),
-        2..=4 => ((nrows as u32).div_ceil(2), 4),
-        5..=8 => ((nrows as u32).div_ceil(2), 2),
-        _ => unreachable!(),
-    };
-    let cfg = hipdarc::driver::LaunchConfig {
-        grid_dim: (nblocks, 1, 1),
-        block_dim: (WARP_SIZE as u32, nwarps, 1),
-        shared_mem_bytes: 0,
+
+    // For decode (b_size=1) on Q4_0/Q4_1/Q8_0 we use the gfx906
+    // warp-cooperative kernel (1 wavefront, 2 rows per block, half-warp
+    // per row). The K-quant b_size=1 kernels and all b_size>1 paths still
+    // use the original ggml-cuda template which expects (WARP_SIZE,4,1)
+    // or (WARP_SIZE,2,1) blocks.
+    let warp_coop = b_size == 1
+        && matches!(
+            dtype,
+            GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0
+        );
+    let cfg = if warp_coop {
+        hipdarc::driver::LaunchConfig {
+            grid_dim: ((nrows as u32).div_ceil(2), 1, 1),
+            block_dim: (WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    } else {
+        // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
+        let (nblocks, nwarps) = match b_size {
+            1 => (nrows as u32, 4),
+            2..=4 => ((nrows as u32).div_ceil(2), 4),
+            5..=8 => ((nrows as u32).div_ceil(2), 2),
+            _ => unreachable!(),
+        };
+        hipdarc::driver::LaunchConfig {
+            grid_dim: (nblocks, 1, 1),
+            block_dim: (WARP_SIZE as u32, nwarps, 1),
+            shared_mem_bytes: 0,
+        }
     };
 
     let mut builder = func.builder();

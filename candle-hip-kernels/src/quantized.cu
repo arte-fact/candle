@@ -105,7 +105,13 @@ static __device__ __forceinline__ int __vsubss4(int a, int b) {
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= MIN_CC_DP4A
     return __dp4a(a, b, c);
-#else // software fallback (used on HIP/gfx906 which lacks dp4a)
+#elif defined(__HIP_PLATFORM_AMD__) && (defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__))
+    // gfx906+ has v_dot4_i32_i8 (a single-cycle 4×i8 dot product). The
+    // previous fallback was a 4-iteration software loop, which made every
+    // quantized matmul on AMD pay a ~4× perf tax for no reason. Confirmed
+    // in llama.cpp's ggml-cuda/common.cuh `ggml_cuda_dp4a`.
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#else // software fallback for older GPUs / CPU
     const int8_t * a8 = (const int8_t *) &a;
     const int8_t * b8 = (const int8_t *) &b;
     return c + a8[0]*b8[0] + a8[1]*b8[1] + a8[2]*b8[2] + a8[3]*b8[3];
@@ -2568,22 +2574,220 @@ static __device__ void mul_mat_vec_q(
     }
 }
 
-// batch size = 1
-extern "C" __global__ void mul_mat_vec_q4_0_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+// ============================================================================
+// gfx906 warp-cooperative MMVQ kernels for Q4_0/Q4_1/Q8_0 (decode hot path)
+// ============================================================================
+//
+// Each block is a single 64-lane wavefront. Lanes 0..31 process row 2k,
+// lanes 32..63 process row 2k+1 — i.e. half a wavefront per row. Each
+// thread walks every 32nd Q4_0/Q4_1/Q8_0 block of its row, accumulates a
+// dp4a sum, then a half-warp __shfl_xor reduction collapses to one float
+// per row that lane 0 / lane 32 writes back.
+//
+// Why this is faster than the upstream candle/ggml `mul_mat_vec_q<1, …>`
+// kernel:
+//   - 64 threads per block instead of 256: fewer lanes idle for short rows
+//     and one full wavefront fits the natural unit on gfx906.
+//   - 2 rows per block instead of 1: halves the block-launch count, which
+//     was a real bottleneck on the ~4096-row projection matmuls in qwen3.x
+//     and gemma4 decode.
+//   - Loads 8 ints of weight + 8 ints of input per block via `memcpy`
+//     instead of byte-by-byte indexing — gives the compiler clean dword
+//     loads that go through the L1 cache fast path.
+//   - Pure half-warp reduction at the end (no shared memory traffic).
+//
+// Ports `gfx906_mul_mat_vec_q{4_0,4_1,8_0}_warp_coop` from llamacpp-turbo,
+// stripped of the multi-channel/multi-sample/MoE-id parameters that
+// candle's MMVQ caller doesn't use.
+//
+// Reference:
+//   /artefact/llamacpp-turbo/llama-cpp-gfx906-turbo/ggml/src/ggml-cuda/
+//     gfx906/matmul/mmvq-{q4_0,q4_1,q8_0}.cuh
 
-    mul_mat_vec_q<1, QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+template<int width>
+static __device__ __forceinline__ float gfx906_half_warp_reduce_sum(float x) {
+    // Half-warp shuffle reduction. width=32 keeps the shuffle inside lanes
+    // 0..31 (or 32..63), so the two row-groups in the same wavefront don't
+    // contaminate each other.
+    #pragma unroll
+    for (int offset = width / 2; offset > 0; offset >>= 1) {
+        x += __shfl_xor(x, offset, width);
+    }
+    return x;
 }
 
-extern "C" __global__ void mul_mat_vec_q4_1_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q4_0_q8_1_cuda1(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
-    mul_mat_vec_q<1, QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    (void) nrows_y; // padded q8_1 stride is encoded by ncols_x rounded up
+
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK4_0;
+    const block_q4_0 * x = (const block_q4_0 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q4_0 * bq4 = x + ib;
+        const block_q8_1 * bq8 = y + ib;
+
+        // 16 bytes of Q4_0 quantized values (32 nibbles)
+        int v0, v1, v2, v3;
+        memcpy(&v0, bq4->qs +  0, 4);
+        memcpy(&v1, bq4->qs +  4, 4);
+        memcpy(&v2, bq4->qs +  8, 4);
+        memcpy(&v3, bq4->qs + 12, 4);
+
+        // 32 bytes of Q8_1 quantized values
+        const int * q8 = (const int *) bq8->qs;
+        const int u0 = q8[0], u1 = q8[1], u2 = q8[2], u3 = q8[3];
+        const int u4 = q8[4], u5 = q8[5], u6 = q8[6], u7 = q8[7];
+
+        // 8 dp4a — full 32-element dot product per block
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, u0, sumi);
+        sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, u4, sumi);
+        sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, u1, sumi);
+        sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, u5, sumi);
+        sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, u2, sumi);
+        sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, u6, sumi);
+        sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, u3, sumi);
+        sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, u7, sumi);
+
+        // Q4_0 formula: d4 * (sumi * d8 - 8 * s8). The "-8" comes from the
+        // fact that Q4_0 stores nibbles in [0,15] and gets reinterpreted as
+        // signed [-8,7] at multiply time, so the bias accumulates as -8*sum(y).
+        const float d4 = __half2float(bq4->d);
+        const float2 ds8 = __half22float2(bq8->ds);
+        sumf += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+    }
+
+    sumf = gfx906_half_warp_reduce_sum<32>(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
 }
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q4_1_q8_1_cuda1(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK4_1;
+    const block_q4_1 * x = (const block_q4_1 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q4_1 * bq4 = x + ib;
+        const block_q8_1 * bq8 = y + ib;
+
+        int v0, v1, v2, v3;
+        memcpy(&v0, bq4->qs +  0, 4);
+        memcpy(&v1, bq4->qs +  4, 4);
+        memcpy(&v2, bq4->qs +  8, 4);
+        memcpy(&v3, bq4->qs + 12, 4);
+
+        const int * q8 = (const int *) bq8->qs;
+        const int u0 = q8[0], u1 = q8[1], u2 = q8[2], u3 = q8[3];
+        const int u4 = q8[4], u5 = q8[5], u6 = q8[6], u7 = q8[7];
+
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, u0, sumi);
+        sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, u4, sumi);
+        sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, u1, sumi);
+        sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, u5, sumi);
+        sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, u2, sumi);
+        sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, u6, sumi);
+        sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, u3, sumi);
+        sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, u7, sumi);
+
+        // Q4_1 has (d, m); Q8_1 has (d, s). Result = sumi * d4 * d8 + m4 * s8.
+        const float2 dm4 = __half22float2(bq4->dm);
+        const float2 ds8 = __half22float2(bq8->ds);
+        sumf += sumi * dm4.x * ds8.x + dm4.y * ds8.y;
+    }
+
+    sumf = gfx906_half_warp_reduce_sum<32>(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q8_0_q8_1_cuda1(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK8_0;
+    const block_q8_0 * x = (const block_q8_0 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q8_0 * bq8_0 = x + ib;
+        const block_q8_1 * bq8_1 = y + ib;
+
+        // Both Q8_0 and Q8_1 are int8 arrays — load as 8 ints each.
+        const int * v = (const int *) bq8_0->qs;
+        const int * u = (const int *) bq8_1->qs;
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(v[0], u[0], sumi);
+        sumi = ggml_cuda_dp4a(v[1], u[1], sumi);
+        sumi = ggml_cuda_dp4a(v[2], u[2], sumi);
+        sumi = ggml_cuda_dp4a(v[3], u[3], sumi);
+        sumi = ggml_cuda_dp4a(v[4], u[4], sumi);
+        sumi = ggml_cuda_dp4a(v[5], u[5], sumi);
+        sumi = ggml_cuda_dp4a(v[6], u[6], sumi);
+        sumi = ggml_cuda_dp4a(v[7], u[7], sumi);
+
+        // Q8_0 formula: d0 * d1 * sumi (no bias term).
+        const float d0 = __half2float(bq8_0->d);
+        const float d1 = __low2float(bq8_1->ds);
+        sumf += d0 * d1 * (float) sumi;
+    }
+
+    sumf = gfx906_half_warp_reduce_sum<32>(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
+// ============================================================================
+// Original mul_mat_vec_q1 wrappers — kept for Q5_0/Q5_1 + K-quants which
+// don't have a warp-cooperative variant yet.
+// ============================================================================
+//
+// (Q4_0/Q4_1/Q8_0 entry points above replace the older `extern "C"`
+//  wrappers; the dispatch in `candle-core/src/quantized/hip.rs` keeps the
+//  same kernel name `mul_mat_vec_q4_0_q8_1_cuda1` etc., so no caller changes
+//  are needed.)
 
 extern "C" __global__ void mul_mat_vec_q5_0_q8_1_cuda1(
     const void * vx, const void * vy, float * dst,
@@ -2601,13 +2805,7 @@ extern "C" __global__ void mul_mat_vec_q5_1_q8_1_cuda1(
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void mul_mat_vec_q8_0_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
-    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
-
-    mul_mat_vec_q<1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
-}
+// (mul_mat_vec_q8_0_q8_1_cuda1 is defined above as the gfx906 warp-coop variant.)
 
 extern "C" __global__ void mul_mat_vec_q2_K_q8_1_cuda1(
     const void * vx, const void * vy, float * dst,
