@@ -161,21 +161,39 @@ impl HipStream {
     /// to `hipMalloc` if the async API isn't supported.
     pub fn alloc<T: DeviceRepr>(&self, len: usize) -> Result<HipSlice<T>, DriverError> {
         self.device.set_current()?;
+        let ordinal = self.device.ordinal;
         if len == 0 {
             return Ok(HipSlice {
                 ptr: std::ptr::null_mut(),
                 len: 0,
                 free_stream: std::ptr::null_mut(),
+                device_ordinal: -1,
                 _marker: PhantomData,
             });
         }
         let size = len * std::mem::size_of::<T>();
+        // Pool fast path: if a buffer of exactly this byte size is
+        // sitting in the per-device pool, take it. The pool is
+        // populated on `Drop` so steady-state inference (which reuses
+        // the same shapes every forward) hits the pool from the
+        // second forward onward, avoiding hipMallocAsync entirely.
+        if let Some(ptr) = pool_try_take(ordinal, size) {
+            return Ok(HipSlice {
+                ptr,
+                len,
+                // The pooled buffer was originally allocated via
+                // hipMallocAsync; the `free_stream` field is only
+                // consulted in the (now-inactive) capture path, so
+                // it's fine to leave it null here.
+                free_stream: std::ptr::null_mut(),
+                device_ordinal: ordinal,
+                _marker: PhantomData,
+            });
+        }
         let mut ptr = std::ptr::null_mut();
-        // Try the async pool first; fall back if it returns
-        // hipErrorNotSupported (older ROCm or unsupported device).
-        // The free path mirrors this: free_stream is set iff the alloc
-        // came from the async pool — that way `Drop` knows whether to
-        // call `hipFreeAsync(stream)` or sync `hipFree`.
+        // Pool miss: allocate via hipMallocAsync (fast async pool in
+        // the runtime), with a fallback to sync hipMalloc on older
+        // ROCm versions where the async API isn't supported.
         let mut free_stream: sys::hipStream_t = std::ptr::null_mut();
         unsafe {
             let rc = sys::hipMallocAsync(&mut ptr, size, self.raw);
@@ -189,6 +207,7 @@ impl HipStream {
             ptr,
             len,
             free_stream,
+            device_ordinal: ordinal,
             _marker: PhantomData,
         })
     }
@@ -199,15 +218,32 @@ impl HipStream {
         len: usize,
     ) -> Result<HipSlice<T>, DriverError> {
         self.device.set_current()?;
+        let ordinal = self.device.ordinal;
         if len == 0 {
             return Ok(HipSlice {
                 ptr: std::ptr::null_mut(),
                 len: 0,
                 free_stream: std::ptr::null_mut(),
+                device_ordinal: -1,
                 _marker: PhantomData,
             });
         }
         let size = len * std::mem::size_of::<T>();
+        // Pool fast path: take an existing buffer of the right size
+        // and zero it. The memset is still required because the pool
+        // doesn't track buffer initialization state.
+        if let Some(ptr) = pool_try_take(ordinal, size) {
+            unsafe {
+                check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?;
+            }
+            return Ok(HipSlice {
+                ptr,
+                len,
+                free_stream: std::ptr::null_mut(),
+                device_ordinal: ordinal,
+                _marker: PhantomData,
+            });
+        }
         let mut ptr = std::ptr::null_mut();
         let mut free_stream: sys::hipStream_t = std::ptr::null_mut();
         unsafe {
@@ -223,6 +259,7 @@ impl HipStream {
             ptr,
             len,
             free_stream,
+            device_ordinal: ordinal,
             _marker: PhantomData,
         })
     }
@@ -497,12 +534,16 @@ pub struct HipSlice<T> {
     pub(crate) ptr: sys::hipDeviceptr_t,
     pub(crate) len: usize,
     /// Stream this allocation was taken from when created via
-    /// `hipMallocAsync`. Currently retained as scaffolding for a
-    /// future async-free path — `Drop` falls back to sync `hipFree`
-    /// because the back-to-back async-alloc + async-free pattern
-    /// regressed decode by ~25% on ROCm 7.1.1. See `Drop` impl below.
+    /// `hipMallocAsync`. Used by the capture-mode `Drop` path to
+    /// record a `hipFreeAsync` graph node on the right stream.
     #[allow(dead_code)]
     pub(crate) free_stream: sys::hipStream_t,
+    /// Device ordinal this allocation lives on. Stored so `Drop` can
+    /// route the buffer back to the right per-device workspace pool
+    /// without needing to call `hipGetDevice` (which is per-thread
+    /// state and would force a `set_device` round-trip in `Drop`).
+    /// `-1` for the empty / null sentinel.
+    pub(crate) device_ordinal: i32,
     pub(crate) _marker: PhantomData<T>,
 }
 
@@ -548,27 +589,253 @@ impl<T> HipSlice<T> {
 
 impl<T> Drop for HipSlice<T> {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // Inside a HIP graph capture, sync `hipFree` would abort
-            // the capture (HIP forbids synchronous device calls during
-            // capture). Inside capture we route through `hipFreeAsync`
-            // on the capture stream — this records a graph-managed
-            // free node, so the temporary's lifetime becomes part of
-            // the graph itself.
-            //
-            // Outside capture, sync `hipFree` is the fast path. Tested
-            // unconditional `hipFreeAsync` and it regressed decode by
-            // ~25% on ROCm 7.1.1, so we keep the branch.
+        if self.ptr.is_null() {
+            return;
+        }
+        // Inside a HIP graph capture, sync `hipFree` would abort the
+        // capture (HIP forbids synchronous device calls during
+        // capture) and pooling the buffer would let it be reused
+        // mid-graph. Route through `hipFreeAsync` on the capture
+        // stream so the free becomes a graph-managed node.
+        unsafe {
+            let captured_to = capture_active_stream();
+            if !captured_to.is_null() {
+                let _ = sys::hipFreeAsync(self.ptr, captured_to);
+                return;
+            }
+        }
+        // Outside capture: return the buffer to the per-device
+        // workspace pool. The next op of the same byte size on this
+        // device will pop it instead of calling hipMallocAsync. The
+        // pool falls back to `hipFree` if it's disabled or the
+        // bucket is at capacity.
+        let size = self.len * std::mem::size_of::<T>();
+        pool_give_back(self.device_ordinal, self.ptr, size);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-device workspace pool
+// ---------------------------------------------------------------------------
+//
+// Candle's HIP backend allocates a fresh device buffer for every Tensor
+// op output and frees it on drop. For an `n_layers × n_ops_per_layer`
+// transformer forward this generates thousands of hipMallocAsync /
+// hipFree pairs *per forward pass* — measured at 1964 alloc + 1964 free
+// + 491 memset calls per forward of qwen35-9B.
+//
+// Each call is sub-millisecond on its own but they accumulate to
+// ~70-100 ms of pure HIP API host overhead per forward, which is roughly
+// equal to the GPU kernel work itself. llamacpp-turbo bypasses this
+// entirely by allocating one large workspace at startup and slicing
+// into it for every op — we measured ~0.4 alloc calls per forward in
+// turbo vs candle's ~2000.
+//
+// The pool below closes most of this gap: alloc requests of the same
+// byte size hit the pool with a HashMap lookup (~10s of ns) instead
+// of going to the runtime allocator. Buffers returned to the pool on
+// drop become available for the next op of the same size on the same
+// device. Inference workloads reuse the exact same shapes on every
+// forward, so once the pool is warm (~1 forward) the per-op allocator
+// path costs essentially zero.
+//
+// Knobs:
+// - `HIPDARC_DISABLE_POOL=1` skips the pool entirely (for A/B testing).
+// - `HIPDARC_POOL_MAX_BYTES=N` caps total pool size per device. Default
+//   is unbounded — for inference workloads the working set is bounded
+//   by the model and tends to plateau after one forward.
+//
+// Capture-mode interaction: while a HIP graph capture is in progress,
+// drops bypass the pool and go to `hipFreeAsync(capture_stream)` so the
+// free becomes a graph-managed node (otherwise the buffer would be
+// reused mid-graph and corrupt captured kernels). The pool is reused
+// freely between captures.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+/// Per-device pool of free buffers, keyed by byte size.
+/// Stores raw device pointers; the size is implicit in the bucket key.
+///
+/// SAFETY: `sys::hipDeviceptr_t` is `*mut c_void` and not `Send` by
+/// default, but device pointers are valid across host threads — the
+/// HIP runtime treats them as opaque handles. The pool is guarded by
+/// a `Mutex` so concurrent access is serialized.
+unsafe impl Send for DevicePool {}
+unsafe impl Sync for DevicePool {}
+
+struct DevicePool {
+    /// `(ordinal, hip raw stream)` — the pool needs to know which device
+    /// owns these allocations so it can `hipSetDevice` before the
+    /// fallback hipMalloc / hipFree paths.
+    device_ordinal: i32,
+    /// Buckets keyed by *byte* size. Each bucket is a stack of free
+    /// pointers — LIFO so the most-recently-used buffer (likely still
+    /// hot in caches) is reused first.
+    buckets: HashMap<usize, Vec<sys::hipDeviceptr_t>>,
+    /// Total bytes currently held by this pool (sum of bucket entries).
+    /// Used for the optional cap. Pool *capacity* is unbounded by
+    /// default; entries beyond the cap fall back to hipFree on drop.
+    total_bytes: usize,
+    max_bytes: usize,
+}
+
+impl DevicePool {
+    fn new(device_ordinal: i32, max_bytes: usize) -> Self {
+        Self {
+            device_ordinal,
+            buckets: HashMap::new(),
+            total_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    /// Take a buffer of exactly `size` bytes from the pool, or `None`
+    /// if none available. Constant-time HashMap lookup + Vec::pop.
+    fn try_take(&mut self, size: usize) -> Option<sys::hipDeviceptr_t> {
+        let bucket = self.buckets.get_mut(&size)?;
+        let ptr = bucket.pop()?;
+        self.total_bytes -= size;
+        Some(ptr)
+    }
+
+    /// Return a buffer of `size` bytes to the pool. If the pool is at
+    /// capacity, frees the buffer instead.
+    fn give_back(&mut self, ptr: sys::hipDeviceptr_t, size: usize) {
+        // Cap check: if adding this buffer would exceed the cap, free
+        // it via hipFree instead of pooling. This keeps the pool
+        // bounded for workloads with unbounded shape variation (rare
+        // in inference but possible).
+        if self.max_bytes != 0 && self.total_bytes + size > self.max_bytes {
             unsafe {
-                let captured_to = capture_active_stream();
-                if !captured_to.is_null() {
-                    let _ = sys::hipFreeAsync(self.ptr, captured_to);
-                } else {
-                    let _ = sys::hipFree(self.ptr);
+                let _ = sys::hipSetDevice(self.device_ordinal);
+                let _ = sys::hipFree(ptr);
+            }
+            return;
+        }
+        self.buckets.entry(size).or_default().push(ptr);
+        self.total_bytes += size;
+    }
+}
+
+impl Drop for DevicePool {
+    fn drop(&mut self) {
+        // Process exit: free everything we still hold. Best-effort —
+        // the runtime is tearing down anyway.
+        unsafe {
+            let _ = sys::hipSetDevice(self.device_ordinal);
+            for (_size, bucket) in self.buckets.drain() {
+                for ptr in bucket {
+                    let _ = sys::hipFree(ptr);
                 }
             }
         }
     }
+}
+
+/// Global registry of per-device pools. Lazy-initialized on first
+/// access. Each device has its own `Mutex<DevicePool>` so unrelated
+/// devices don't contend.
+static POOLS: OnceLock<Mutex<HashMap<i32, Arc<Mutex<DevicePool>>>>> = OnceLock::new();
+
+/// Cached "is the pool enabled" flag — checked once per process. The
+/// `HIPDARC_DISABLE_POOL` env var lets users opt out for benchmarking
+/// without recompiling.
+static POOL_ENABLED: OnceLock<bool> = OnceLock::new();
+static POOL_MAX_BYTES: OnceLock<usize> = OnceLock::new();
+static POOL_MAX_BUFFER_BYTES: OnceLock<usize> = OnceLock::new();
+
+fn pool_enabled() -> bool {
+    *POOL_ENABLED.get_or_init(|| std::env::var("HIPDARC_DISABLE_POOL").is_err())
+}
+
+fn pool_max_bytes() -> usize {
+    *POOL_MAX_BYTES.get_or_init(|| {
+        std::env::var("HIPDARC_POOL_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            // Default cap: 1 GiB per device. The per-buffer threshold
+            // (see below) keeps the largest individual buffers out of
+            // the pool entirely, so this cap is mostly belt-and-
+            // braces for the case where many medium buffers pile up.
+            // Override with `HIPDARC_POOL_MAX_BYTES` (0 = unbounded).
+            .unwrap_or(1024 * 1024 * 1024)
+    })
+}
+
+/// Maximum size of an individual buffer eligible for the pool.
+/// Buffers larger than this skip the pool on both alloc and free.
+///
+/// Why this matters: candle's `ConcatKvCache` grows the KV cache by
+/// one row per decode step via `Tensor::cat`, which produces a buffer
+/// of a *new* size every step (1, 2, 3, ... rows). Each unique size
+/// lives in its own bucket, hits *exactly once*, and never gets
+/// reused — so pooling them just hoards VRAM. The per-token
+/// activation buffers that *do* benefit from pooling (the wq/wk/wv
+/// projections, ffn intermediate, layer norms) are all under ~256 KB
+/// at typical hidden sizes. The default threshold filters the cache
+/// growth out and keeps the activations.
+///
+/// Override with `HIPDARC_POOL_MAX_BUFFER_BYTES`.
+fn pool_max_buffer_bytes() -> usize {
+    *POOL_MAX_BUFFER_BYTES.get_or_init(|| {
+        std::env::var("HIPDARC_POOL_MAX_BUFFER_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            // 1 MiB: covers all per-token activation buffers for
+            // hidden_size up to ~32K with f32 dtype, while excluding
+            // even modest KV-cache cat results.
+            .unwrap_or(1024 * 1024)
+    })
+}
+
+/// Get or create the per-device pool for `ordinal`.
+fn pool_for(ordinal: i32) -> Arc<Mutex<DevicePool>> {
+    let registry = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().expect("pool registry poisoned");
+    guard
+        .entry(ordinal)
+        .or_insert_with(|| Arc::new(Mutex::new(DevicePool::new(ordinal, pool_max_bytes()))))
+        .clone()
+}
+
+/// Try to take a buffer of `size` bytes from the device pool. Returns
+/// `None` if pooling is disabled, the size is above the per-buffer
+/// threshold, or no buffer of that size is cached.
+#[inline]
+fn pool_try_take(ordinal: i32, size: usize) -> Option<sys::hipDeviceptr_t> {
+    if !pool_enabled() || size > pool_max_buffer_bytes() {
+        return None;
+    }
+    let pool = pool_for(ordinal);
+    let mut guard = pool.lock().ok()?;
+    guard.try_take(size)
+}
+
+/// Return a buffer to the device pool. If pooling is disabled or the
+/// buffer is above the per-buffer threshold, falls back to `hipFree`.
+#[inline]
+fn pool_give_back(ordinal: i32, ptr: sys::hipDeviceptr_t, size: usize) {
+    if !pool_enabled() || size > pool_max_buffer_bytes() {
+        unsafe {
+            let _ = sys::hipSetDevice(ordinal);
+            let _ = sys::hipFree(ptr);
+        }
+        return;
+    }
+    let pool = pool_for(ordinal);
+    let mut guard = match pool.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Poisoned — fall back to direct free.
+            unsafe {
+                let _ = sys::hipSetDevice(ordinal);
+                let _ = sys::hipFree(ptr);
+            }
+            return;
+        }
+    };
+    guard.give_back(ptr, size);
 }
 
 // ---------------------------------------------------------------------------
@@ -579,8 +846,7 @@ impl<T> Drop for HipSlice<T> {
 // drops must be routed through `hipFreeAsync` on the capture stream so
 // they're recorded as graph-managed free nodes — see `with_capture`
 // below for the wrapper that sets this state up. Outside capture, drops
-// take the synchronous `hipFree` fast path because `hipFreeAsync` is
-// measurably slower in steady-state decode (see commit history).
+// take the pool fast path (or sync `hipFree` if the pool is disabled).
 
 use std::cell::Cell;
 
