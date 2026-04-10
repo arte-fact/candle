@@ -165,22 +165,30 @@ impl HipStream {
             return Ok(HipSlice {
                 ptr: std::ptr::null_mut(),
                 len: 0,
+                free_stream: std::ptr::null_mut(),
                 _marker: PhantomData,
             });
         }
         let size = len * std::mem::size_of::<T>();
         let mut ptr = std::ptr::null_mut();
+        // Try the async pool first; fall back if it returns
+        // hipErrorNotSupported (older ROCm or unsupported device).
+        // The free path mirrors this: free_stream is set iff the alloc
+        // came from the async pool — that way `Drop` knows whether to
+        // call `hipFreeAsync(stream)` or sync `hipFree`.
+        let mut free_stream: sys::hipStream_t = std::ptr::null_mut();
         unsafe {
-            // Try the async pool first; fall back if it returns
-            // hipErrorNotSupported (older ROCm or unsupported device).
             let rc = sys::hipMallocAsync(&mut ptr, size, self.raw);
             if rc != sys::hipError_t::hipSuccess {
                 check_hip(sys::hipMalloc(&mut ptr, size))?;
+            } else {
+                free_stream = self.raw;
             }
         };
         Ok(HipSlice {
             ptr,
             len,
+            free_stream,
             _marker: PhantomData,
         })
     }
@@ -195,21 +203,26 @@ impl HipStream {
             return Ok(HipSlice {
                 ptr: std::ptr::null_mut(),
                 len: 0,
+                free_stream: std::ptr::null_mut(),
                 _marker: PhantomData,
             });
         }
         let size = len * std::mem::size_of::<T>();
         let mut ptr = std::ptr::null_mut();
+        let mut free_stream: sys::hipStream_t = std::ptr::null_mut();
         unsafe {
             let rc = sys::hipMallocAsync(&mut ptr, size, self.raw);
             if rc != sys::hipError_t::hipSuccess {
                 check_hip(sys::hipMalloc(&mut ptr, size))?;
+            } else {
+                free_stream = self.raw;
             }
             check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?;
         }
         Ok(HipSlice {
             ptr,
             len,
+            free_stream,
             _marker: PhantomData,
         })
     }
@@ -340,6 +353,13 @@ impl std::fmt::Debug for HipStream {
 pub struct HipSlice<T> {
     pub(crate) ptr: sys::hipDeviceptr_t,
     pub(crate) len: usize,
+    /// Stream this allocation was taken from when created via
+    /// `hipMallocAsync`. Currently retained as scaffolding for a
+    /// future async-free path — `Drop` falls back to sync `hipFree`
+    /// because the back-to-back async-alloc + async-free pattern
+    /// regressed decode by ~25% on ROCm 7.1.1. See `Drop` impl below.
+    #[allow(dead_code)]
+    pub(crate) free_stream: sys::hipStream_t,
     pub(crate) _marker: PhantomData<T>,
 }
 
@@ -387,6 +407,13 @@ impl<T> Drop for HipSlice<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe {
+                // Sync `hipFree` here even when the alloc came from
+                // `hipMallocAsync`. Tested `hipFreeAsync` and it tanked
+                // decode by ~25% — likely because the back-to-back
+                // async-alloc + async-free pattern serialises on the
+                // runtime's pool lock harder than the sync free does.
+                // Keeping `free_stream` on the struct in case a future
+                // ROCm release fixes this.
                 let _ = sys::hipFree(self.ptr);
             }
         }
