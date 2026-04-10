@@ -33,16 +33,33 @@ echo
 cargo test -p candle-core --features hip --release --lib graph_smoke --no-run 2>&1 | tail -3
 echo
 
-# The bench is `#[ignore]` so it only runs with --ignored. The test
-# itself prints baseline / replay / speedup on stderr — capture both
-# stdout and stderr so the user sees everything.
+# Two `#[ignore]`d variants:
+#
+#   capture_replay_kernel_only_floor   — chain of `hipMemsetAsync`
+#       calls against a pre-allocated buffer. No alloc/free nodes
+#       in the captured graph. Measures the floor: how fast can
+#       graph replay be on this hardware when the graph is *just*
+#       kernels?
+#
+#   capture_replay_chained_bench       — chain of candle Tensor
+#       (matmul → relu) pairs. Each op allocates an output tensor
+#       so the captured graph contains many `hipMallocAsync` /
+#       `hipFreeAsync` nodes. Measures the realistic case for
+#       capturing a candle forward as-is.
 cargo test -p candle-core --features hip --release --lib \
-    capture_replay_chained_bench -- --nocapture --ignored 2>&1 | tail -40
+    graph_smoke -- --nocapture --include-ignored 2>&1 | tail -50
 
 echo
 echo "=== bench complete ==="
 echo
-echo "If 'speedup' is >= 3×: the launch-overhead theory is correct, and the"
-echo "  multi-day model-side graph integration is worth investing in."
-echo "If speedup is < 1.5×: the bottleneck is somewhere else (kernel work,"
-echo "  rocBLAS dispatch, or memory traffic) and graphs are the wrong lever."
+echo "Decision matrix:"
+echo "  kernel_only_floor speedup  >>  chained_bench speedup  →"
+echo "    The hardware *can* benefit from graph replay, but the candle"
+echo "    Tensor model is allocating too many temporaries inside the"
+echo "    captured forward. To unlock graphs, we'd need a pre-allocated"
+echo "    intermediate buffer pool that the captured forward writes into,"
+echo "    so the captured graph contains only kernel nodes."
+echo
+echo "  Both speedups < 1.5×  →"
+echo "    HIP graphs are not the right lever on this hardware. Pivot"
+echo "    to operator fusion / GQA-aware matmul instead."
