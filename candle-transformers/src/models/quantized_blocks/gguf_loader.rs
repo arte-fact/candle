@@ -94,6 +94,98 @@ impl Gguf {
         }
     }
 
+    /// Load several quantized weight tensors and concatenate them along
+    /// dim 0 (the output / row dim) into a single fused QMatMul.
+    ///
+    /// All input tensors must share the same `ggml_dtype` and the same
+    /// in_features (last dim). The fused output has shape
+    /// `(sum_of_out_features, in_features)`.
+    ///
+    /// This is the on-load fusion used to collapse the QKV projections
+    /// (and the gate+up FFN projections) into a single matmul launch on
+    /// the forward path. For Q4_0, Q4_1, Q5_K, Q6_K and friends, the
+    /// per-row block layout means concatenating along the row dim is a
+    /// pure byte concatenation of the underlying storage — no scale
+    /// re-computation, no requantization.
+    ///
+    /// Loads the bytes of each constituent tensor from the mmap blob,
+    /// concatenates them in host memory, and uploads the combined
+    /// buffer to the target device as one allocation. Cheaper than
+    /// loading three tensors separately and then trying to merge them
+    /// device-side.
+    pub fn qmatmul_concat_rows(&self, names: &[&str]) -> Result<QMatMul> {
+        if names.is_empty() {
+            candle::bail!("qmatmul_concat_rows: empty name list");
+        }
+        // Look up tensor info for each constituent tensor and validate
+        // they're all compatible for byte concatenation along dim 0.
+        let infos: Vec<&gguf_file::TensorInfo> = names
+            .iter()
+            .map(|n| {
+                self.ct
+                    .tensor_infos
+                    .get(*n)
+                    .ok_or_else(|| candle::Error::Msg(format!("missing tensor: {n}")))
+            })
+            .collect::<Result<_>>()?;
+
+        let dtype = infos[0].ggml_dtype;
+        let dims0 = infos[0].shape.dims();
+        if dims0.len() != 2 {
+            candle::bail!(
+                "qmatmul_concat_rows: expected rank-2 tensors, got {dims0:?} for {}",
+                names[0]
+            );
+        }
+        let in_features = dims0[1];
+        for (info, name) in infos.iter().zip(names.iter()).skip(1) {
+            if info.ggml_dtype != dtype {
+                candle::bail!(
+                    "qmatmul_concat_rows: dtype mismatch ({:?} vs {:?}) for {name}",
+                    dtype,
+                    info.ggml_dtype
+                );
+            }
+            let d = info.shape.dims();
+            if d.len() != 2 || d[1] != in_features {
+                candle::bail!(
+                    "qmatmul_concat_rows: shape mismatch (in_features={in_features}) \
+                     vs {d:?} for {name}"
+                );
+            }
+        }
+        let total_out: usize = infos.iter().map(|i| i.shape.dims()[0]).sum();
+
+        // Read each constituent's raw bytes from the blob and append.
+        let block_size = dtype.block_size();
+        let type_size = dtype.type_size();
+        let mut combined: Vec<u8> = Vec::with_capacity(
+            (total_out * in_features / block_size) * type_size,
+        );
+        for info in &infos {
+            let elems = info.shape.elem_count();
+            if elems % block_size != 0 {
+                candle::bail!(
+                    "qmatmul_concat_rows: elems {elems} not divisible by block_size {block_size}"
+                );
+            }
+            let bytes = elems / block_size * type_size;
+            let abs_offset = self.ct.tensor_data_offset + info.offset;
+            let raw = self.blob.read_to_vec(abs_offset, bytes)?;
+            combined.extend_from_slice(&raw);
+        }
+
+        // Build a single QTensor from the concatenated bytes.
+        let combined_dims = vec![total_out, in_features];
+        let qt = candle::quantized::ggml_file::qtensor_from_ggml(
+            dtype,
+            &combined,
+            combined_dims,
+            &self.device,
+        )?;
+        QMatMul::from_weights(qt.into())
+    }
+
     /// Load a tensor as RmsNorm.
     pub fn rms_norm(&self, name: &str, eps: f64) -> Result<RmsNorm> {
         let ws = self.ct.tensor_from_blob(&self.blob, name, &self.device)?;

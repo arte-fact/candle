@@ -354,9 +354,17 @@ impl StandardAttention {
 /// Used by qwen35/qwen3next full-attention layers.
 /// Reference: llama.cpp qwen35.cpp `build_layer_attn`
 pub struct GatedAttention {
-    wq: QMatMul,   // outputs 2 * n_head * head_dim (Q + gate interleaved stride-2)
-    wk: QMatMul,
-    wv: QMatMul,
+    /// Fused Q+gate, K, V weight: rows
+    /// `[0 .. 2*n_head*head_dim)` are the Q+gate projection (which is
+    /// itself the qwen35 fused Q + per-head gate),
+    /// `[2*n_head*head_dim .. + n_kv_head*head_dim)` are K, the next
+    /// `n_kv_head*head_dim` rows are V. One matmul launch instead of
+    /// three on the forward path.
+    wqkv: QMatMul,
+    /// Output dim of the Q+gate slice: `2 * n_head * head_dim`.
+    qg_out: usize,
+    /// Output dim of the K (and V) slice: `n_kv_head * head_dim`.
+    kv_out: usize,
     wo: QMatMul,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
@@ -373,6 +381,10 @@ pub struct GatedAttention {
 
 impl GatedAttention {
     /// Load from GGUF for a full-attention layer in qwen35-family models.
+    /// Concatenates wq + wk + wv into a single fused weight matrix at
+    /// load time so the forward path issues one matmul launch instead
+    /// of three. The narrows on the fused output recover the
+    /// individual Q+gate, K, and V slices.
     pub fn load(
         gg: &Gguf,
         prefix: &str,
@@ -381,10 +393,18 @@ impl GatedAttention {
         rotary: Arc<RotaryEmbedding>,
     ) -> Result<Self> {
         let n_kv_head = *cfg.head_count_kv.get(layer_idx);
+        let n_head = cfg.head_count;
+        let head_dim = cfg.head_dim;
+        // qwen35 wq carries Q AND a per-head gate, so its row count is
+        // 2 * n_head * head_dim. K and V are vanilla GQA projections.
+        let qg_out = 2 * n_head * head_dim;
+        let kv_out = n_kv_head * head_dim;
 
-        let wq = gg.qmatmul(&format!("{prefix}.attn_q.weight"))?;
-        let wk = gg.qmatmul(&format!("{prefix}.attn_k.weight"))?;
-        let wv = gg.qmatmul(&format!("{prefix}.attn_v.weight"))?;
+        let wq_name = format!("{prefix}.attn_q.weight");
+        let wk_name = format!("{prefix}.attn_k.weight");
+        let wv_name = format!("{prefix}.attn_v.weight");
+        let wqkv = gg.qmatmul_concat_rows(&[&wq_name, &wk_name, &wv_name])?;
+
         let wo = gg.qmatmul(&format!("{prefix}.attn_output.weight"))?;
         let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), cfg.rms_norm_eps)?;
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), cfg.rms_norm_eps)?;
@@ -394,15 +414,15 @@ impl GatedAttention {
         let kv_cache = KvCache::new(2, KV_CACHE_INITIAL);
 
         Ok(Self {
-            wq,
-            wk,
-            wv,
+            wqkv,
+            qg_out,
+            kv_out,
             wo,
             q_norm,
             k_norm,
-            n_head: cfg.head_count,
+            n_head,
             n_kv_head,
-            head_dim: cfg.head_dim,
+            head_dim,
             attn_scale: cfg.default_attention_scale(),
             rotary,
             kv_cache,
@@ -417,11 +437,18 @@ impl GatedAttention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        // Q projection outputs interleaved Q + gate: shape (B, L, 2*n_head*head_dim)
-        let q_full = self.wq.forward(x)?;
+        // Single fused QKV matmul. Output shape:
+        // (B, L, qg_out + kv_out + kv_out)
+        let qkv = self.wqkv.forward(x)?;
 
-        // Split Q and gate using stride-2 view on the head dimension
-        // q_full reshaped to (B, L, n_head, 2*head_dim), then split
+        // Slice the fused output back into Q+gate, K, and V along
+        // the last dim. The narrows are non-contiguous views; the
+        // downstream norms will materialize via .contiguous().
+        let q_full = qkv.narrow(D::Minus1, 0, self.qg_out)?;
+        let k = qkv.narrow(D::Minus1, self.qg_out, self.kv_out)?;
+        let v = qkv.narrow(D::Minus1, self.qg_out + self.kv_out, self.kv_out)?;
+
+        // Q+gate path: reshape to (B, L, n_head, 2*head_dim), split.
         let q_full = q_full.reshape((b_sz, seq_len, self.n_head, 2 * self.head_dim))?;
         let q = q_full.narrow(D::Minus1, 0, self.head_dim)?;
         let gate = q_full.narrow(D::Minus1, self.head_dim, self.head_dim)?;
@@ -433,9 +460,8 @@ impl GatedAttention {
         // Q norm (applied per-head)
         let q = self.q_norm.forward(&q.contiguous()?)?;
 
-        // K, V projections
-        let k = self.wk.forward(x)?;
-        let v = self.wv.forward(x)?;
+        // K, V: reshape to (B, L, n_kv_head, head_dim), transpose to
+        // (B, n_kv_head, L, head_dim).
         let k = k.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
         let v = v.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?.transpose(1, 2)?;
 
