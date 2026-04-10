@@ -20,7 +20,6 @@ use super::norms::l2_norm;
 use super::super::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
 use candle::{Module, Result, Tensor, D};
-use std::io::{Read, Seek};
 
 // ---------------------------------------------------------------------------
 // GdnDimensions: all derived from GgufConfig, no hardcoded values
@@ -188,8 +187,8 @@ pub struct DeltaNetLayer {
 
 impl DeltaNetLayer {
     /// Load from GGUF. Auto-detects alpha/beta vs ba tensor format.
-    pub fn load<R: Read + Seek>(
-        gg: &mut Gguf<R>,
+    pub fn load(
+        gg: &Gguf,
         prefix: &str,
         cfg: &GgufConfig,
         recurrent_idx: usize,

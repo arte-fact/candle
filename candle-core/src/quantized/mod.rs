@@ -41,6 +41,7 @@ pub mod simd128;
 pub mod utils;
 use half::{bf16, f16};
 
+pub use gguf_file::GgufBlob;
 pub use k_quants::GgmlType;
 
 fn as_t_slice<T>(data: Cow<'_, [u8]>) -> &[T] {

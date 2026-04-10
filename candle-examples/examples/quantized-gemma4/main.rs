@@ -102,9 +102,11 @@ fn main() -> anyhow::Result<()> {
     let model_path = std::path::PathBuf::from(&args.model);
     let start = std::time::Instant::now();
 
-    // Transparently handles single-file GGUFs and split `*-NNNNN-of-MMMMM.gguf`
-    // multi-file GGUFs.
-    let (ct, mut file) = gguf_file::Content::read_split_files(&model_path)
+    // mmap-backed loader: handles single-file GGUFs and split
+    // `*-NNNNN-of-MMMMM.gguf` multi-file GGUFs. The returned `GgufBlob` is
+    // shared via `Arc` across rayon workers in `from_gguf_multi_device`,
+    // which loads layer weights in parallel.
+    let (ct, blob) = gguf_file::Content::read_mmap(&model_path)
         .map_err(|e| e.with_path(&model_path))?;
 
     let name = ct.metadata.get("general.name")
@@ -132,9 +134,9 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut model = if devices.len() > 1 {
-        ModelWeights::from_gguf_multi_device(ct, &mut file, &devices)?
+        ModelWeights::from_gguf_multi_device(ct, blob, &devices)?
     } else {
-        ModelWeights::from_gguf(ct, &mut file, &device)?
+        ModelWeights::from_gguf(ct, blob, &device)?
     };
     println!("model built in {:.2}s", start.elapsed().as_secs_f32());
     let mut tos = TokenOutputStream::new(tokenizer);

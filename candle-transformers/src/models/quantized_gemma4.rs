@@ -22,10 +22,10 @@
 
 use crate::models::quantized_blocks::*;
 use crate::quantized_nn::RmsNorm;
-use candle::quantized::gguf_file;
+use candle::quantized::{gguf_file, GgufBlob};
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::Embedding;
-use std::io::{Read, Seek};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 pub const MAX_SEQ_LEN: usize = 131072;
@@ -105,20 +105,21 @@ pub struct ModelWeights {
 }
 
 impl ModelWeights {
-    pub fn from_gguf<R: Read + Seek>(
+    pub fn from_gguf(
         ct: gguf_file::Content,
-        reader: &mut R,
+        blob: Arc<GgufBlob>,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_multi_device(ct, reader, &[device.clone()])
+        Self::from_gguf_multi_device(ct, blob, &[device.clone()])
     }
 
     /// Load with pipeline-parallel layer split across multiple devices.
     /// Token embedding lives on `devices[0]`; output norm + lm_head live on
-    /// the device of the last layer.
-    pub fn from_gguf_multi_device<R: Read + Seek>(
+    /// the device of the last layer. Per-layer weights are loaded in
+    /// parallel via rayon (mmap-backed `Gguf`).
+    pub fn from_gguf_multi_device(
         ct: gguf_file::Content,
-        reader: &mut R,
+        blob: Arc<GgufBlob>,
         devices: &[Device],
     ) -> Result<Self> {
         if devices.is_empty() {
@@ -127,7 +128,7 @@ impl ModelWeights {
         let dev0 = &devices[0];
 
         // ----- read all metadata up front via the shared GgufConfig --------
-        let mut gg = Gguf::new(ct, reader, dev0.clone());
+        let gg = Gguf::new(ct, blob, dev0.clone());
         let cfg = GgufConfig::from_metadata(gg.metadata())?;
         if cfg.arch != "gemma4" {
             candle::bail!("quantized_gemma4 expects arch=gemma4, got {}", cfg.arch);
@@ -239,7 +240,8 @@ impl ModelWeights {
             .collect();
 
         // ----- shared rope_freqs (proportional rope for global layers) -----
-        gg.set_device(dev0.clone());
+        // Read from the dev0-targeted gg (no need for set_device since gg is
+        // already on dev0).
         let rope_freqs: Option<Vec<f32>> = gg
             .try_dequantize("rope_freqs.weight")
             .and_then(|t| t.to_dtype(DType::F32).ok())
@@ -251,20 +253,15 @@ impl ModelWeights {
         // dequantized F32 embedding is 5.6 GB and pushes dev0 over the 16 GB
         // MI50 limit. Keep the embedding on CPU and let the forward pass move
         // the looked-up rows to dev0 (a few KB per token).
-        let tok_tensor = gg.tensor("token_embd.weight")?;
         let cpu = candle::Device::Cpu;
-        let tok_embeddings = Embedding::new(
-            tok_tensor.dequantize(&cpu)?,
-            embedding_length,
-        );
+        let cpu_gg = gg.with_device(cpu.clone());
+        let tok_tensor = cpu_gg.tensor("token_embd.weight")?;
+        let tok_embeddings = Embedding::new(tok_tensor.dequantize(&cpu)?, embedding_length);
 
         // ----- per-layer embedding global components (E4B only) ------------
         let per_layer_embeddings = if n_embd_per_layer > 0 {
-            // Keep the huge per_layer_token_embd on CPU.
-            let cpu = candle::Device::Cpu;
-            gg.set_device(cpu.clone());
-            let pl_embd = gg.try_dequantize("per_layer_token_embd.weight");
-            gg.set_device(dev0.clone());
+            // Keep the huge per_layer_token_embd on CPU; the proj/norm live on dev0.
+            let pl_embd = cpu_gg.try_dequantize("per_layer_token_embd.weight");
             let pl_proj = gg.try_qmatmul("per_layer_model_proj.weight");
             let pl_pn = gg.try_rms_norm("per_layer_proj_norm.weight", rms_norm_eps);
             match (pl_embd, pl_proj, pl_pn) {
@@ -280,130 +277,136 @@ impl ModelWeights {
             None
         };
 
-        // ----- build layers ------------------------------------------------
-        let mut layers = Vec::with_capacity(block_count);
-        for il in 0..block_count {
-            let block_prefix = format!("blk.{il}");
-            let layer_dev_idx = layer_to_device[il];
-            let layer_device = devices[layer_dev_idx].clone();
-            gg.set_device(layer_device.clone());
+        // ----- build layers in parallel via rayon --------------------------
+        // Each rayon worker pulls a cheap Gguf clone for its layer's device,
+        // then loads attn / norms / FFN / per-layer-embed from the shared
+        // mmap'd blob in one shot. With 4 MI50s and gemma4 31B (~17 GB Q4_0)
+        // this drops model build time from ~52 s (sequential) to ~6 s.
+        let layers: Vec<LayerWeights> = (0..block_count)
+            .into_par_iter()
+            .map(|il| -> Result<LayerWeights> {
+                let block_prefix = format!("blk.{il}");
+                let layer_dev_idx = layer_to_device[il];
+                let layer_device = devices[layer_dev_idx].clone();
+                let lgg = gg.with_device(layer_device.clone());
 
-            let is_sliding = is_sliding_per_layer[il];
-            let has_kv = il < n_layer_kv_from_start;
-            let kv_source_idx = kv_source_per_layer[il];
+                let is_sliding = is_sliding_per_layer[il];
+                let has_kv = il < n_layer_kv_from_start;
+                let kv_source_idx = kv_source_per_layer[il];
 
-            // Per-layer head_dim (sliding=key_length_swa, global=key_length).
-            let layer_head_dim = if is_sliding { key_length_swa } else { key_length };
+                // Per-layer head_dim (sliding=key_length_swa, global=key_length).
+                let layer_head_dim = if is_sliding { key_length_swa } else { key_length };
 
-            // Per-layer rotated dimension count.
-            let rotated_dim = if is_sliding {
-                rope_dim_count_swa.unwrap_or(layer_head_dim)
-            } else {
-                rope_dim_count.unwrap_or_else(|| {
-                    let partial = (layer_head_dim as f64 * 0.25) as usize;
-                    (partial & !1).max(2)
+                // Per-layer rotated dimension count.
+                let rotated_dim = if is_sliding {
+                    rope_dim_count_swa.unwrap_or(layer_head_dim)
+                } else {
+                    rope_dim_count.unwrap_or_else(|| {
+                        let partial = (layer_head_dim as f64 * 0.25) as usize;
+                        (partial & !1).max(2)
+                    })
+                };
+                let layer_rope_freq = if is_sliding {
+                    rope_freq_base_swa
+                } else {
+                    rope_freq_base
+                };
+                let layer_freq_factors: Option<&[f32]> =
+                    if !is_sliding { rope_freqs.as_deref() } else { None };
+
+                let rotary = Arc::new(RotaryEmbedding::new_with_freq_factors(
+                    layer_rope_freq as f64,
+                    rotated_dim,
+                    MAX_SEQ_LEN.min(cfg.max_seq_len()),
+                    layer_freq_factors,
+                    DType::F32,
+                    &layer_device,
+                )?);
+
+                // Per-layer GgufConfig clone with the right head_dim/n_kv_head.
+                let mut layer_cfg = cfg.clone();
+                layer_cfg.head_dim = layer_head_dim;
+                layer_cfg.head_count_kv = PerLayer::Uniform(head_count_kv_per_layer[il]);
+
+                let attn_opts = StandardAttentionOpts {
+                    use_v_norm: true,
+                    use_gemma_norms: false,
+                    attention_scale: Some(1.0),
+                };
+                let attn = StandardAttention::load_with_opts(
+                    &lgg,
+                    &block_prefix,
+                    &layer_cfg,
+                    il,
+                    rotary,
+                    attn_opts,
+                )?;
+
+                let attn_norm =
+                    lgg.rms_norm(&format!("{block_prefix}.attn_norm.weight"), rms_norm_eps)?;
+                let post_attention_norm = lgg.rms_norm(
+                    &format!("{block_prefix}.post_attention_norm.weight"),
+                    rms_norm_eps,
+                )?;
+                let ffn_norm =
+                    lgg.rms_norm(&format!("{block_prefix}.ffn_norm.weight"), rms_norm_eps)?;
+                let post_ffn_norm = lgg
+                    .rms_norm(&format!("{block_prefix}.post_ffw_norm.weight"), rms_norm_eps)?;
+
+                // Gemma4 FFN uses GeGLU.
+                let mlp = DenseMlp::load_with_activation(
+                    &lgg,
+                    &block_prefix,
+                    MlpActivation::Gelu,
+                )?;
+
+                let layer_output_scale =
+                    lgg.try_dequantize(&format!("{block_prefix}.layer_output_scale.weight"));
+
+                let per_layer_embed = if n_embd_per_layer > 0 {
+                    let inp_gate = lgg.try_qmatmul(&format!("{block_prefix}.inp_gate.weight"));
+                    let proj = lgg.try_qmatmul(&format!("{block_prefix}.proj.weight"));
+                    let pn = lgg.try_rms_norm(
+                        &format!("{block_prefix}.post_norm.weight"),
+                        rms_norm_eps,
+                    );
+                    match (inp_gate, proj, pn) {
+                        (Some(inp_gate), Some(proj), Some(post_norm)) => Some(PerLayerEmbed {
+                            inp_gate,
+                            proj,
+                            post_norm,
+                        }),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
+                Ok(LayerWeights {
+                    attn,
+                    attn_norm,
+                    post_attention_norm,
+                    ffn_norm,
+                    post_ffn_norm,
+                    mlp,
+                    sliding_window_size: if is_sliding { Some(sliding_window_size) } else { None },
+                    has_kv,
+                    kv_source_idx,
+                    layer_output_scale,
+                    per_layer_embed,
+                    device: layer_device,
                 })
-            };
-            let layer_rope_freq = if is_sliding {
-                rope_freq_base_swa
-            } else {
-                rope_freq_base
-            };
-            let layer_freq_factors: Option<&[f32]> =
-                if !is_sliding { rope_freqs.as_deref() } else { None };
-
-            let rotary = Arc::new(RotaryEmbedding::new_with_freq_factors(
-                layer_rope_freq as f64,
-                rotated_dim,
-                MAX_SEQ_LEN.min(cfg.max_seq_len()),
-                layer_freq_factors,
-                DType::F32,
-                &layer_device,
-            )?);
-
-            // Build a per-layer GgufConfig clone with the right head_dim/n_kv_head
-            // so StandardAttention reads them. We override head_dim and the
-            // Uniform/Array head_count_kv to match this layer.
-            let mut layer_cfg = cfg.clone();
-            layer_cfg.head_dim = layer_head_dim;
-            layer_cfg.head_count_kv = PerLayer::Uniform(head_count_kv_per_layer[il]);
-
-            // gemma4 uses scale=1.0 (no pre-attn scaling).
-            let attn_opts = StandardAttentionOpts {
-                use_v_norm: true,
-                use_gemma_norms: false,
-                attention_scale: Some(1.0),
-            };
-            let attn = StandardAttention::load_with_opts(
-                &mut gg,
-                &block_prefix,
-                &layer_cfg,
-                il,
-                rotary,
-                attn_opts,
-            )?;
-
-            let attn_norm = gg.rms_norm(&format!("{block_prefix}.attn_norm.weight"), rms_norm_eps)?;
-            let post_attention_norm = gg.rms_norm(
-                &format!("{block_prefix}.post_attention_norm.weight"),
-                rms_norm_eps,
-            )?;
-            let ffn_norm = gg.rms_norm(&format!("{block_prefix}.ffn_norm.weight"), rms_norm_eps)?;
-            let post_ffn_norm = gg.rms_norm(
-                &format!("{block_prefix}.post_ffw_norm.weight"),
-                rms_norm_eps,
-            )?;
-
-            // Gemma4 FFN uses GeGLU.
-            let mlp = DenseMlp::load_with_activation(
-                &mut gg,
-                &block_prefix,
-                MlpActivation::Gelu,
-            )?;
-
-            let layer_output_scale = gg
-                .try_dequantize(&format!("{block_prefix}.layer_output_scale.weight"));
-
-            let per_layer_embed = if n_embd_per_layer > 0 {
-                let inp_gate = gg.try_qmatmul(&format!("{block_prefix}.inp_gate.weight"));
-                let proj = gg.try_qmatmul(&format!("{block_prefix}.proj.weight"));
-                let pn = gg.try_rms_norm(&format!("{block_prefix}.post_norm.weight"), rms_norm_eps);
-                match (inp_gate, proj, pn) {
-                    (Some(inp_gate), Some(proj), Some(post_norm)) => Some(PerLayerEmbed {
-                        inp_gate,
-                        proj,
-                        post_norm,
-                    }),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            let _ = head_count; // silence "unused" if metadata reads more than we use
-            layers.push(LayerWeights {
-                attn,
-                attn_norm,
-                post_attention_norm,
-                ffn_norm,
-                post_ffn_norm,
-                mlp,
-                sliding_window_size: if is_sliding { Some(sliding_window_size) } else { None },
-                has_kv,
-                kv_source_idx,
-                layer_output_scale,
-                per_layer_embed,
-                device: layer_device,
-            });
-        }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let _ = head_count; // silence "unused" if metadata reads more than we use
 
         // ----- output norm + lm_head live on the device of the last layer --
         let last_dev = devices[layer_to_device[block_count - 1]].clone();
-        gg.set_device(last_dev.clone());
-        let norm = gg.rms_norm("output_norm.weight", rms_norm_eps)?;
-        let lm_head_tensor = gg
+        let last_gg = gg.with_device(last_dev.clone());
+        let norm = last_gg.rms_norm("output_norm.weight", rms_norm_eps)?;
+        let lm_head_tensor = last_gg
             .try_qmatmul("output.weight")
-            .or_else(|| gg.try_qmatmul("token_embd.weight"))
+            .or_else(|| last_gg.try_qmatmul("token_embd.weight"))
             .ok_or_else(|| candle::Error::Msg("missing output.weight and token_embd.weight".into()))?;
         let output = lm_head_tensor;
 

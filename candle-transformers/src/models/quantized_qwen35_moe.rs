@@ -7,10 +7,10 @@
 
 use super::quantized_blocks::*;
 use crate::quantized_nn::RmsNorm;
-use candle::quantized::gguf_file;
+use candle::quantized::{gguf_file, GgufBlob};
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::Embedding;
-use std::io::{Read, Seek};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 enum AttnBlock {
@@ -45,43 +45,30 @@ fn device_eq(a: &Device, b: &Device) -> bool {
 }
 
 impl ModelWeights {
-    pub fn from_gguf<R: Read + Seek>(
+    pub fn from_gguf(
         ct: gguf_file::Content,
-        reader: &mut R,
+        blob: Arc<GgufBlob>,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_multi_device(ct, reader, &[device.clone()])
+        Self::from_gguf_multi_device(ct, blob, &[device.clone()])
     }
 
     /// Load with pipeline-parallel layer split across multiple devices.
-    /// Layers are assigned in contiguous chunks (LAYER split mode).
-    pub fn from_gguf_multi_device<R: Read + Seek>(
+    /// Layer weights are loaded in parallel via rayon.
+    pub fn from_gguf_multi_device(
         ct: gguf_file::Content,
-        reader: &mut R,
+        blob: Arc<GgufBlob>,
         devices: &[Device],
     ) -> Result<Self> {
         if devices.is_empty() {
             candle::bail!("from_gguf_multi_device requires at least one device");
         }
         let dev0 = &devices[0];
-        let mut gg = Gguf::new(ct, reader, dev0.clone());
+        let gg = Gguf::new(ct, blob, dev0.clone());
         let cfg = GgufConfig::from_metadata(gg.metadata())?;
 
-        // Compute layer-to-device mapping (chunked, first `extra` devices get +1).
-        let n_dev = devices.len();
         let block_count = cfg.block_count;
-        let base = block_count / n_dev;
-        let extra = block_count % n_dev;
-        let layer_to_device: Vec<usize> = {
-            let mut v = Vec::with_capacity(block_count);
-            for d in 0..n_dev {
-                let count = base + if d < extra { 1 } else { 0 };
-                for _ in 0..count {
-                    v.push(d);
-                }
-            }
-            v
-        };
+        let layer_to_device = split_layers_across_devices(block_count, devices.len());
 
         // Build a RotaryEmbedding per device — full-attention layers on each
         // device share that device's instance.
@@ -102,56 +89,65 @@ impl ModelWeights {
             .collect::<Result<Vec<_>>>()?;
 
         // Embedding lives on dev0.
-        gg.set_device(dev0.clone());
         let embed_tensor = gg.tensor("token_embd.weight")?;
         let embed_tokens = Embedding::new(embed_tensor.dequantize(dev0)?, cfg.hidden_size);
 
-        // Track device per recurrent layer for GdnState init.
+        // Pre-compute the recurrent index for each layer so the parallel
+        // load doesn't need a shared counter.
+        let mut recurrent_idx_for_layer: Vec<Option<usize>> = vec![None; block_count];
         let mut recurrent_devices: Vec<Device> = Vec::new();
-
-        let mut layers = Vec::with_capacity(block_count);
-        let mut recurrent_idx = 0;
-
-        for il in 0..block_count {
-            let prefix = format!("blk.{il}");
-            let layer_dev_idx = layer_to_device[il];
-            let layer_device = devices[layer_dev_idx].clone();
-            gg.set_device(layer_device.clone());
-
-            let attn = if cfg.is_recurrent(il) {
-                let gdn = DeltaNetLayer::load(&mut gg, &prefix, &cfg, recurrent_idx)?;
-                recurrent_idx += 1;
-                recurrent_devices.push(layer_device.clone());
-                AttnBlock::Recurrent(gdn)
-            } else {
-                AttnBlock::FullAttn(GatedAttention::load(
-                    &mut gg,
-                    &prefix,
-                    &cfg,
-                    il,
-                    rotary_per_device[layer_dev_idx].clone(),
-                )?)
-            };
-
-            layers.push(Layer {
-                attn_norm: gg.rms_norm(&format!("{prefix}.attn_norm.weight"), cfg.rms_norm_eps)?,
-                attn,
-                post_attn_norm: gg.rms_norm(
-                    &format!("{prefix}.post_attention_norm.weight"),
-                    cfg.rms_norm_eps,
-                )?,
-                ffn: MoeExperts::load(&mut gg, &prefix, &cfg)?,
-                device: layer_device,
-            });
+        {
+            let mut next_recurrent_idx = 0usize;
+            for il in 0..block_count {
+                if cfg.is_recurrent(il) {
+                    recurrent_idx_for_layer[il] = Some(next_recurrent_idx);
+                    recurrent_devices.push(devices[layer_to_device[il]].clone());
+                    next_recurrent_idx += 1;
+                }
+            }
         }
+
+        let layers: Vec<Layer> = (0..block_count)
+            .into_par_iter()
+            .map(|il| -> Result<Layer> {
+                let prefix = format!("blk.{il}");
+                let layer_dev_idx = layer_to_device[il];
+                let layer_device = devices[layer_dev_idx].clone();
+                let lgg = gg.with_device(layer_device.clone());
+
+                let attn = if let Some(rec_idx) = recurrent_idx_for_layer[il] {
+                    AttnBlock::Recurrent(DeltaNetLayer::load(&lgg, &prefix, &cfg, rec_idx)?)
+                } else {
+                    AttnBlock::FullAttn(GatedAttention::load(
+                        &lgg,
+                        &prefix,
+                        &cfg,
+                        il,
+                        rotary_per_device[layer_dev_idx].clone(),
+                    )?)
+                };
+
+                Ok(Layer {
+                    attn_norm: lgg
+                        .rms_norm(&format!("{prefix}.attn_norm.weight"), cfg.rms_norm_eps)?,
+                    attn,
+                    post_attn_norm: lgg.rms_norm(
+                        &format!("{prefix}.post_attention_norm.weight"),
+                        cfg.rms_norm_eps,
+                    )?,
+                    ffn: MoeExperts::load(&lgg, &prefix, &cfg)?,
+                    device: layer_device,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Output norm + lm_head on the device of the last layer.
         let last_dev = devices[layer_to_device[block_count - 1]].clone();
-        gg.set_device(last_dev.clone());
-        let norm = gg.rms_norm("output_norm.weight", cfg.rms_norm_eps)?;
-        let lm_head_tensor = match gg.tensor("output.weight") {
+        let last_gg = gg.with_device(last_dev.clone());
+        let norm = last_gg.rms_norm("output_norm.weight", cfg.rms_norm_eps)?;
+        let lm_head_tensor = match last_gg.tensor("output.weight") {
             Ok(t) => t,
-            Err(_) => gg.tensor("token_embd.weight")?,
+            Err(_) => last_gg.tensor("token_embd.weight")?,
         };
         let lm_head = super::with_tracing::QMatMul::from_weights(lm_head_tensor.into())?;
 

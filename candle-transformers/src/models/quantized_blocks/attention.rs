@@ -11,7 +11,6 @@ use super::super::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
 use candle::{Module, Result, Tensor, D};
 use candle_nn::kv_cache::ConcatKvCache;
-use std::io::{Read, Seek};
 use std::sync::Arc;
 
 /// GQA broadcast: expand `k` (or `v`) from `n_kv_head` to `n_head` by duplicating
@@ -112,8 +111,8 @@ impl Default for StandardAttentionOpts {
 
 impl StandardAttention {
     /// Load from GGUF with default options (Llama/Qwen style).
-    pub fn load<R: Read + Seek>(
-        gg: &mut Gguf<R>,
+    pub fn load(
+        gg: &Gguf,
         prefix: &str,
         cfg: &GgufConfig,
         layer_idx: usize,
@@ -139,8 +138,8 @@ impl StandardAttention {
     /// Reads `wk`/`wv` only if their tensors are present in the GGUF — shared-KV
     /// layers (e.g. gemma4-31B layers without `attn_v.weight`) will have those
     /// fields set to `None`, and [`Self::compute_kv`] will return `None`.
-    pub fn load_with_opts<R: Read + Seek>(
-        gg: &mut Gguf<R>,
+    pub fn load_with_opts(
+        gg: &Gguf,
         prefix: &str,
         cfg: &GgufConfig,
         layer_idx: usize,
@@ -361,8 +360,8 @@ pub struct GatedAttention {
 
 impl GatedAttention {
     /// Load from GGUF for a full-attention layer in qwen35-family models.
-    pub fn load<R: Read + Seek>(
-        gg: &mut Gguf<R>,
+    pub fn load(
+        gg: &Gguf,
         prefix: &str,
         cfg: &GgufConfig,
         layer_idx: usize,

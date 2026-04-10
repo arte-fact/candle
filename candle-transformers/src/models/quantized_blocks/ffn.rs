@@ -8,7 +8,6 @@ use super::gguf_loader::Gguf;
 use super::super::with_tracing::QMatMul;
 use candle::quantized::QTensor;
 use candle::{Device, Module, Result, Tensor, D};
-use std::io::{Read, Seek};
 use std::sync::Arc;
 
 /// Compare two devices for equality without allocating.
@@ -53,13 +52,13 @@ pub struct DenseMlp {
 
 impl DenseMlp {
     /// Load from GGUF with default SiLU activation (Llama/Qwen convention).
-    pub fn load<R: Read + Seek>(gg: &mut Gguf<R>, prefix: &str) -> Result<Self> {
+    pub fn load(gg: &Gguf, prefix: &str) -> Result<Self> {
         Self::load_with_activation(gg, prefix, MlpActivation::Silu)
     }
 
     /// Load from GGUF with explicit activation (use Gelu for Gemma family).
-    pub fn load_with_activation<R: Read + Seek>(
-        gg: &mut Gguf<R>,
+    pub fn load_with_activation(
+        gg: &Gguf,
         prefix: &str,
         activation: MlpActivation,
     ) -> Result<Self> {
@@ -112,8 +111,8 @@ pub struct MoeExperts {
 
 impl MoeExperts {
     /// Load from GGUF. Auto-detects separate vs fused expert layout and shared expert.
-    pub fn load<R: Read + Seek>(
-        gg: &mut Gguf<R>,
+    pub fn load(
+        gg: &Gguf,
         prefix: &str,
         cfg: &GgufConfig,
     ) -> Result<Self> {

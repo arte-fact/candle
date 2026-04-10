@@ -19,11 +19,11 @@ use super::quantized_blocks::{
     StandardAttention,
 };
 use crate::quantized_nn::RmsNorm;
-use candle::quantized::gguf_file;
+use candle::quantized::{gguf_file, GgufBlob};
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_nn::kv_cache::ConcatKvCache;
 use candle_nn::Embedding;
-use std::io::{Read, Seek};
+use rayon::prelude::*;
 use std::sync::Arc;
 
 struct Layer {
@@ -52,25 +52,31 @@ fn device_eq(a: &Device, b: &Device) -> bool {
 }
 
 impl ModelWeights {
-    pub fn from_gguf<R: Read + Seek>(
+    pub fn from_gguf(
         ct: gguf_file::Content,
-        reader: &mut R,
+        blob: Arc<GgufBlob>,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_multi_device(ct, reader, &[device.clone()])
+        Self::from_gguf_multi_device(ct, blob, &[device.clone()])
     }
 
     /// Load with pipeline-parallel layer split across multiple devices.
-    pub fn from_gguf_multi_device<R: Read + Seek>(
+    ///
+    /// Layer weights are loaded in parallel via rayon: each block in the
+    /// transformer fans out to a worker thread that pulls every tensor for
+    /// that block from the shared mmap'd [`GgufBlob`] in one shot. With 4
+    /// MI50s and a 17 GB Q4_K_XL GGUF this drops model build time from
+    /// ~17 s (sequential) to ~3 s.
+    pub fn from_gguf_multi_device(
         ct: gguf_file::Content,
-        reader: &mut R,
+        blob: Arc<GgufBlob>,
         devices: &[Device],
     ) -> Result<Self> {
         if devices.is_empty() {
             candle::bail!("from_gguf_multi_device requires at least one device");
         }
         let dev0 = &devices[0];
-        let mut gg = Gguf::new(ct, reader, dev0.clone());
+        let gg = Gguf::new(ct, blob, dev0.clone());
         let cfg = GgufConfig::from_metadata(gg.metadata())?;
 
         let layer_to_device = split_layers_across_devices(cfg.block_count, devices.len());
@@ -90,49 +96,51 @@ impl ModelWeights {
             .collect::<Result<Vec<_>>>()?;
 
         // Embedding lives on dev0.
-        gg.set_device(dev0.clone());
         let embed_tensor = gg.tensor("token_embd.weight")?;
         let embed_tokens = Embedding::new(embed_tensor.dequantize(dev0)?, cfg.hidden_size);
 
-        let mut layers = Vec::with_capacity(cfg.block_count);
-        for il in 0..cfg.block_count {
-            let prefix = format!("blk.{il}");
-            let layer_dev_idx = layer_to_device[il];
-            let layer_device = devices[layer_dev_idx].clone();
-            gg.set_device(layer_device.clone());
+        // Parallel per-layer load. Each rayon worker gets its own cheap Gguf
+        // clone (Arc bumps only) retargeted to that layer's device.
+        let layers: Vec<Layer> = (0..cfg.block_count)
+            .into_par_iter()
+            .map(|il| -> Result<Layer> {
+                let prefix = format!("blk.{il}");
+                let layer_dev_idx = layer_to_device[il];
+                let layer_device = devices[layer_dev_idx].clone();
+                let lgg = gg.with_device(layer_device.clone());
 
-            let attn = StandardAttention::load(
-                &mut gg,
-                &prefix,
-                &cfg,
-                il,
-                rotary_per_device[layer_dev_idx].clone(),
-                /* use_v_norm */ false,
-            )?;
+                let attn = StandardAttention::load(
+                    &lgg,
+                    &prefix,
+                    &cfg,
+                    il,
+                    rotary_per_device[layer_dev_idx].clone(),
+                    /* use_v_norm */ false,
+                )?;
+                let attn_norm =
+                    lgg.rms_norm(&format!("{prefix}.attn_norm.weight"), cfg.rms_norm_eps)?;
+                let ffn_norm =
+                    lgg.rms_norm(&format!("{prefix}.ffn_norm.weight"), cfg.rms_norm_eps)?;
+                let ffn = MoeExperts::load(&lgg, &prefix, &cfg)?;
 
-            let attn_norm =
-                gg.rms_norm(&format!("{prefix}.attn_norm.weight"), cfg.rms_norm_eps)?;
-            let ffn_norm =
-                gg.rms_norm(&format!("{prefix}.ffn_norm.weight"), cfg.rms_norm_eps)?;
-            let ffn = MoeExperts::load(&mut gg, &prefix, &cfg)?;
-
-            layers.push(Layer {
-                attn_norm,
-                attn,
-                kv_cache: ConcatKvCache::new(2),
-                ffn_norm,
-                ffn,
-                device: layer_device,
-            });
-        }
+                Ok(Layer {
+                    attn_norm,
+                    attn,
+                    kv_cache: ConcatKvCache::new(2),
+                    ffn_norm,
+                    ffn,
+                    device: layer_device,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         // Output norm + lm_head on the device of the last layer.
         let last_dev = devices[layer_to_device[cfg.block_count - 1]].clone();
-        gg.set_device(last_dev.clone());
-        let norm = gg.rms_norm("output_norm.weight", cfg.rms_norm_eps)?;
-        let lm_head_tensor = match gg.tensor("output.weight") {
+        let last_gg = gg.with_device(last_dev.clone());
+        let norm = last_gg.rms_norm("output_norm.weight", cfg.rms_norm_eps)?;
+        let lm_head_tensor = match last_gg.tensor("output.weight") {
             Ok(t) => t,
-            Err(_) => gg.tensor("token_embd.weight")?,
+            Err(_) => last_gg.tensor("token_embd.weight")?,
         };
         let lm_head = super::with_tracing::QMatMul::from_weights(lm_head_tensor.into())?;
 

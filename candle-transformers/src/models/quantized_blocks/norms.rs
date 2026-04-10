@@ -3,7 +3,6 @@
 use super::gguf_loader::Gguf;
 use candle::quantized::QTensor;
 use candle::{DType, Device, Module, Result, Tensor, D};
-use std::io::{Read, Seek};
 
 /// Gemma-style RmsNorm wrapper.
 ///
@@ -29,13 +28,13 @@ impl GemmaRmsNorm {
     }
 
     /// Load from a GGUF tensor name.
-    pub fn load<R: Read + Seek>(gg: &mut Gguf<R>, name: &str, eps: f64) -> Result<Self> {
+    pub fn load(gg: &Gguf, name: &str, eps: f64) -> Result<Self> {
         let qt = gg.tensor(name)?;
         Self::from_qtensor(qt, eps)
     }
 
     /// Try to load from GGUF; return None if the tensor doesn't exist.
-    pub fn try_load<R: Read + Seek>(gg: &mut Gguf<R>, name: &str, eps: f64) -> Option<Self> {
+    pub fn try_load(gg: &Gguf, name: &str, eps: f64) -> Option<Self> {
         if gg.has_tensor(name) {
             Self::load(gg, name, eps).ok()
         } else {

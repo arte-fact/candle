@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
@@ -483,6 +484,98 @@ impl Content {
         tensor_info.read(reader, self.tensor_data_offset, device)
     }
 
+    /// Read a tensor straight out of a [`GgufBlob`] with no `&mut` reader
+    /// and no per-call seek setup. This is what the parallel layer loaders
+    /// rely on — multiple worker threads can all call this at once because
+    /// the blob is `Arc<...> + Send + Sync` and `pread` is thread-safe.
+    pub fn tensor_from_blob(
+        &self,
+        blob: &GgufBlob,
+        name: &str,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(t) => t,
+            None => crate::bail!("cannot find tensor info for {name}"),
+        };
+        let tensor_elems = tensor_info.shape.elem_count();
+        let block_size = tensor_info.ggml_dtype.block_size();
+        if !tensor_elems.is_multiple_of(block_size) {
+            crate::bail!(
+                "the number of elements {tensor_elems} is not divisible by \
+                 the block size {block_size}"
+            )
+        }
+        let size_in_bytes = tensor_elems / block_size * tensor_info.ggml_dtype.type_size();
+        let abs_offset = self.tensor_data_offset + tensor_info.offset;
+        let raw_data = blob.read_to_vec(abs_offset, size_in_bytes)?;
+        super::ggml_file::qtensor_from_ggml(
+            tensor_info.ggml_dtype,
+            &raw_data,
+            tensor_info.shape.dims().to_vec(),
+            device,
+        )
+    }
+
+    /// Open a (possibly split) GGUF file as a thread-safe `pread`-backed
+    /// blob and return the parsed [`Content`] alongside an
+    /// [`Arc<GgufBlob>`] that can be shared across worker threads. Tensor
+    /// offsets in the merged `Content` point into the blob's flat virtual
+    /// address space, with `tensor_data_offset = 0`.
+    ///
+    /// This is the parallel loading path: tensor reads are `&self` so they
+    /// can be fanned out across rayon workers in the model assemblers.
+    pub fn read_mmap(first_path: impl AsRef<Path>) -> Result<(Self, Arc<GgufBlob>)> {
+        let blob = GgufBlob::open(first_path.as_ref())?;
+        // Parse the GGUF header from the start of the first part. We use
+        // a small in-memory buffer (header + tensor info table is bounded —
+        // a few MB at most) so we can hand a `Cursor` to the existing
+        // `Content::read` parser.
+        let header_buf = blob.read_to_vec(0, blob.parts[0].len.min(64 * 1024 * 1024) as usize)?;
+        let mut cursor = std::io::Cursor::new(&header_buf[..]);
+        let mut header = Content::read(&mut cursor)?;
+
+        // Single-file GGUF: tensor offsets are relative to
+        // `tensor_data_offset` and that's already a valid virtual offset
+        // into the blob, so no rebasing needed.
+        if blob.parts.len() == 1 {
+            return Ok((header, Arc::new(blob)));
+        }
+
+        // Multi-file GGUF: walk every part header and rebase its tensor
+        // offsets into the blob's virtual address space.
+        let mut tensor_infos: HashMap<String, TensorInfo> = HashMap::new();
+        let mut metadata = header.metadata.clone();
+        metadata.remove("split.no");
+        metadata.remove("split.count");
+        metadata.remove("split.tensors.count");
+        for part in blob.parts.iter() {
+            // Same bounded header read for each part.
+            let part_buf = blob.read_to_vec(
+                part.virtual_start,
+                part.len.min(64 * 1024 * 1024) as usize,
+            )?;
+            let mut part_cursor = std::io::Cursor::new(&part_buf[..]);
+            let part_header = Content::read(&mut part_cursor)?;
+            for (name, info) in part_header.tensor_infos.iter() {
+                let abs = part.virtual_start + part_header.tensor_data_offset + info.offset;
+                tensor_infos.insert(
+                    name.clone(),
+                    TensorInfo {
+                        shape: info.shape.clone(),
+                        offset: abs,
+                        ggml_dtype: info.ggml_dtype,
+                    },
+                );
+            }
+        }
+
+        header.metadata = metadata;
+        header.tensor_infos = tensor_infos;
+        header.tensor_data_offset = 0;
+        Ok((header, Arc::new(blob)))
+    }
+
     /// Open a possibly multi-file GGUF given the path to the *first* part.
     ///
     /// Detects the `<base>-<NNNNN>-of-<MMMMM>.gguf` split pattern. If the path
@@ -637,6 +730,142 @@ impl Content {
         Ok((merged, reader))
     }
 }
+
+// ---------------------------------------------------------------------------
+// GgufBlob: pread-backed, Arc-shareable tensor data
+// ---------------------------------------------------------------------------
+
+/// A GGUF file (or virtual concatenation of split parts) backed by direct
+/// `pread()` reads.
+///
+/// Backs the parallel-friendly tensor loading path. The struct is
+/// `Send + Sync` so it can be wrapped in `Arc` and handed to rayon workers.
+/// Reads use Linux's `pread()` (positional read) which doesn't touch the
+/// file descriptor's seek pointer, so multiple threads can read at
+/// independent offsets from the same `File` concurrently — no locking,
+/// no mmap, no per-page fault overhead.
+///
+/// Why not mmap? Tried it (memmap2 + `MADV_WILLNEED` + `MADV_SEQUENTIAL`)
+/// and the cold-cache page fault rate (1 fault per 4 KB) made loading a
+/// 45 GB GGUF take 10×+ longer than the original `seek+read_exact`
+/// reader path on gfx906. HIP `memcpy_htod` from non-pinned mmap'd memory
+/// is also slower than from a fresh `Vec<u8>` because the runtime stages
+/// through a pinned bounce buffer per call. `pread` into a fresh `Vec`
+/// matches the old fast path while still being thread-safe.
+///
+/// For single-file GGUFs `parts` has one entry covering the whole file.
+/// For split GGUFs every part has its own `File` handle and the parts'
+/// virtual offsets are computed at open time so the loader can address
+/// every tensor through one flat byte address space.
+pub struct GgufBlob {
+    parts: Vec<BlobFilePart>,
+    /// Total virtual size in bytes (sum of all part lengths).
+    total_len: u64,
+}
+
+struct BlobFilePart {
+    /// File handle used for `pread`. `File` is `Send + Sync` and
+    /// `pread` does not touch the FD's seek pointer, so concurrent
+    /// reads from multiple threads are race-free.
+    file: File,
+    /// Virtual start offset of this part inside the flat blob address space.
+    virtual_start: u64,
+    /// Length of this part in bytes.
+    len: u64,
+}
+
+impl GgufBlob {
+    /// Open a (possibly split) GGUF and return a thread-safe blob handle.
+    pub fn open(first_path: &Path) -> Result<Self> {
+        let parts_paths = match split_sibling_paths(first_path)? {
+            Some(parts) => parts,
+            None => vec![first_path.to_path_buf()],
+        };
+        let mut parts = Vec::with_capacity(parts_paths.len());
+        let mut acc: u64 = 0;
+        for path in &parts_paths {
+            let file = File::open(path)
+                .map_err(|e| crate::Error::Io(e).with_path(path))?;
+            let len = file
+                .metadata()
+                .map_err(crate::Error::Io)?
+                .len();
+            parts.push(BlobFilePart {
+                file,
+                virtual_start: acc,
+                len,
+            });
+            acc = acc.checked_add(len).ok_or_else(|| {
+                crate::Error::Msg("GgufBlob: cumulative file size overflow".into())
+            })?;
+        }
+        Ok(Self {
+            parts,
+            total_len: acc,
+        })
+    }
+
+    /// Number of file parts (1 for single-file, N for split).
+    pub fn num_parts(&self) -> usize {
+        self.parts.len()
+    }
+
+    /// Total virtual size in bytes.
+    pub fn len(&self) -> usize {
+        self.total_len as usize
+    }
+
+    /// Whether the blob is empty.
+    pub fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    /// Read `len` bytes starting at virtual offset `offset` into a fresh
+    /// `Vec<u8>`. Thread-safe — uses positional read so multiple threads
+    /// can call this concurrently on the same blob.
+    ///
+    /// Reads that straddle a part boundary are handled correctly by
+    /// dispatching across the involved parts.
+    pub fn read_to_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        if (offset as usize)
+            .checked_add(len)
+            .map(|end| end as u64 > self.total_len)
+            .unwrap_or(true)
+        {
+            crate::bail!(
+                "GgufBlob: read [{offset}..{}) out of bounds (total {})",
+                offset as usize + len,
+                self.total_len
+            );
+        }
+        let mut out = vec![0u8; len];
+        let mut written = 0usize;
+        let mut cursor = offset;
+        while written < len {
+            // Find the part containing `cursor`.
+            let idx = self
+                .parts
+                .iter()
+                .position(|p| cursor < p.virtual_start + p.len)
+                .ok_or_else(|| crate::Error::Msg("GgufBlob: read past end".into()))?;
+            let part = &self.parts[idx];
+            let local = cursor - part.virtual_start;
+            let avail = (part.len - local) as usize;
+            let want = (len - written).min(avail);
+            part.file
+                .read_exact_at(&mut out[written..written + want], local)
+                .map_err(crate::Error::Io)?;
+            written += want;
+            cursor += want as u64;
+        }
+        Ok(out)
+    }
+}
+
+// File is Send + Sync on Unix; the only field is a Vec<BlobFilePart>.
+// Belt-and-suspenders trait bounds are enforced by the compiler so no
+// unsafe impls are needed here.
 
 // ---------------------------------------------------------------------------
 // Split file discovery
