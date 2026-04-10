@@ -1010,6 +1010,279 @@ pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
     &h * up
 }
 
+// ---------------------------------------------------------------------------
+// Fused residual + RMS norm
+// ---------------------------------------------------------------------------
+//
+// Replaces the two-launch sequence
+//     let h_new = (&h + &delta)?;
+//     let normed = rms_norm(&h_new, &weight, eps)?;
+// with a single fused HIP kernel launch that produces *both* outputs.
+//
+// Multi-output trick: candle's CustomOp3 returns one tensor, so the kernel
+// writes both outputs into a single packed buffer of shape `(2, ...)`.
+// The two halves can then be recovered as contiguous standalone tensors
+// via `narrow(0, 0, 1).squeeze(0)` (the normed output) and
+// `narrow(0, 1, 1).squeeze(0)` (the residual sum) — no extra kernel,
+// no extra allocation.
+
+#[derive(Debug, Clone)]
+struct FusedResidualRmsNorm {
+    eps: f32,
+}
+
+impl candle::CustomOp3 for FusedResidualRmsNorm {
+    fn name(&self) -> &'static str {
+        "fused-residual-rmsnorm"
+    }
+
+    /// CPU fallback. Not on the hot path — the public function falls
+    /// back to the chained ops on CPU before reaching here. Implemented
+    /// only so the trait is satisfied and the op is testable in isolation.
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+        s3: &CpuStorage,
+        l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        let eps = self.eps;
+        fn inner<
+            T: candle::WithDType
+                + num_traits::Float
+                + num_traits::AsPrimitive<f32>
+                + num_traits::FromPrimitive,
+        >(
+            h: &[T],
+            l1: &Layout,
+            delta: &[T],
+            l2: &Layout,
+            alpha: &[T],
+            l3: &Layout,
+            eps: f32,
+        ) -> Result<(CpuStorage, Shape)> {
+            let h = match l1.contiguous_offsets() {
+                None => candle::bail!("fused_residual_rmsnorm: h must be contiguous"),
+                Some((o1, o2)) => &h[o1..o2],
+            };
+            let delta = match l2.contiguous_offsets() {
+                None => candle::bail!("fused_residual_rmsnorm: delta must be contiguous"),
+                Some((o1, o2)) => &delta[o1..o2],
+            };
+            let alpha = match l3.contiguous_offsets() {
+                None => candle::bail!("fused_residual_rmsnorm: alpha must be contiguous"),
+                Some((o1, o2)) => &alpha[o1..o2],
+            };
+            let dims = l1.shape().dims().to_vec();
+            let dim_m1 = dims[dims.len() - 1];
+            let n_rows = l1.shape().elem_count() / dim_m1;
+            let n = n_rows * dim_m1;
+            // Packed [normed | h_new]
+            let mut packed = vec![T::zero(); 2 * n];
+            for r in 0..n_rows {
+                let mut sumsq = 0f32;
+                for c in 0..dim_m1 {
+                    let s: f32 = h[r * dim_m1 + c].as_() + delta[r * dim_m1 + c].as_();
+                    sumsq += s * s;
+                }
+                let scale = (sumsq / dim_m1 as f32 + eps).sqrt().recip();
+                for c in 0..dim_m1 {
+                    let s: f32 = h[r * dim_m1 + c].as_() + delta[r * dim_m1 + c].as_();
+                    let a: f32 = alpha[c].as_();
+                    packed[r * dim_m1 + c] =
+                        T::from_f32(s * scale * a).unwrap_or_else(T::nan); // normed
+                    packed[n + r * dim_m1 + c] =
+                        T::from_f32(s).unwrap_or_else(T::nan); // h_new
+                }
+            }
+            // Output shape: (2, ..., ...)
+            let mut out_dims = vec![2usize];
+            out_dims.extend_from_slice(&dims);
+            let storage = candle::WithDType::to_cpu_storage_owned(packed);
+            Ok((storage, Shape::from_dims(&out_dims)))
+        }
+        match (s1, s2, s3) {
+            (CpuStorage::F32(h), CpuStorage::F32(d), CpuStorage::F32(a)) => {
+                inner::<f32>(h, l1, d, l2, a, l3, eps)
+            }
+            (CpuStorage::F16(h), CpuStorage::F16(d), CpuStorage::F16(a)) => {
+                inner::<half::f16>(h, l1, d, l2, a, l3, eps)
+            }
+            (CpuStorage::BF16(h), CpuStorage::BF16(d), CpuStorage::BF16(a)) => {
+                inner::<half::bf16>(h, l1, d, l2, a, l3, eps)
+            }
+            _ => {
+                use candle::backend::BackendStorage;
+                candle::bail!(
+                    "fused_residual_rmsnorm: unsupported dtype {:?}",
+                    s1.dtype()
+                )
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    fn hip_fwd(
+        &self,
+        s1: &candle::HipStorage,
+        l1: &Layout,
+        s2: &candle::HipStorage,
+        l2: &Layout,
+        s3: &candle::HipStorage,
+        l3: &Layout,
+    ) -> Result<(candle::HipStorage, Shape)> {
+        use candle::hip_backend::hipdarc::driver::{
+            DeviceRepr, HipSlice, LaunchConfig, ValidAsZeroBits,
+        };
+        use candle::hip_backend::{kernels, Map3, WrapErr};
+        use candle::{hip_backend::HipDevice, WithDType};
+
+        struct S {
+            eps: f32,
+        }
+        impl Map3 for S {
+            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+                &self,
+                h: &HipSlice<T>,
+                h_l: &Layout,
+                delta: &HipSlice<T>,
+                delta_l: &Layout,
+                alpha: &HipSlice<T>,
+                alpha_l: &Layout,
+                dev: &HipDevice,
+            ) -> Result<HipSlice<T>> {
+                let h = match h_l.contiguous_offsets() {
+                    None => candle::bail!("fused_residual_rmsnorm: h must be contiguous"),
+                    Some((o1, o2)) => h.slice(o1..o2),
+                };
+                let delta = match delta_l.contiguous_offsets() {
+                    None => candle::bail!("fused_residual_rmsnorm: delta must be contiguous"),
+                    Some((o1, o2)) => delta.slice(o1..o2),
+                };
+                let alpha = match alpha_l.contiguous_offsets() {
+                    None => candle::bail!("fused_residual_rmsnorm: alpha must be contiguous"),
+                    Some((o1, o2)) => alpha.slice(o1..o2),
+                };
+
+                let el = h_l.shape().elem_count();
+                if delta_l.shape().elem_count() != el {
+                    candle::bail!(
+                        "fused_residual_rmsnorm: h/delta shape mismatch {:?} vs {:?}",
+                        h_l.shape(),
+                        delta_l.shape()
+                    );
+                }
+                let dims = h_l.shape().dims();
+                let dim_m1 = dims[dims.len() - 1];
+                let n_rows = el / dim_m1;
+                if alpha_l.shape().elem_count() != dim_m1 {
+                    candle::bail!(
+                        "fused_residual_rmsnorm: alpha length {} != hidden dim {dim_m1}",
+                        alpha_l.shape().elem_count()
+                    );
+                }
+
+                // Match the standalone rmsnorm kernel block sizing.
+                // Wave64 requires block_size >= WARP_SIZE.
+                let block_size: u32 = if dim_m1 >= 1024 { 1024 } else { 64 };
+                let cfg = LaunchConfig {
+                    grid_dim: (n_rows as u32, 1, 1),
+                    block_dim: (block_size, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let kernel_name = format!("rmsnorm_add_{}", T::DTYPE.as_str());
+                let func = dev.get_or_load_func(&kernel_name, &kernels::REDUCE)?;
+
+                // Packed output buffer: (2, n_rows, dim_m1)
+                let out = unsafe { dev.alloc::<T>(2 * el)? };
+                // The kernel takes two output pointers; we hand it slices
+                // into the same allocation. The second slice begins
+                // `el` elements in.
+                let dst_normed = out.slice(0..el);
+                let dst_h_new = out.slice(el..(2 * el));
+
+                let mut builder = func.builder();
+                builder.arg(&h);
+                builder.arg(&delta);
+                builder.arg(&dst_normed);
+                builder.arg(&dst_h_new);
+                builder.arg(&alpha);
+                let n_cols_i32 = dim_m1 as i32;
+                let block_size_i32 = block_size as i32;
+                builder.arg(&n_cols_i32);
+                builder.arg(&block_size_i32);
+                builder.arg(&self.eps);
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(out)
+            }
+        }
+
+        use candle::backend::BackendStorage;
+        let dev = s1.device();
+        let slice = S { eps: self.eps }
+            .map(&s1.slice, l1, &s2.slice, l2, &s3.slice, l3, dev)?;
+        let dst = candle::HipStorage {
+            slice,
+            device: dev.clone(),
+        };
+        // Output shape: (2, ...input dims...)
+        let mut out_dims = vec![2usize];
+        out_dims.extend_from_slice(l1.shape().dims());
+        Ok((dst, Shape::from_dims(&out_dims)))
+    }
+}
+
+/// Compute `(rms_norm(h + delta, weight), h + delta)` in one fused launch on
+/// HIP, returning `(normed, h_new)`. On non-HIP backends or non-contiguous
+/// inputs, falls back to the chained ops.
+///
+/// The fused HIP kernel saves one launch and one intermediate buffer per
+/// call. Used at the post-attention and post-ffn pre-norms in every layer
+/// of every dense transformer — for qwen35-9B that's 64 launches per token.
+pub fn fused_residual_rms_norm(
+    h: &Tensor,
+    delta: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> Result<(Tensor, Tensor)> {
+    if h.shape() != delta.shape() {
+        candle::bail!(
+            "fused_residual_rms_norm: shape mismatch {:?} vs {:?}",
+            h.shape(),
+            delta.shape()
+        )
+    }
+    let hidden = h.dim(D::Minus1)?;
+    let weight_dim = weight.dims1()?;
+    if hidden != weight_dim {
+        candle::bail!(
+            "fused_residual_rms_norm: hidden {} != weight {}",
+            hidden,
+            weight_dim
+        );
+    }
+
+    #[cfg(feature = "hip")]
+    if matches!(h.device(), candle::Device::Hip(_))
+        && h.is_contiguous()
+        && delta.is_contiguous()
+        && weight.is_contiguous()
+    {
+        let packed = h.apply_op3_no_bwd(delta, weight, &FusedResidualRmsNorm { eps })?;
+        // packed has shape (2, ...). Slice the two halves out.
+        let normed = packed.narrow(0, 0, 1)?.squeeze(0)?;
+        let h_new = packed.narrow(0, 1, 1)?.squeeze(0)?;
+        return Ok((normed, h_new));
+    }
+    let _ = FusedResidualRmsNorm { eps }; // silence unused warning
+    // Fallback: chained ops.
+    let h_new = (h + delta)?;
+    let normed = rms_norm(&h_new, weight, eps)?;
+    Ok((normed, h_new))
+}
+
 #[derive(Debug, Clone)]
 struct LayerNorm {
     eps: f32,

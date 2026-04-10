@@ -283,6 +283,80 @@ __device__ void rmsnorm(const T * x, T * dst, const T * alpha, const int ncols, 
     }
 }
 
+// Fused: out_normed = rmsnorm(h + delta, alpha) ; out_h_new = h + delta
+//
+// Eliminates the separate `h = h + delta` launch + intermediate buffer in
+// the transformer pre-norm path. The two outputs are written to a single
+// packed buffer of shape (2, n_rows, n_cols):
+//   dst[0      .. n_rows*n_cols] = normed (input to next attention/ffn)
+//   dst[n_rows*n_cols .. 2*..]   = h_new   (residual stream for next add)
+//
+// Both halves are contiguous standalone (n_rows, n_cols) tensors so the
+// caller can recover them via `narrow(0, 0, 1).squeeze(0)` and
+// `narrow(0, 1, 1).squeeze(0)` at zero kernel cost.
+//
+// Two-pass design (matches the standalone `rmsnorm` kernel above):
+//   Pass 1: read h[i] + delta[i], accumulate (h+delta)^2 into a per-thread
+//           partial sum. No writes — keeps the loop cache-resident.
+//   Pass 2: re-read h[i] + delta[i], compute the same s = h+delta, then
+//           write *both* h_new[i] = s and normed[i] = s * scale * alpha[i].
+//
+// Re-reading h and delta in pass 2 (instead of writing s in pass 1 and
+// reading it back) avoids the need for `__syncthreads()` between the two
+// halves of the kernel. Total memory traffic is the same as the unfused
+// (residual_add + rmsnorm) sequence — the saving is one launch + one
+// intermediate allocation per call.
+template <typename T>
+__device__ void rmsnorm_add(
+    const T * __restrict__ h,
+    const T * __restrict__ delta,
+    T * __restrict__ dst_normed,   // first half of the packed output
+    T * __restrict__ dst_h_new,    // second half of the packed output
+    const T * __restrict__ alpha,
+    const int ncols,
+    const int block_size,
+    const float eps
+) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f;
+
+    // Pass 1: accumulate sum of squares of (h + delta)
+    for (int col = tid; col < ncols; col += block_size) {
+        const int i = row * ncols + col;
+        const float s = static_cast<float>(h[i]) + static_cast<float>(delta[i]);
+        tmp += s * s;
+    }
+
+    // Block-level reduction (matches the standalone `rmsnorm` kernel).
+    tmp = warp_reduce_sum(tmp);
+    if (block_size > WARP_SIZE) {
+        __shared__ float s_sum[BLOCK_SIZE / WARP_SIZE];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = tmp;
+        }
+        __syncthreads();
+        int num_warps = block_size / WARP_SIZE;
+        tmp = (lane_id < num_warps) ? s_sum[lane_id] : 0.0f;
+        tmp = warp_reduce_sum(tmp);
+    }
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // Pass 2: write both outputs.
+    for (int col = tid; col < ncols; col += block_size) {
+        const int i = row * ncols + col;
+        const float s = static_cast<float>(h[i]) + static_cast<float>(delta[i]);
+        dst_h_new[i] = static_cast<T>(s);
+        const float a = static_cast<float>(alpha[col]);
+        dst_normed[i] = static_cast<T>(s * scale * a);
+    }
+}
+
 // Softmax implementation adapted from ggml.
 // https://github.com/ggerganov/llama.cpp/blob/d59bd97065cd7ded6c4ecab54b1d5e0b1b11e318/ggml-cuda.cu#L4159
 template <typename T, typename ACC>
@@ -661,6 +735,16 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     rmsnorm<TYPENAME>(src, dst, alpha, n_cols, block_size, eps);               \
   }                                                                            \
 
+#define RMSNORM_ADD_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME(                                          \
+      const TYPENAME *h, const TYPENAME *delta,                                \
+      TYPENAME *dst_normed, TYPENAME *dst_h_new,                               \
+      const TYPENAME *alpha,                                                   \
+      const int n_cols, const int block_size, const float eps) {               \
+    rmsnorm_add<TYPENAME>(h, delta, dst_normed, dst_h_new, alpha,              \
+                          n_cols, block_size, eps);                            \
+  }                                                                            \
+
 #define LAYERNORM_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME(                                          \
       const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
@@ -706,6 +790,7 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
 // bf16 -- always available on HIP via hip_bfloat16
 SOFTMAX_OP(hip_bfloat16, float, softmax_bf16)
 RMSNORM_OP(hip_bfloat16, rmsnorm_bf16)
+RMSNORM_ADD_OP(hip_bfloat16, rmsnorm_add_bf16)
 LAYERNORM_OP(hip_bfloat16, layernorm_bf16)
 ROPE_OP(hip_bfloat16, rope_bf16, rope_i_bf16, rope_thd_bf16)
 SUM_OP(hip_bfloat16, sum_bf16)
@@ -716,6 +801,7 @@ FAST_OP(hip_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argma
 // fp16 -- always available on HIP (gfx906+)
 SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
+RMSNORM_ADD_OP(__half, rmsnorm_add_f16)
 LAYERNORM_OP(__half, layernorm_f16)
 ROPE_OP(__half, rope_f16, rope_i_f16, rope_thd_f16)
 SUM_OP(__half, sum_f16)
@@ -728,6 +814,8 @@ SOFTMAX_OP(float, float, softmax_f32)
 SOFTMAX_OP(double, double, softmax_f64)
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
+RMSNORM_ADD_OP(float, rmsnorm_add_f32)
+RMSNORM_ADD_OP(double, rmsnorm_add_f64)
 LAYERNORM_OP(float, layernorm_f32)
 LAYERNORM_OP(double, layernorm_f64)
 ROPE_OP(float, rope_f32, rope_i_f32, rope_thd_f32)

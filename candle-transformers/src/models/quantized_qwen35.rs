@@ -202,9 +202,12 @@ impl ModelWeights {
                 AttnBlock::FullAttn(a) => a.forward(&normed, mask_for_layer.as_ref(), offset)?,
                 AttnBlock::Recurrent(gdn) => gdn.forward_step(&normed, &mut self.gdn_state)?,
             };
-            h = (&h + attn_out)?;
+            // Fused: post_attn_norm(h + attn_out) + (h + attn_out) in one
+            // HIP launch. Saves the separate residual-add launch +
+            // intermediate alloc per layer, per token.
+            let (normed, h_after_attn) = layer.post_attn_norm.forward_residual(&h, &attn_out)?;
+            h = h_after_attn;
 
-            let normed = layer.post_attn_norm.forward(&h)?;
             let ffn_out = layer.ffn.forward(&normed)?;
             h = (&h + ffn_out)?;
         }

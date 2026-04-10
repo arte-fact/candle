@@ -116,6 +116,29 @@ impl RmsNorm {
         let weight = weight.dequantize(&weight.device())?;
         Ok(Self { weight, eps, span })
     }
+
+    /// The (already-dequantized) gain tensor used by this RmsNorm.
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    /// Numerical-stability epsilon (cast to f32 for the fused kernels).
+    pub fn eps_f32(&self) -> f32 {
+        self.eps as f32
+    }
+
+    /// Fused: compute `(rms_norm(h + delta, weight), h + delta)` in one
+    /// HIP launch. The first return value is the input to the next op
+    /// (post-norm); the second is the residual stream that the next add
+    /// will use. Falls back to the chained ops on non-HIP backends.
+    pub fn forward_residual(
+        &self,
+        h: &Tensor,
+        delta: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let _enter = self.span.enter();
+        candle_nn::ops::fused_residual_rms_norm(h, delta, &self.weight, self.eps as f32)
+    }
 }
 
 impl Module for RmsNorm {

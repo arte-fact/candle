@@ -395,3 +395,81 @@ fn silu_mul(device: &Device) -> Result<()> {
     Ok(())
 }
 test_device!(silu_mul, silu_mul_cpu, silu_mul_gpu, silu_mul_metal, silu_mul_hip);
+
+/// Verify the fused `fused_residual_rms_norm` matches the unfused chain
+/// `(h+delta, rms_norm(h+delta, weight))` to within numerical tolerance.
+/// Tests both the residual sum and the normed output.
+fn fused_residual_rms_norm(device: &Device) -> Result<()> {
+    let eps = 1e-5f32;
+
+    // Phase 1: small hand-crafted inputs.
+    let h = Tensor::new(
+        &[[[1.0f32, -2.0, 3.0, -4.0], [0.5, -0.5, 0.25, -0.25]]],
+        device,
+    )?;
+    let delta = Tensor::new(
+        &[[[0.1f32, 0.2, -0.1, 0.3], [-0.1, 0.1, 0.05, -0.05]]],
+        device,
+    )?;
+    let weight = Tensor::new(&[1.0f32, 2.0, 0.5, 1.5], device)?;
+
+    let (normed, h_new) = candle_nn::ops::fused_residual_rms_norm(&h, &delta, &weight, eps)?;
+    let h_new_ref = (&h + &delta)?;
+    let normed_ref = candle_nn::ops::rms_norm(&h_new_ref, &weight, eps)?;
+
+    let diff_normed = (normed - &normed_ref)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    let diff_h_new = (h_new - &h_new_ref)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(
+        diff_normed < 1e-5,
+        "fused_residual_rms_norm normed mismatch on {device:?}: {diff_normed}"
+    );
+    assert!(
+        diff_h_new < 1e-5,
+        "fused_residual_rms_norm h_new mismatch on {device:?}: {diff_h_new}"
+    );
+
+    // Phase 2: FFN-realistic random inputs (1, 8, 4096) — same shape used
+    // by the silu_mul test, matches a real qwen35-9B intermediate.
+    let h = Tensor::randn(0f32, 1.0, (1, 8, 4096), device)?;
+    let delta = Tensor::randn(0f32, 0.1, (1, 8, 4096), device)?;
+    let weight = Tensor::randn(0f32, 0.1, 4096, device)?;
+    let (normed, h_new) = candle_nn::ops::fused_residual_rms_norm(&h, &delta, &weight, eps)?;
+    let h_new_ref = (&h + &delta)?;
+    let normed_ref = candle_nn::ops::rms_norm(&h_new_ref, &weight, eps)?;
+    let diff_normed = (normed - &normed_ref)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    let diff_h_new = (h_new - &h_new_ref)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    // Looser tolerance — random inputs amplify f32 rounding differences
+    // between the fused single-pass kernel and the two-pass chain.
+    assert!(
+        diff_normed < 1e-4,
+        "fused_residual_rms_norm FFN normed mismatch on {device:?}: {diff_normed}"
+    );
+    assert!(
+        diff_h_new < 1e-5,
+        "fused_residual_rms_norm FFN h_new mismatch on {device:?}: {diff_h_new}"
+    );
+    Ok(())
+}
+test_device!(
+    fused_residual_rms_norm,
+    fused_residual_rms_norm_cpu,
+    fused_residual_rms_norm_gpu,
+    fused_residual_rms_norm_metal,
+    fused_residual_rms_norm_hip
+);

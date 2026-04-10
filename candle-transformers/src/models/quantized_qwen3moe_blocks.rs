@@ -185,9 +185,10 @@ impl ModelWeights {
                 mask_for_layer.as_ref(),
                 offset,
             )?;
-            h = (&h + attn_out)?;
+            // Fused: ffn_norm(h + attn_out) + (h + attn_out) in one launch.
+            let (normed, h_after_attn) = layer.ffn_norm.forward_residual(&h, &attn_out)?;
+            h = h_after_attn;
 
-            let normed = layer.ffn_norm.forward(&h)?;
             let ffn_out = layer.ffn.forward(&normed)?;
             h = (&h + ffn_out)?;
         }
