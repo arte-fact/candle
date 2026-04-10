@@ -188,7 +188,7 @@ impl LayerWeights {
         index_pos: usize,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
-        let (b_sz, seq_len, n_embd) = x.dims3()?;
+        let (b_sz, seq_len, _n_embd) = x.dims3()?;
         let q = self.attention_wq.forward(x)?;
         let k = self.attention_wk.forward(x)?;
         let v = self.attention_wv.forward(x)?;

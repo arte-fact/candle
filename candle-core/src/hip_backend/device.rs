@@ -32,7 +32,8 @@ pub struct HipDevice {
     stream: Arc<HipStream>,
     modules: Arc<RwLock<ModuleStore>>,
     custom_modules: Arc<RwLock<HashMap<String, Arc<HipModule>>>>,
-    pub(crate) blas: Arc<RocBlas>,
+    pub(crate) blas: Arc<std::sync::OnceLock<RocBlas>>,
+    blas_stream: Arc<HipStream>,
     // CPU-based RNG: generate on host, upload to device. hiprand/rocrand
     // segfaults on some ROCm installations so we avoid it entirely.
     cpu_rng: Arc<Mutex<rand::rngs::StdRng>>,
@@ -99,8 +100,19 @@ impl HipDevice {
         self.id
     }
 
-    pub fn rocblas_handle(&self) -> Arc<RocBlas> {
-        self.blas.clone()
+    pub fn rocblas_handle(&self) -> Result<&RocBlas> {
+        if let Some(blas) = self.blas.get() {
+            return Ok(blas);
+        }
+        match RocBlas::new(&self.blas_stream) {
+            Ok(blas) => {
+                let _ = self.blas.set(blas);
+                Ok(self.blas.get().unwrap())
+            }
+            Err(e) => Err(HipError::InternalError(
+                Box::leak(format!("rocBLAS init failed: {e:?}. For gfx906: install patched rocBLAS with Tensile gfx906 kernels.").into_boxed_str())
+            ).into())
+        }
     }
 
     /// Load a kernel function from a precompiled HSACO module, caching the
@@ -173,7 +185,8 @@ impl BackendDevice for HipDevice {
         use rand::SeedableRng;
         let raw = RawHipDevice::new(ordinal).w()?;
         let stream = Arc::new(HipStream::new(&raw).w()?);
-        let blas = Arc::new(RocBlas::new(&stream).w()?);
+        let blas = Arc::new(std::sync::OnceLock::new());
+        let blas_stream = stream.clone();
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
         };
@@ -183,6 +196,7 @@ impl BackendDevice for HipDevice {
             ordinal,
             stream,
             blas,
+            blas_stream,
             cpu_rng: Arc::new(Mutex::new(rand::rngs::StdRng::seed_from_u64(seed))),
             modules: Arc::new(RwLock::new(module_store)),
             custom_modules: Arc::new(RwLock::new(HashMap::new())),

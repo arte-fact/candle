@@ -1940,7 +1940,7 @@ impl BackendStorage for HipStorage {
                 let beta_f32: f32 = 0.0;
                 unsafe {
                     hipdarc::rocblas::gemm_strided_batched_ex(
-                        &dev.blas,
+                        dev.rocblas_handle()?,
                         &cfg,
                         &alpha_f32 as *const f32 as *const _,
                         rhs_view.device_ptr() as *const _,
@@ -1976,7 +1976,7 @@ impl BackendStorage for HipStorage {
                 let out = unsafe { dev.alloc::<f16>(elem_count)? };
                 unsafe {
                     hipdarc::rocblas::gemm_strided_batched_ex(
-                        &dev.blas,
+                        dev.rocblas_handle()?,
                         &cfg,
                         alpha_ptr,
                         rhs_view.device_ptr() as *const _,
@@ -2000,7 +2000,7 @@ impl BackendStorage for HipStorage {
                 let out = unsafe { dev.alloc::<f32>(elem_count)? };
                 unsafe {
                     hipdarc::rocblas::gemm_strided_batched_ex(
-                        &dev.blas,
+                        dev.rocblas_handle()?,
                         &cfg,
                         &alpha as *const f32 as *const _,
                         rhs_view.device_ptr() as *const _,
@@ -2024,7 +2024,7 @@ impl BackendStorage for HipStorage {
                 let out = unsafe { dev.alloc::<f64>(elem_count)? };
                 unsafe {
                     hipdarc::rocblas::gemm_strided_batched_ex(
-                        &dev.blas,
+                        dev.rocblas_handle()?,
                         &cfg,
                         &alpha as *const f64 as *const _,
                         rhs_view.device_ptr() as *const _,

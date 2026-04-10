@@ -2,9 +2,12 @@ use crate::quantized::gguf_file;
 use crate::{Context, Error, Result};
 use std::collections::HashSet;
 use tokenizers::{
-    decoders::{byte_level::ByteLevel as ByteLevelDecoder, DecoderWrapper},
+    decoders::{
+        byte_fallback::ByteFallback, byte_level::ByteLevel as ByteLevelDecoder, fuse::Fuse,
+        sequence::Sequence as DecoderSequence, strip::Strip, DecoderWrapper,
+    },
     models::bpe::{Vocab, BPE},
-    normalizers::{unicode::NFC, NormalizerWrapper},
+    normalizers::{replace::Replace, unicode::NFC, NormalizerWrapper},
     pre_tokenizers::{
         byte_level::ByteLevel as ByteLevelPre,
         sequence::Sequence,
@@ -98,6 +101,29 @@ fn pre_tokenizer_sequence(regex: &str, byte_level: ByteLevelPre) -> Result<PreTo
     )
     .map_err(Error::wrap)?;
     Ok(Sequence::new(vec![split.into(), byte_level.into()]).into())
+}
+
+/// Build the SentencePiece-style pipeline used by Gemma / LLaMA-1 family models.
+///
+/// Mirrors the HuggingFace `gemma` tokenizer.json:
+///   - normalizer: Replace " " → "▁"
+///   - pre-tokenizer: none
+///   - decoder: Sequence([Replace("▁"," "), ByteFallback, Fuse, Strip(" ", 1, 0)])
+fn gemma_pipeline() -> Result<Pipeline> {
+    let normalizer = Replace::new(" ", "\u{2581}").map_err(Error::wrap)?;
+    let dec_replace = Replace::new("\u{2581}", " ").map_err(Error::wrap)?;
+    let decoder = DecoderSequence::new(vec![
+        DecoderWrapper::Replace(dec_replace),
+        DecoderWrapper::ByteFallback(ByteFallback::new()),
+        DecoderWrapper::Fuse(Fuse::new()),
+        DecoderWrapper::Strip(Strip::new(' ', 1, 0)),
+    ]);
+    Ok(Pipeline {
+        normalizer: Some(NormalizerWrapper::Replace(normalizer)),
+        pretokenizer: None,
+        decoder: Some(DecoderWrapper::Sequence(decoder)),
+        post_processor: None,
+    })
 }
 
 fn pipeline_from_pre(pre: &str) -> Result<Pipeline> {
@@ -203,7 +229,11 @@ impl TokenizerFromGguf for Tokenizer {
         let model_kind = metadata_value(ct, "tokenizer.ggml.model")?
             .to_string()?
             .to_lowercase();
-        if model_kind != "gpt2" {
+        let is_spm = matches!(
+            model_kind.as_str(),
+            "llama" | "gemma" | "gemma2" | "gemma3" | "gemma4"
+        );
+        if model_kind != "gpt2" && !is_spm {
             crate::bail!("unsupported tokenizer model `{model_kind}`");
         }
 
@@ -220,7 +250,10 @@ impl TokenizerFromGguf for Tokenizer {
 
         let mut builder = BPE::builder().vocab_and_merges(vocab, merges);
 
-        if let Ok(val) = metadata_value(ct, "tokenizer.ggml.unk_token_id") {
+        // Some converters write `unk_token_id`, others (gemma, gemma4) write `unknown_token_id`.
+        let unk_meta = metadata_value(ct, "tokenizer.ggml.unk_token_id")
+            .or_else(|_| metadata_value(ct, "tokenizer.ggml.unknown_token_id"));
+        if let Ok(val) = unk_meta {
             let token_id = gguf_value_to_u32(val)?;
             if let Some(token) = tokens.get(token_id as usize) {
                 builder = builder.unk_token(token.clone());
@@ -229,6 +262,10 @@ impl TokenizerFromGguf for Tokenizer {
 
         if let Ok(val) = metadata_value(ct, "tokenizer.ggml.byte_fallback") {
             builder = builder.byte_fallback(val.to_bool()?);
+        } else if is_spm {
+            // SentencePiece tokenizers always use byte fallback even when the
+            // metadata flag is absent (HF gemma tokenizer.json sets it).
+            builder = builder.byte_fallback(true);
         }
 
         if let Ok(val) = metadata_value(ct, "tokenizer.ggml.ignore_merges") {
@@ -242,7 +279,13 @@ impl TokenizerFromGguf for Tokenizer {
             .and_then(|v| v.to_string())
             .map(|s| s.to_string())
             .unwrap_or_else(|_| "gpt2".to_string());
-        let pipeline = pipeline_from_pre(pre.as_str())?;
+        let pipeline = if is_spm {
+            // SentencePiece-style models (gemma, llama) ignore tokenizer.ggml.pre
+            // and use the Replace(" "→"▁") + ByteFallback decoder pipeline.
+            gemma_pipeline()?
+        } else {
+            pipeline_from_pre(pre.as_str())?
+        };
         let post_processor_base = pipeline.post_processor.clone();
 
         let add_bos = metadata_value(ct, "tokenizer.ggml.add_bos_token")
@@ -301,8 +344,11 @@ impl TokenizerFromGguf for Tokenizer {
             "tokenizer.ggml.bos_token_id",
             "tokenizer.ggml.eos_token_id",
             "tokenizer.ggml.pad_token_id",
+            "tokenizer.ggml.padding_token_id",
             "tokenizer.ggml.sep_token_id",
             "tokenizer.ggml.unk_token_id",
+            "tokenizer.ggml.unknown_token_id",
+            "tokenizer.ggml.mask_token_id",
         ] {
             if let Ok(val) = metadata_value(ct, key) {
                 explicit_specials.insert(gguf_value_to_u32(val)?);

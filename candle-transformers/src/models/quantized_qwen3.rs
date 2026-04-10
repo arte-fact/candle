@@ -199,13 +199,8 @@ impl AttentionWeights {
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let q_flat = q.flatten(0, 2)?;
-        let k_flat = k.flatten(0, 2)?;
-
-        let q_flat = self.q_norm.forward(&q_flat)?;
-        let k_flat = self.k_norm.forward(&k_flat)?;
-        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+        let q = self.q_norm.forward(&q.contiguous()?)?;
+        let k = self.k_norm.forward(&k.contiguous()?)?;
 
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 

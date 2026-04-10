@@ -466,9 +466,10 @@ impl candle::CustomOp1 for SoftmaxLastDim {
                 let dim_m1 = dims[dims.len() - 1];
                 let (n_rows, n_cols) = (el / dim_m1, dim_m1);
 
+                // Wave64 fix: block_dim must be 64 (full warp) on AMD gfx906
                 let cfg = LaunchConfig {
                     grid_dim: (n_rows as u32, 1, 1),
-                    block_dim: (1, 32, 1),
+                    block_dim: (1, 64, 1),
                     shared_mem_bytes: 0,
                 };
                 let kernel_name = format!("softmax_{}", T::DTYPE.as_str());
@@ -725,7 +726,10 @@ impl candle::CustomOp2 for RmsNorm {
                 let dim_m1 = dims[dims.len() - 1];
                 let (n_rows, n_cols) = (el / dim_m1, dim_m1);
 
-                let block_size = if n_cols < 1024 { 32 } else { 1024 };
+                // CRITICAL: AMD Wave64 — block_size MUST be at least WARP_SIZE (64),
+                // otherwise warp_reduce_sum reads garbage from inactive lanes.
+                // Was: `if n_cols < 1024 { 32 } else { 1024 }` which broke Wave64.
+                let block_size: u32 = if n_cols >= 1024 { 1024 } else { 64 };
                 let cfg = LaunchConfig {
                     grid_dim: (n_rows as u32, 1, 1),
                     block_dim: (block_size, 1, 1),
@@ -1046,7 +1050,8 @@ impl candle::CustomOp3 for LayerNorm {
                 let dim_m1 = dims[dims.len() - 1];
                 let (n_rows, n_cols) = (el / dim_m1, dim_m1);
 
-                let block_size = if n_cols < 1024 { 32 } else { 1024 };
+                // Wave64 fix: block_size MUST be >= WARP_SIZE (64) on AMD gfx906
+                let block_size: u32 = if n_cols >= 1024 { 1024 } else { 64 };
                 let cfg = LaunchConfig {
                     grid_dim: (n_rows as u32, 1, 1),
                     block_dim: (block_size, 1, 1),
