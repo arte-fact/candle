@@ -4267,9 +4267,13 @@ __device__ void indexed_moe_forward(
     const unsigned int expert_id = indices[task_id];
 
     // Calculate strides
+    // NOTE: use the template parameter `qk` (the per-quant block size), NOT
+    // `QK_K` (256, the K-quant superblock). For Q8_0, qk=32, so
+    // n*k / 32 != n*k / 256, and using QK_K under-counts the per-expert stride
+    // by 8x — every expert except #0 reads garbage memory between rows.
     const size_t weight_block_size = sizeof(block_q_t);
     const size_t input_block_size = sizeof(block_q8_1);
-    const size_t weight_expert_stride_bytes = (size_t)(n * k) / QK_K * weight_block_size;
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
     const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
     const size_t output_task_stride_elems = n;
 
@@ -4410,5 +4414,135 @@ extern "C" __global__ void indexed_moe_forward_q8_0_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q4_0_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q4_1_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q5_0_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK5_0, QI5_0, block_q5_0, VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void indexed_moe_forward_q5_1_q8_1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward<QK5_1, QI5_1, block_q5_1, VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+// MoE forward pass for F16 weights with F32 input.
+//
+// Used by mixed-precision MoE GGUFs (e.g. Unsloth Dynamic) where some expert
+// tensors are stored as raw F16 instead of K-quants. The dispatch in
+// `candle-core/src/quantized/hip.rs::QHipStorage::indexed_moe_forward` skips
+// the q8_1 input quantization for this path and passes the F32 activation
+// directly.
+//
+// Launch config:
+//   grid_dim  = (n, batch, topk)         — one block per (expert output row, batch slot, topk slot)
+//   block_dim = (WARP_SIZE, 4, 1)        — 4 warps per block, same as the quantized variants
+extern "C" __global__ void indexed_moe_forward_f16_f32(
+    const __half * __restrict__ all_weights,    // [num_experts, n, k]
+    const float * __restrict__ all_inputs,      // [batch, input_dim1, k]
+    const unsigned int * __restrict__ indices,  // [batch * topk]
+    float * __restrict__ all_outputs,           // [batch, topk, n]
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int input_dim1) {
+
+    const int current_batch = blockIdx.y;
+    const int current_topk = blockIdx.z;
+    const int task_id = current_batch * gridDim.z + current_topk;
+    if (task_id >= gridDim.y * gridDim.z) return;
+
+    // If input_dim1 == 1, all topk slots in this batch share the same input row.
+    const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
+    const unsigned int expert_id = indices[task_id];
+
+    const int row0 = blockIdx.x;
+    if (row0 >= n) return;
+
+    // Per-expert weight pointer at row `row0`.
+    const __half * w_row =
+        all_weights + (size_t)expert_id * (size_t)n * (size_t)k + (size_t)row0 * (size_t)k;
+    // Per-task input vector.
+    const float * x_row = all_inputs + (size_t)input_idx * (size_t)k;
+    float * out_row = all_outputs + (size_t)task_id * (size_t)n;
+
+    constexpr int nwarps = 4;
+    const int tid = WARP_SIZE * threadIdx.y + threadIdx.x;
+    const int n_threads = WARP_SIZE * nwarps;
+
+    // Each thread accumulates a stride of the dot product.
+    float tmp = 0.0f;
+    for (int i = tid; i < k; i += n_threads) {
+        tmp += __half2float(w_row[i]) * x_row[i];
+    }
+
+    // Inter-warp reduction: warps 1..nwarps-1 spill into shared memory,
+    // warp 0 sums them up and emits the final reduced value.
+    __shared__ float tmp_shared[nwarps - 1][WARP_SIZE];
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y - 1][threadIdx.x] = tmp;
+    }
+    __syncthreads();
+
+    if (threadIdx.y == 0) {
+        for (int l = 0; l < nwarps - 1; ++l) {
+            tmp += tmp_shared[l][threadIdx.x];
+        }
+        tmp = warp_reduce_sum(tmp);
+        if (threadIdx.x == 0) {
+            out_row[row0] = tmp;
+        }
+    }
 }

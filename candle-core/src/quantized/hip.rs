@@ -351,7 +351,19 @@ fn mul_mat_vec_via_q8_1(
     Ok(HipStorage::wrap_hip_slice(dst, dev.clone()))
 }
 
+/// Integer-MMQ quantized matrix-matrix multiply (input quantized to q8_1).
+///
+/// **Currently unused — kept here as scaffolding for a future fix.**
+///
+/// The `mul_mat_q*` kernels in `candle-hip-kernels/src/quantized.cu` produce
+/// numerically wrong results on gfx906 (Wave64) for any `b*m >= 9`. The bug
+/// shows up as catastrophic divergence in qwen3-family multi-token prefill
+/// (task #22). Until the kernels are fixed, [`QHipStorage::dequantize_matmul`]
+/// always dequantizes the weight to f32 and dispatches through the regular
+/// rocBLAS gemm, which is well-tested. This costs one weight-sized f32
+/// allocation per call, freed when the call returns.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn mul_mat_via_q8_1(
     data: &PaddedHipSlice,
     y: &HipView<'_, f32>,
@@ -422,6 +434,63 @@ fn mul_mat_via_q8_1(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// MoE forward pass for F16 weights with F32 input.
+///
+/// Skips the q8_1 input quantization step that the K-quant path uses, since
+/// F16 weights can be multiplied directly by F32 inputs in the kernel.
+fn indexed_moe_forward_f16_f32(
+    weight: &HipView<'_, u8>,
+    w_shape: &crate::Shape, //[num_experts, n, k]
+    input: &HipSlice<f32>,
+    in_shape: &crate::Shape, //[batch, topk or 1, k]
+    ids: &HipView<'_, u32>,
+    idx_shape: &crate::Shape, //[batch, topk]
+    dev: &HipDevice,
+) -> Result<(HipStorage, crate::Shape)> {
+    let (_, n, k) = w_shape.dims3()?;
+    let batch = in_shape.dims()[0];
+    let input_dim1 = in_shape.dims()[1];
+    let topk = idx_shape.dims()[1];
+    assert!(batch == idx_shape.dims()[0], "batch dim not match!");
+
+    // Output buffer: [batch, topk, n]
+    let outsize = batch * topk * n;
+    let out = dev.alloc_zeros::<f32>(outsize)?;
+
+    let func =
+        dev.get_or_load_func("indexed_moe_forward_f16_f32", &candle_hip_kernels::QUANTIZED)?;
+    let (nblocks, nwarps) = (n as u32, 4);
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (nblocks, batch as u32, topk as u32),
+        block_dim: (WARP_SIZE as u32, nwarps, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(weight);
+    builder.arg(input);
+    builder.arg(ids);
+    builder.arg(&out);
+    barg!(
+        builder,
+        n as i32,
+        k as i32,
+        batch as i32,
+        topk as i32,
+        input_dim1 as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    let mut out_shape = in_shape.dims().to_vec();
+    out_shape.pop();
+    out_shape.push(n);
+    out_shape[1] = topk;
+    Ok((
+        HipStorage::wrap_hip_slice(out, dev.clone()),
+        out_shape.into(),
+    ))
+}
+
 fn indexed_moe_forward_fused_q8_1_input(
     weight: &HipView<'_, u8>,
     w_shape: &crate::Shape, //[num_experts, n, k]
@@ -466,6 +535,10 @@ fn indexed_moe_forward_fused_q8_1_input(
         GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
         GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
         GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
+        GgmlDType::Q4_0 => "indexed_moe_forward_q4_0_q8_1",
+        GgmlDType::Q4_1 => "indexed_moe_forward_q4_1_q8_1",
+        GgmlDType::Q5_0 => "indexed_moe_forward_q5_0_q8_1",
+        GgmlDType::Q5_1 => "indexed_moe_forward_q5_1_q8_1",
         _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_hip_kernels::QUANTIZED)?;
@@ -514,7 +587,11 @@ impl QHipStorage {
     ) -> Result<(HipStorage, crate::Shape)> {
         if matches!(
             self.dtype(),
-            GgmlDType::Q8_0
+            GgmlDType::Q4_0
+                | GgmlDType::Q4_1
+                | GgmlDType::Q5_0
+                | GgmlDType::Q5_1
+                | GgmlDType::Q8_0
                 | GgmlDType::Q2K
                 | GgmlDType::Q3K
                 | GgmlDType::Q4K
@@ -531,6 +608,21 @@ impl QHipStorage {
                 input_l.shape(), //[batch, topk or 1, k]
                 &ids_storage.slice(0..ids_storage.len()),
                 ids_l.shape(), //[batch, topk]
+                &self.device,
+            )
+        } else if self.dtype() == GgmlDType::F16 {
+            // Mixed-precision GGUFs (e.g. Unsloth Dynamic Q8_K_XL) leave some
+            // expert tensors as raw F16. Skip the q8_1 input quantization and
+            // dispatch directly to the F16 weight × F32 input kernel.
+            let input_storage = input.as_hip_slice::<f32>()?;
+            let ids_storage = ids.as_hip_slice::<u32>()?;
+            indexed_moe_forward_f16_f32(
+                &self.data.inner.slice(0..self.data.inner.len()),
+                self_shape,
+                input_storage,
+                input_l.shape(),
+                &ids_storage.slice(0..ids_storage.len()),
+                ids_l.shape(),
                 &self.device,
             )
         } else {
@@ -612,6 +704,7 @@ impl QHipStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
+            GgmlDType::Mxfp4 => deq::<crate::quantized::BlockMxfp4>(&buffer, block_len, &mut out),
         }
 
         self.device
@@ -825,30 +918,17 @@ impl QHipStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
 
-        let out = if FORCE_DMMV.load(std::sync::atomic::Ordering::Relaxed) {
-            let data_f32 = self.dequantize(n * k)?;
-            let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
-            storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?
-        } else {
-            let storage = storage.as_hip_slice::<f32>()?;
-            let storage = match layout.contiguous_offsets() {
-                Some((o1, o2)) => storage.slice(o1..o2),
-                None => Err(crate::Error::RequiresContiguous {
-                    op: "quantized-matmul",
-                }
-                .bt())?,
-            };
-            mul_mat_via_q8_1(
-                &self.data,
-                &storage,
-                self.dtype,
-                /* x_rows */ n,
-                /* x_cols */ k,
-                /* y_rows */ k,
-                /* y_cols */ b * m,
-                self.device(),
-            )?
-        };
+        // The integer-MMQ kernels (`mul_mat_via_q8_1` → `mul_mat_q*`) produce
+        // wrong results on gfx906 once `b*m >= 9` (numerically diverges, makes
+        // qwen3 multi-token prefill output garbage — see task #22). Always
+        // dequantize the weight and dispatch through the regular f32 gemm,
+        // which is well-tested. The temporary f32 buffer is `n*k` floats per
+        // call (~32 MB for typical attention/ffn projections) and is freed
+        // when the call returns; peak memory is bounded by one such tile.
+        let data_f32 = self.dequantize(n * k)?;
+        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
+        let out = storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?;
+
         let mut out_shape = layout.shape().dims().to_vec();
         out_shape.pop();
         out_shape.push(n);

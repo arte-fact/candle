@@ -19,6 +19,9 @@ pub const QK5_0: usize = 32;
 pub const QK5_1: usize = 32;
 pub const QK8_0: usize = 32;
 pub const QK8_1: usize = 32;
+/// MXFP4 (Microscaling FP4) block size — 32 elements per block, one shared
+/// E8M0 exponent. Used by qwen3next shared experts and a few other models.
+pub const QK_MXFP4: usize = 32;
 
 pub trait GgmlType: Sized + Clone + Send + Sync {
     const DTYPE: GgmlDType;
@@ -106,6 +109,77 @@ pub struct BlockQ8_1 {
     pub(crate) qs: [i8; QK8_1],
 }
 const _: () = assert!(std::mem::size_of::<BlockQ8_1>() == 36);
+
+/// MXFP4 (Microscaling FP4) — used by qwen3next shared experts.
+///
+/// Layout (per `ggml-common.h:204-208`):
+/// - `e`: one byte E8M0 shared exponent for the block
+/// - `qs`: 16 bytes packing 32 e2m1 quants (1 sign + 2 exp + 1 mantissa each)
+///
+/// The 16 distinct dequantized values are looked up from `KVALUES_MXFP4`.
+/// Reference: `ggml/src/ggml-quants.c::dequantize_row_mxfp4`.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockMxfp4 {
+    pub(crate) e: u8,
+    pub(crate) qs: [u8; QK_MXFP4 / 2],
+}
+const _: () = assert!(std::mem::size_of::<BlockMxfp4>() == 1 + QK_MXFP4 / 2);
+
+/// MXFP4 lookup table — 16 e2m1 values multiplied by 2 (so the shared scale is
+/// `0.5 * 2^(E8M0)` to compensate, matching ggml's `ggml_e8m0_to_fp32_half`).
+const KVALUES_MXFP4: [i8; 16] = [
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+];
+
+/// E8M0 → f32 with the implicit factor of 0.5 baked in (matches
+/// `ggml_e8m0_to_fp32_half` in `ggml-impl.h:471`).
+#[inline]
+fn e8m0_to_fp32_half(x: u8) -> f32 {
+    let bits: u32 = if x < 2 {
+        // Denormal patterns: 0x00200000 = 2^(-128), 0x00400000 = 2^(-127).
+        0x0020_0000u32 << x
+    } else {
+        // Normalized: 0.5 * 2^(x-127) = 2^(x-128) → biased exponent (x-1).
+        (x as u32 - 1) << 23
+    };
+    f32::from_bits(bits)
+}
+
+impl GgmlType for BlockMxfp4 {
+    const DTYPE: GgmlDType = GgmlDType::Mxfp4;
+    const BLCK_SIZE: usize = QK_MXFP4;
+    type VecDotType = BlockMxfp4;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let qk = Self::BLCK_SIZE;
+        let nb = ys.len() / qk;
+        for i in 0..nb {
+            let d = e8m0_to_fp32_half(xs[i].e);
+            for j in 0..(qk / 2) {
+                let v0 = KVALUES_MXFP4[(xs[i].qs[j] & 0x0F) as usize];
+                let v1 = KVALUES_MXFP4[(xs[i].qs[j] >> 4) as usize];
+                ys[i * qk + j] = (v0 as f32) * d;
+                ys[i * qk + j + qk / 2] = (v1 as f32) * d;
+            }
+        }
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        unimplemented!("MXFP4 quantization (write path) is not implemented; \
+                        candle currently only loads MXFP4 from existing GGUFs.")
+    }
+
+    fn vec_dot(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        unimplemented!("MXFP4 vec_dot is not implemented — MXFP4 weights are \
+                        always dequantized to F32 before matmul.")
+    }
+
+    fn vec_dot_unopt(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        unimplemented!("MXFP4 vec_dot_unopt is not implemented — MXFP4 weights are \
+                        always dequantized to F32 before matmul.")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
