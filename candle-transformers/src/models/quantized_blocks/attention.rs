@@ -447,11 +447,11 @@ impl GatedAttention {
 
         // KV cache. The pre-allocated `KvCache::append` uses
         // `slice_set` under the hood, which requires contiguous
-        // sources — `k` from the rotary may be a non-contiguous view
-        // depending on the rope variant, and `v` is post-transpose
-        // and may also be non-contiguous.
-        let k = if k.is_contiguous() { k } else { k.contiguous()? };
-        let v = if v.is_contiguous() { v } else { v.contiguous()? };
+        // sources. `Tensor::contiguous` is a no-op when the tensor
+        // is already contiguous, so we can call it unconditionally
+        // without wasting work on the common case.
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
         // GQA broadcast — see `broadcast_kv` doc for why we don't use repeat_kv.
@@ -459,8 +459,10 @@ impl GatedAttention {
         let k = broadcast_kv(&k, n_rep)?;
         let v = broadcast_kv(&v, n_rep)?;
 
-        // Scaled dot-product attention (ensure contiguous for GPU matmul)
-        let q = q.contiguous()?;
+        // Scaled dot-product attention. `q` is the rotary output,
+        // which is already contiguous, so we drop the redundant
+        // `.contiguous()` here. `k.t()` flips strides so we still
+        // need to materialize it for matmul.
         let attn_weights = (q.matmul(&k.t()?.contiguous()?)? * self.attn_scale)?;
         let attn_weights = match mask {
             Some(m) => attn_weights.broadcast_add(m)?,
