@@ -101,7 +101,14 @@ pub struct ModelWeights {
     per_layer_embeddings: Option<PerLayerEmbeddings>,
     /// Per-layer KV cache. For shared-KV layers (`has_kv=false`) the entry is
     /// always `None` and the layer reads from `kv_caches[kv_source_idx]`.
-    kv_caches: Vec<Option<(Tensor, Tensor)>>,
+    ///
+    /// Uses the pre-allocated `KvCache` (slice-set into a fixed buffer)
+    /// instead of `Tensor::cat`, which would otherwise allocate a new
+    /// `cache_len + 1` buffer every decode step and copy the entire
+    /// cache contents into it — O(N²) memory traffic on long contexts
+    /// and the dominant decode cost on gemma4 (which slowed 31% on
+    /// candle vs 3% on turbo at long-cache decode before this fix).
+    kv_caches: Vec<Option<candle_nn::kv_cache::KvCache>>,
 }
 
 impl ModelWeights {
@@ -410,7 +417,11 @@ impl ModelWeights {
             .ok_or_else(|| candle::Error::Msg("missing output.weight and token_embd.weight".into()))?;
         let output = lm_head_tensor;
 
-        let kv_caches = vec![None; block_count];
+        // Pre-allocated KV cache slot per layer. Slot is `None` for
+        // shared-KV layers (which borrow from another layer's slot).
+        // Initialized lazily on first append in the forward.
+        let kv_caches: Vec<Option<candle_nn::kv_cache::KvCache>> =
+            (0..block_count).map(|_| None).collect();
 
         Ok(Self {
             tok_embeddings: Embedding::new_unused(),
@@ -511,24 +522,34 @@ impl ModelWeights {
             let residual = layer_in.clone();
             let x_norm = self.layers[il].attn_norm.forward(&layer_in)?;
 
-            // Compute fresh K/V if this layer owns its cache.
+            // Compute fresh K/V if this layer owns its cache and append
+            // them to the pre-allocated `KvCache` (which uses
+            // `slice_set` into a fixed buffer instead of `Tensor::cat`,
+            // so the buffer pointer stays stable across decode steps).
             if has_kv {
                 if let Some((k_new, v_new)) =
                     self.layers[il].attn.compute_kv(&x_norm, index_pos)?
                 {
-                    let (k_full, v_full) = match self.kv_caches[il].take() {
-                        None => (k_new, v_new),
-                        Some((k_old, v_old)) => {
-                            if index_pos == 0 {
-                                (k_new, v_new)
-                            } else {
-                                let k = Tensor::cat(&[&k_old, &k_new], 2)?;
-                                let v = Tensor::cat(&[&v_old, &v_new], 2)?;
-                                (k, v)
-                            }
+                    // First-touch initialization at index_pos == 0:
+                    // wipe any state from a previous generation. The
+                    // `KvCache::reset` is `O(1)` and doesn't free the
+                    // backing buffer.
+                    if index_pos == 0 {
+                        if let Some(ref mut c) = self.kv_caches[il] {
+                            c.reset();
                         }
-                    };
-                    self.kv_caches[il] = Some((k_full, v_full));
+                    }
+                    let cache = self.kv_caches[il]
+                        .get_or_insert_with(|| {
+                            // dim=2 = sequence dim of (B, n_kv_head, T, head_dim).
+                            // 4096 covers the typical chat context;
+                            // KvCache grows automatically beyond.
+                            candle_nn::kv_cache::KvCache::new(2, 4096)
+                        });
+                    // KvCache::append needs contiguous sources.
+                    let k_new = if k_new.is_contiguous() { k_new } else { k_new.contiguous()? };
+                    let v_new = if v_new.is_contiguous() { v_new } else { v_new.contiguous()? };
+                    let _ = cache.append(&k_new, &v_new)?;
                 }
             }
 
@@ -539,15 +560,21 @@ impl ModelWeights {
                 let cache = self.kv_caches[src]
                     .as_ref()
                     .expect("KV cache must exist for has_kv source layer");
-                let k = if device_eq(cache.0.device(), &layer_device) {
-                    cache.0.clone()
+                let k = cache
+                    .k()?
+                    .ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
+                let v = cache
+                    .v()?
+                    .ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
+                let k = if device_eq(k.device(), &layer_device) {
+                    k
                 } else {
-                    cache.0.to_device(&layer_device)?
+                    k.to_device(&layer_device)?
                 };
-                let v = if device_eq(cache.1.device(), &layer_device) {
-                    cache.1.clone()
+                let v = if device_eq(v.device(), &layer_device) {
+                    v
                 } else {
-                    cache.1.to_device(&layer_device)?
+                    v.to_device(&layer_device)?
                 };
                 (k, v)
             };
@@ -610,7 +637,9 @@ impl ModelWeights {
 
     pub fn clear_kv_cache(&mut self) {
         for slot in self.kv_caches.iter_mut() {
-            *slot = None;
+            if let Some(c) = slot.as_mut() {
+                c.reset();
+            }
         }
     }
 }

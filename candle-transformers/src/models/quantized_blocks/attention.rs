@@ -10,8 +10,18 @@ use super::rope::RotaryEmbedding;
 use super::super::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
 use candle::{Module, Result, Tensor, D};
-use candle_nn::kv_cache::ConcatKvCache;
+use candle_nn::kv_cache::{ConcatKvCache, KvCache};
 use std::sync::Arc;
+
+/// Initial KV cache capacity in tokens. The cache grows by this many
+/// tokens at a time once full — for typical chat workloads (≤4K
+/// context) it never grows past the initial allocation, eliminating
+/// the per-step `Tensor::cat` from `ConcatKvCache` which would
+/// otherwise allocate a new buffer of size `cache_len + 1` every
+/// decode step (turning into O(N²) memory traffic on long contexts
+/// and defeating the workspace pool — each new size hits its own
+/// bucket exactly once).
+const KV_CACHE_INITIAL: usize = 4096;
 
 /// GQA broadcast: expand `k` (or `v`) from `n_kv_head` to `n_head` by duplicating
 /// each KV head `n_rep` times in place.
@@ -355,7 +365,10 @@ pub struct GatedAttention {
     head_dim: usize,
     attn_scale: f64,
     rotary: Arc<RotaryEmbedding>,
-    kv_cache: ConcatKvCache,
+    /// Pre-allocated KV cache (slice-set into a fixed buffer).
+    /// Replaces `ConcatKvCache` which allocated a new growing-size
+    /// buffer every step.
+    kv_cache: KvCache,
 }
 
 impl GatedAttention {
@@ -376,7 +389,9 @@ impl GatedAttention {
         let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), cfg.rms_norm_eps)?;
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), cfg.rms_norm_eps)?;
 
-        let kv_cache = ConcatKvCache::new(2);
+        // dim=2 because the cached K/V are stored as
+        // (B, n_kv_head, seq, head_dim).
+        let kv_cache = KvCache::new(2, KV_CACHE_INITIAL);
 
         Ok(Self {
             wq,
@@ -430,7 +445,13 @@ impl GatedAttention {
         // RoPE (multi-frequency sections applied by the RotaryEmbedding)
         let (q, k) = self.rotary.apply(&q, &k, offset)?;
 
-        // KV cache
+        // KV cache. The pre-allocated `KvCache::append` uses
+        // `slice_set` under the hood, which requires contiguous
+        // sources — `k` from the rotary may be a non-contiguous view
+        // depending on the rope variant, and `v` is post-transpose
+        // and may also be non-contiguous.
+        let k = if k.is_contiguous() { k } else { k.contiguous()? };
+        let v = if v.is_contiguous() { v } else { v.contiguous()? };
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
         // GQA broadcast — see `broadcast_kv` doc for why we don't use repeat_kv.
