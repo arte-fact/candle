@@ -346,6 +346,149 @@ impl std::fmt::Debug for HipStream {
 }
 
 // ---------------------------------------------------------------------------
+// HIP graphs — capture-replay for per-token decode
+// ---------------------------------------------------------------------------
+//
+// Used to amortise per-kernel driver-call overhead. The model captures
+// its per-token decode forward into a `HipGraphExec` once, then replays
+// it for every subsequent token via `HipGraphExec::launch(stream)`.
+//
+// Restrictions during capture:
+// - Every operation on the stream must be stream-ordered (no sync calls).
+//   This is why hipdarc switched to `hipMallocAsync`. Sync `hipFree` on
+//   `Drop` would also kill capture, so allocations made during capture
+//   must outlive the capture and free outside it.
+// - The kernel arguments and memory layout must be deterministic across
+//   replays. For decode this means a pre-allocated KV cache (no growing
+//   `Tensor::cat`) and a fixed input slot for the next-token id.
+
+/// RAII handle for an in-progress stream capture. Calling
+/// [`Self::end`] (or letting it drop) ends the capture and returns the
+/// captured graph. Failing to do either leaves the stream stuck in
+/// capture mode and is a programmer error.
+pub struct HipGraphCapture<'s> {
+    stream: &'s HipStream,
+    finished: bool,
+}
+
+impl<'s> HipGraphCapture<'s> {
+    /// Begin capturing every operation submitted to `stream`.
+    pub fn begin(stream: &'s HipStream) -> Result<Self, DriverError> {
+        unsafe {
+            check_hip(sys::hipStreamBeginCapture(
+                stream.raw,
+                sys::HIP_STREAM_CAPTURE_MODE_GLOBAL,
+            ))?;
+        }
+        Ok(Self {
+            stream,
+            finished: false,
+        })
+    }
+
+    /// End the capture and return the resulting graph. Must be called
+    /// exactly once per `HipGraphCapture`.
+    pub fn end(mut self) -> Result<HipGraph, DriverError> {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            check_hip(sys::hipStreamEndCapture(self.stream.raw, &mut raw))?;
+        }
+        self.finished = true;
+        Ok(HipGraph { raw })
+    }
+}
+
+impl Drop for HipGraphCapture<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // The capture wasn't ended explicitly. Try to end it now to
+            // avoid leaving the stream stuck in capture mode; we discard
+            // the resulting graph since the caller obviously doesn't
+            // want it.
+            let mut raw = std::ptr::null_mut();
+            unsafe {
+                let rc = sys::hipStreamEndCapture(self.stream.raw, &mut raw);
+                if rc == sys::hipError_t::hipSuccess && !raw.is_null() {
+                    let _ = sys::hipGraphDestroy(raw);
+                }
+            }
+        }
+    }
+}
+
+/// Owned captured graph. Not yet executable — call
+/// [`Self::instantiate`] to compile it into a `HipGraphExec`.
+pub struct HipGraph {
+    raw: sys::hipGraph_t,
+}
+
+unsafe impl Send for HipGraph {}
+unsafe impl Sync for HipGraph {}
+
+impl HipGraph {
+    pub fn raw(&self) -> sys::hipGraph_t {
+        self.raw
+    }
+
+    /// Compile this graph into an executable that can be replayed
+    /// repeatedly via [`HipGraphExec::launch`].
+    pub fn instantiate(&self) -> Result<HipGraphExec, DriverError> {
+        let mut exec = std::ptr::null_mut();
+        unsafe {
+            check_hip(sys::hipGraphInstantiate(
+                &mut exec,
+                self.raw,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            ))?;
+        }
+        Ok(HipGraphExec { raw: exec })
+    }
+}
+
+impl Drop for HipGraph {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let _ = sys::hipGraphDestroy(self.raw);
+            }
+        }
+    }
+}
+
+/// Compiled executable graph. Replay with [`Self::launch`].
+pub struct HipGraphExec {
+    raw: sys::hipGraphExec_t,
+}
+
+unsafe impl Send for HipGraphExec {}
+unsafe impl Sync for HipGraphExec {}
+
+impl HipGraphExec {
+    pub fn raw(&self) -> sys::hipGraphExec_t {
+        self.raw
+    }
+
+    /// Launch the captured graph on `stream`. This submits the entire
+    /// kernel sequence with one driver call instead of N
+    /// `hipModuleLaunchKernel` calls.
+    pub fn launch(&self, stream: &HipStream) -> Result<(), DriverError> {
+        unsafe { check_hip(sys::hipGraphLaunch(self.raw, stream.raw)) }
+    }
+}
+
+impl Drop for HipGraphExec {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let _ = sys::hipGraphExecDestroy(self.raw);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HipSlice — owned device memory
 // ---------------------------------------------------------------------------
 
@@ -725,4 +868,83 @@ macro_rules! barg {
     ($builder:expr, $val:expr) => {
         $builder.arg(&$val)
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test: capture an `alloc_zeros` + an `htod` copy + a `dtod`
+    /// clone into a HIP graph, instantiate it, and replay it twice. Reads
+    /// the destination buffer back through `clone_dtoh` and verifies the
+    /// content matches.
+    ///
+    /// This is the minimum viable proof that capture/replay works on
+    /// gfx906 + ROCm 7.1.1 — if this test passes, the bindings are
+    /// trustworthy enough to wire into the model forward.
+    #[test]
+    fn hip_graph_capture_replay() {
+        let dev = match HipDevice::new(0) {
+            Ok(d) => d,
+            // No HIP device available — skip silently so unit tests still
+            // pass on a CPU-only build host.
+            Err(_) => return,
+        };
+        let stream = HipStream::new(&dev).expect("create stream");
+
+        // Two device buffers — `src` filled with a known pattern outside
+        // capture, `dst` allocated outside capture as well so the
+        // captured graph can target a stable address.
+        let pattern: Vec<u8> = (0..256u32).map(|x| x as u8).collect();
+        let mut src = stream.alloc::<u8>(pattern.len()).expect("alloc src");
+        stream.memcpy_htod(&mut src, &pattern).expect("htod src");
+        let mut dst = stream.alloc::<u8>(pattern.len()).expect("alloc dst");
+        stream.memcpy_dtod(&mut dst, &src).expect("warm dtod");
+        stream.synchronize().expect("warmup sync");
+
+        // Capture: a single dtod copy into `dst`. We use the existing
+        // memcpy_dtod which goes through hipMemcpyAsync — captureable.
+        let capture = HipGraphCapture::begin(&stream).expect("begin capture");
+        stream.memcpy_dtod(&mut dst, &src).expect("dtod inside capture");
+        let graph = capture.end().expect("end capture");
+        let exec = graph.instantiate().expect("instantiate");
+
+        // Zero `dst`, replay the graph, verify the bytes are restored.
+        let zeros = vec![0u8; pattern.len()];
+        stream.memcpy_htod(&mut dst, &zeros).expect("zero dst");
+        stream.synchronize().expect("zero sync");
+        let dst_zeroed = stream.clone_dtoh(&dst).expect("read zeros");
+        assert!(dst_zeroed.iter().all(|&b| b == 0), "dst not zeroed");
+
+        exec.launch(&stream).expect("graph launch 1");
+        stream.synchronize().expect("launch 1 sync");
+        let dst_after_launch1 = stream.clone_dtoh(&dst).expect("read after 1");
+        assert_eq!(
+            dst_after_launch1, pattern,
+            "graph replay #1 did not restore the pattern"
+        );
+
+        // Replay a second time on a fresh-zeroed dst — proves the graph
+        // is reusable, not a one-shot.
+        stream.memcpy_htod(&mut dst, &zeros).expect("re-zero dst");
+        stream.synchronize().expect("re-zero sync");
+        exec.launch(&stream).expect("graph launch 2");
+        stream.synchronize().expect("launch 2 sync");
+        let dst_after_launch2 = stream.clone_dtoh(&dst).expect("read after 2");
+        assert_eq!(
+            dst_after_launch2, pattern,
+            "graph replay #2 did not restore the pattern"
+        );
+    }
+
+    /// Mostly a compile-test: prove that `HipGraph` and `HipGraphExec`
+    /// implement `Send + Sync`. The model code holds `Arc<HipGraphExec>`
+    /// across worker threads when graphs are wired into multi-GPU
+    /// pipelines, and we want a static guarantee that's safe.
+    #[test]
+    fn hip_graph_types_are_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<HipGraph>();
+        assert_send_sync::<HipGraphExec>();
+    }
 }

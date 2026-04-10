@@ -13,6 +13,21 @@ pub type hipModule_t = *mut c_void;
 pub type hipFunction_t = *mut c_void;
 pub type hipDeviceptr_t = *mut c_void;
 pub type hipEvent_t = *mut c_void;
+/// Opaque handle to a captured HIP graph (`hipGraph_t` in the C API).
+pub type hipGraph_t = *mut c_void;
+/// Opaque handle to an instantiated executable graph (`hipGraphExec_t`).
+pub type hipGraphExec_t = *mut c_void;
+
+/// Capture modes for [`hipStreamBeginCapture`]:
+/// - 0 = `hipStreamCaptureModeGlobal` — captures all activity on the
+///   thread, including unrelated launches. Most permissive; use this
+///   when nothing else is racing on the device.
+/// - 1 = `hipStreamCaptureModeThreadLocal` — captures only this thread.
+/// - 2 = `hipStreamCaptureModeRelaxed` — like Global but doesn't error
+///   on disallowed sync calls (instead just stops the capture).
+pub const HIP_STREAM_CAPTURE_MODE_GLOBAL: c_uint = 0;
+pub const HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_uint = 1;
+pub const HIP_STREAM_CAPTURE_MODE_RELAXED: c_uint = 2;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -121,6 +136,31 @@ extern "C" {
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
+
+    // -- HIP graphs (capture-replay) ---------------------------------------
+    /// Begin recording every operation submitted to `stream` into a graph.
+    /// Subsequent kernel launches, async memcpys, and async allocs on this
+    /// stream are deferred to the captured graph instead of executing.
+    /// Capture mode `0 = hipStreamCaptureModeGlobal` (the most permissive).
+    pub fn hipStreamBeginCapture(stream: hipStream_t, mode: c_uint) -> hipError_t;
+    /// Stop capturing on `stream` and return the resulting graph handle.
+    pub fn hipStreamEndCapture(stream: hipStream_t, graph: *mut hipGraph_t) -> hipError_t;
+    /// Compile a captured `hipGraph_t` into an executable form. Errors and
+    /// node info are written to `error_node` / `log_buffer` if non-null.
+    pub fn hipGraphInstantiate(
+        exec: *mut hipGraphExec_t,
+        graph: hipGraph_t,
+        error_node: *mut *mut c_void,
+        log_buffer: *mut c_char,
+        log_buffer_size: size_t,
+    ) -> hipError_t;
+    /// Replay a previously captured + instantiated graph on `stream`.
+    /// Submits the entire kernel sequence with one driver call instead
+    /// of the per-kernel `hipModuleLaunchKernel` overhead. The big
+    /// per-decoded-token win that closes the gap with llamacpp-turbo.
+    pub fn hipGraphLaunch(exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t;
+    pub fn hipGraphDestroy(graph: hipGraph_t) -> hipError_t;
+    pub fn hipGraphExecDestroy(exec: hipGraphExec_t) -> hipError_t;
 
     // Modules (load compiled GPU code objects)
     pub fn hipModuleLoadData(module: *mut hipModule_t, image: *const c_void) -> hipError_t;
