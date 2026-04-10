@@ -116,10 +116,15 @@ impl Model {
         }
     }
 
-    /// Whether this model has recurrent state (GDN) and therefore needs the
-    /// prompt processed token-by-token to build state correctly.
+    /// Whether to force token-by-token prompt processing. The hybrid GDN
+    /// model (`Model::Moe`) used to require this because its `forward_prefill`
+    /// looped per-token internally; now it batches the linear projections
+    /// across the whole prompt and only the recurrent step (`delta_net`)
+    /// stays sequential. Returns `false` so callers can pass the full
+    /// prompt to `forward()` as one tensor — `--split-prompt` is the only
+    /// way to opt back into the old per-token behaviour.
     fn is_recurrent(&self) -> bool {
-        matches!(self, Model::Moe(_))
+        false
     }
 }
 
