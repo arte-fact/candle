@@ -307,6 +307,42 @@ fn mul_mat_vec_via_q8_1(
     let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
     quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
 
+    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
+    let dst_view = dst.slice(0..dst.len());
+    launch_mul_mat_vec_q8_1_chunk(
+        data,
+        &y_q8_1.slice(0..y_q8_1.len()),
+        &dst_view,
+        dtype,
+        ncols,
+        nrows,
+        b_size,
+        ncols_padded,
+        dev,
+    )?;
+    Ok(HipStorage::wrap_hip_slice(dst, dev.clone()))
+}
+
+/// Launch one specialized `mul_mat_vec_<dtype>_q8_1_cuda<b_size>` kernel
+/// against an externally-managed (already-quantized) Q8_1 input view and an
+/// externally-allocated output view. Used by both [`mul_mat_vec_via_q8_1`]
+/// (which allocates everything itself) and [`mul_mat_via_q8_1_chunked`]
+/// (which loops this function across slices of a single big buffer).
+#[allow(clippy::too_many_arguments)]
+fn launch_mul_mat_vec_q8_1_chunk(
+    data: &PaddedHipSlice,
+    y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+    dst: &hipdarc::driver::HipView<'_, f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    b_size: usize,
+    ncols_padded: usize,
+    dev: &HipDevice,
+) -> Result<()> {
+    if b_size == 0 || b_size > 8 {
+        crate::bail!("launch_mul_mat_vec_q8_1_chunk: bsize must be 1..=8, got {b_size}")
+    }
     let kernel_name = match dtype {
         GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
         GgmlDType::Q4_1 => "mul_mat_vec_q4_1_q8_1_cuda",
@@ -322,13 +358,12 @@ fn mul_mat_vec_via_q8_1(
     };
     let kernel_name = format!("{kernel_name}{b_size}");
     let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::QUANTIZED)?;
-    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
     // https://github.com/ggerganov/llama.cpp/blob/facb8b56f8fd3bb10a693bf0943ae9d69d0828ef/ggml-cuda/mmvq.cu#L98
     let (nblocks, nwarps) = match b_size {
         1 => (nrows as u32, 4),
         2..=4 => ((nrows as u32).div_ceil(2), 4),
         5..=8 => ((nrows as u32).div_ceil(2), 2),
-        _ => crate::bail!("unexpected bsize {b_size}"),
+        _ => unreachable!(),
     };
     let cfg = hipdarc::driver::LaunchConfig {
         grid_dim: (nblocks, 1, 1),
@@ -338,8 +373,8 @@ fn mul_mat_vec_via_q8_1(
 
     let mut builder = func.builder();
     builder.arg(&data.inner);
-    builder.arg(&y_q8_1);
-    builder.arg(&dst);
+    builder.arg(y_q8_1);
+    builder.arg(dst);
     barg!(
         builder,
         /* ncols_x */ ncols as i32,
@@ -348,6 +383,96 @@ fn mul_mat_vec_via_q8_1(
         /* nrows_dst */ nrows as i32
     );
     unsafe { builder.launch(cfg) }.w()?;
+    Ok(())
+}
+
+/// Quantized matrix-matrix multiply built by chunking the input into
+/// `b_size <= 8` slices and dispatching the well-tested vector kernel
+/// (`mul_mat_vec_<dtype>_q8_1_cuda<b_size>`) for each chunk.
+///
+/// **Why this exists.** The integer-MMQ matrix kernels (`mul_mat_q*` in
+/// `candle-hip-kernels/src/quantized.cu`) produce numerically wrong
+/// results on gfx906 once `b*m >= 9` — see task #22. Until those kernels
+/// are fixed/replaced (the upstream `mul_mat_q` rewrite is much larger),
+/// chunking the call into multiple vector-path launches gives correct
+/// results at a small launch-overhead cost. For typical prefill (L=15)
+/// this is 2 launches instead of 1, far cheaper than the previous
+/// dequant+f32-gemm fallback.
+///
+/// Layout: input is `(total_b, ncols)` row-major f32. Output is
+/// `(total_b, nrows)` row-major f32 (`dst[i*nrows + j]` = row i × col j).
+#[allow(clippy::too_many_arguments)]
+fn mul_mat_via_q8_1_chunked(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<HipStorage> {
+    let data_elems = data.len / dtype.type_size() * dtype.block_size();
+    if data_elems < ncols * nrows {
+        crate::bail!(
+            "unexpected data size {}, ncols {ncols} nrows {nrows}",
+            data_elems
+        )
+    }
+    if y.len() != ncols * total_b {
+        crate::bail!("unexpected y size {}, ncols {ncols} total_b {total_b}", y.len())
+    }
+    if total_b == 0 {
+        return Ok(HipStorage::wrap_hip_slice(
+            dev.alloc_zeros::<f32>(0)?,
+            dev.clone(),
+        ));
+    }
+
+    // 1. Quantize ALL input rows to q8_1 in one shot. quantize_q8_1
+    //    operates row-by-row so the cost is the same whether we call it
+    //    once with total_b rows or N times with chunks of 8 — and the
+    //    single call is fewer kernel launches.
+    let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+    let q8_1_block_size = GgmlDType::Q8_1.block_size();
+    let q8_1_type_size = GgmlDType::Q8_1.type_size();
+    let bytes_per_row = ncols_padded / q8_1_block_size * q8_1_type_size;
+    let y_size_in_bytes = total_b * bytes_per_row;
+    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    quantize_q8_1(y, &mut y_q8_1, ncols, total_b, dev)?;
+
+    // 2. Pre-allocate the full output buffer.
+    let dst = dev.alloc_zeros::<f32>(total_b * nrows)?;
+
+    // 3. Loop chunks of up to 8 rows. Each iteration launches one vector
+    //    kernel against a slice of the quantized input and writes into a
+    //    slice of the pre-allocated output buffer.
+    const MAX_CHUNK: usize = 8;
+    let mut chunk_start = 0usize;
+    while chunk_start < total_b {
+        let chunk = (total_b - chunk_start).min(MAX_CHUNK);
+        // Slice the quantized input: chunk's bytes start at
+        // chunk_start * bytes_per_row.
+        let q_chunk = y_q8_1.slice(
+            chunk_start * bytes_per_row..(chunk_start + chunk) * bytes_per_row,
+        );
+        // Slice the output: chunk's f32 floats start at
+        // chunk_start * nrows.
+        let dst_chunk =
+            dst.slice(chunk_start * nrows..(chunk_start + chunk) * nrows);
+        launch_mul_mat_vec_q8_1_chunk(
+            data,
+            &q_chunk,
+            &dst_chunk,
+            dtype,
+            ncols,
+            nrows,
+            chunk,
+            ncols_padded,
+            dev,
+        )?;
+        chunk_start += chunk;
+    }
+
     Ok(HipStorage::wrap_hip_slice(dst, dev.clone()))
 }
 
@@ -907,7 +1032,6 @@ impl QHipStorage {
         storage: &HipStorage,
         layout: &crate::Layout,
     ) -> Result<(HipStorage, crate::Shape)> {
-        use crate::backend::BackendStorage;
         let (n, k) = self_shape.dims2()?;
         let (b, m, k2) = match layout.shape().dims() {
             &[b, m, k2] => (b, m, k2),
@@ -918,16 +1042,30 @@ impl QHipStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
 
-        // The integer-MMQ kernels (`mul_mat_via_q8_1` → `mul_mat_q*`) produce
-        // wrong results on gfx906 once `b*m >= 9` (numerically diverges, makes
-        // qwen3 multi-token prefill output garbage — see task #22). Always
-        // dequantize the weight and dispatch through the regular f32 gemm,
-        // which is well-tested. The temporary f32 buffer is `n*k` floats per
-        // call (~32 MB for typical attention/ffn projections) and is freed
-        // when the call returns; peak memory is bounded by one such tile.
-        let data_f32 = self.dequantize(n * k)?;
-        let rhs_l = crate::Layout::new((k, n).into(), vec![1, k], 0).broadcast_as((b, k, n))?;
-        let out = storage.matmul(&data_f32, (b, m, n, k), layout, &rhs_l)?;
+        // The integer-MMQ matrix kernels (`mul_mat_via_q8_1` → `mul_mat_q*`)
+        // produce wrong results on gfx906 once `b*m >= 9` (catastrophic
+        // divergence, garbages qwen3 multi-token prefill — see task #22).
+        // Until those kernels are fixed/replaced (the upstream `mul_mat_q`
+        // rewrite is much larger), `mul_mat_via_q8_1_chunked` chunks the
+        // call into multiple `mul_mat_vec_*_q8_1_cuda<bsize>` launches,
+        // each ≤ 8 rows wide. The vector path is well-tested and correct.
+        let storage = storage.as_hip_slice::<f32>()?;
+        let storage = match layout.contiguous_offsets() {
+            Some((o1, o2)) => storage.slice(o1..o2),
+            None => Err(crate::Error::RequiresContiguous {
+                op: "quantized-matmul",
+            }
+            .bt())?,
+        };
+        let out = mul_mat_via_q8_1_chunked(
+            &self.data,
+            &storage,
+            self.dtype,
+            /* ncols */ k,
+            /* nrows */ n,
+            /* total_b */ b * m,
+            self.device(),
+        )?;
 
         let mut out_shape = layout.shape().dims().to_vec();
         out_shape.pop();
