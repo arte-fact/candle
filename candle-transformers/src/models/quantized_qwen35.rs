@@ -180,36 +180,79 @@ impl ModelWeights {
         let mut mask_cache: std::collections::HashMap<String, Tensor> =
             std::collections::HashMap::new();
 
-        for layer in &mut self.layers {
-            // Pipeline-parallel: transfer the residual stream onto this layer's device.
-            if !device_eq(h.device(), &layer.device) {
-                h = h.to_device(&layer.device)?;
-            }
+        // Across-layer fusion: the post-FFN residual add of layer N and the
+        // attn_norm of layer N+1 are fused into a single launch via
+        // `forward_residual`. To make that work, the *first* layer's
+        // attn_norm is hoisted outside the loop, and each iteration
+        // produces the next iteration's `normed_for_attn` as part of the
+        // fused op (either via the across-layer fusion when the next layer
+        // is on the same device, or via a fallback transfer + plain norm
+        // when crossing pipeline-parallel boundaries).
+        let layers_len = self.layers.len();
+        let layer0_dev = self.layers[0].device.clone();
+        if !device_eq(h.device(), &layer0_dev) {
+            h = h.to_device(&layer0_dev)?;
+        }
+        let mut normed_for_attn = self.layers[0].attn_norm.forward(&h)?;
+
+        for il in 0..layers_len {
+            let layer_dev = self.layers[il].device.clone();
 
             let mask_for_layer = if l == 1 {
                 None
             } else {
-                let key = format!("{:?}", layer.device.location());
+                let key = format!("{:?}", layer_dev.location());
                 if !mask_cache.contains_key(&key) {
-                    let m = causal_mask(b, l, offset, None, DType::F32, &layer.device)?;
+                    let m = causal_mask(b, l, offset, None, DType::F32, &layer_dev)?;
                     mask_cache.insert(key.clone(), m);
                 }
                 mask_cache.get(&key).cloned()
             };
 
-            let normed = layer.attn_norm.forward(&h)?;
-            let attn_out = match &mut layer.attn {
-                AttnBlock::FullAttn(a) => a.forward(&normed, mask_for_layer.as_ref(), offset)?,
-                AttnBlock::Recurrent(gdn) => gdn.forward_step(&normed, &mut self.gdn_state)?,
+            // Attention. The mutable borrow of `self.layers[il].attn` is
+            // scoped to this match so the next field accesses don't
+            // conflict.
+            let attn_out = match &mut self.layers[il].attn {
+                AttnBlock::FullAttn(a) => {
+                    a.forward(&normed_for_attn, mask_for_layer.as_ref(), offset)?
+                }
+                AttnBlock::Recurrent(gdn) => {
+                    gdn.forward_step(&normed_for_attn, &mut self.gdn_state)?
+                }
             };
-            // Fused: post_attn_norm(h + attn_out) + (h + attn_out) in one
-            // HIP launch. Saves the separate residual-add launch +
-            // intermediate alloc per layer, per token.
-            let (normed, h_after_attn) = layer.post_attn_norm.forward_residual(&h, &attn_out)?;
+
+            // Within-layer fusion: post_attn_norm(h + attn_out) + (h + attn_out)
+            let (normed_for_ffn, h_after_attn) =
+                self.layers[il].post_attn_norm.forward_residual(&h, &attn_out)?;
             h = h_after_attn;
 
-            let ffn_out = layer.ffn.forward(&normed)?;
-            h = (&h + ffn_out)?;
+            let ffn_out = self.layers[il].ffn.forward(&normed_for_ffn)?;
+
+            // Across-layer fusion: combine the post-FFN residual add with
+            // the next layer's attn_norm into one launch when both live on
+            // the same device. Cross-device boundaries fall back to a
+            // plain residual add + transfer + standalone norm.
+            let is_last = il + 1 == layers_len;
+            if is_last {
+                h = (&h + ffn_out)?;
+                // `normed_for_attn` is no longer used; nothing to update.
+            } else {
+                let next_dev = self.layers[il + 1].device.clone();
+                if device_eq(&next_dev, &layer_dev) {
+                    let (next_normed, h_after_ffn) = self.layers[il + 1]
+                        .attn_norm
+                        .forward_residual(&h, &ffn_out)?;
+                    h = h_after_ffn;
+                    normed_for_attn = next_normed;
+                } else {
+                    // Cross-device pipeline boundary. Do the residual add
+                    // on this device, then transfer the residual stream
+                    // and run the unfused norm on the next device.
+                    h = (&h + ffn_out)?;
+                    h = h.to_device(&next_dev)?;
+                    normed_for_attn = self.layers[il + 1].attn_norm.forward(&h)?;
+                }
+            }
         }
 
         let h = self.norm.forward(&h)?;
