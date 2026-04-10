@@ -52,9 +52,19 @@ impl MlpActivation {
 
 /// Standard gated feed-forward: out = down(activation(gate(x)) * up(x))
 /// The activation is configurable (SiLU for Llama/Qwen, GELU for Gemma).
+///
+/// The gate and up projections are loaded as a single fused weight
+/// matrix at GGUF load time, so the forward path issues one quantized
+/// matmul instead of two. The fused output is split via `narrow`.
 pub struct DenseMlp {
-    gate: QMatMul,
-    up: QMatMul,
+    /// Fused [gate; up] weight: rows `[0..intermediate_size)` are
+    /// `ffn_gate`, rows `[intermediate_size..2*intermediate_size)` are
+    /// `ffn_up`. One matmul launch instead of two on the forward
+    /// path.
+    gate_up: QMatMul,
+    /// Per-side output dim. Both gate and up have the same intermediate
+    /// width by construction.
+    intermediate_size: usize,
     down: QMatMul,
     activation: MlpActivation,
 }
@@ -71,18 +81,38 @@ impl DenseMlp {
         prefix: &str,
         activation: MlpActivation,
     ) -> Result<Self> {
-        let gate = gg.qmatmul(&format!("{prefix}.ffn_gate.weight"))?;
-        let up = gg.qmatmul(&format!("{prefix}.ffn_up.weight"))?;
+        let gate_name = format!("{prefix}.ffn_gate.weight");
+        let up_name = format!("{prefix}.ffn_up.weight");
+        // Need the per-side intermediate size; read it from the
+        // ffn_gate tensor info before fusing.
+        let intermediate_size = gg
+            .ct
+            .tensor_infos
+            .get(&gate_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing {gate_name}")))?
+            .shape
+            .dims()[0];
+        let gate_up = gg.qmatmul_concat_rows(&[&gate_name, &up_name])?;
         let down = gg.qmatmul(&format!("{prefix}.ffn_down.weight"))?;
-        Ok(Self { gate, up, down, activation })
+        Ok(Self { gate_up, intermediate_size, down, activation })
     }
 }
 
 impl Module for DenseMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate_out = self.gate.forward(x)?;
-        let up_out = self.up.forward(x)?;
-        let activated = self.activation.apply_with_mul(&gate_out, &up_out)?;
+        // Single fused gate+up matmul. Output: (B, L, 2*intermediate)
+        let gate_up = self.gate_up.forward(x)?;
+        // Split into gate and up halves along the last dim. The
+        // narrows are non-contiguous views into the same buffer; the
+        // fused silu_mul kernel works against contiguous inputs so we
+        // materialize once via .contiguous().
+        let gate = gate_up
+            .narrow(D::Minus1, 0, self.intermediate_size)?
+            .contiguous()?;
+        let up = gate_up
+            .narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?
+            .contiguous()?;
+        let activated = self.activation.apply_with_mul(&gate, &up)?;
         self.down.forward(&activated)
     }
 }
@@ -153,14 +183,31 @@ impl MoeExperts {
             cfg.feed_forward_length.unwrap_or(0)
         };
 
-        // Detect shared expert
+        // Detect shared expert. Build it via DenseMlp::load_with_activation
+        // so it picks up the same fused gate+up packing as the dense
+        // FFN path — saves one MMVQ launch per shared-expert call too.
         let shared = if gg.has_tensor(&format!("{prefix}.ffn_up_shexp.weight")) {
-            let shared_gate_w = gg.qmatmul(&format!("{prefix}.ffn_gate_shexp.weight"))?;
-            let shared_up = gg.qmatmul(&format!("{prefix}.ffn_up_shexp.weight"))?;
+            // The shared-expert tensors live under `{prefix}.ffn_*_shexp.weight`,
+            // so DenseMlp::load_with_activation needs a virtual prefix
+            // that resolves to those names. Concretely we want it to
+            // try `{prefix}_shexp.ffn_*.weight`, but that's not the
+            // actual layout. Instead, build the fused weight directly
+            // here using the same helper.
+            let shared_gate_name = format!("{prefix}.ffn_gate_shexp.weight");
+            let shared_up_name = format!("{prefix}.ffn_up_shexp.weight");
+            let shared_intermediate = gg
+                .ct
+                .tensor_infos
+                .get(&shared_gate_name)
+                .ok_or_else(|| candle::Error::Msg(format!("missing {shared_gate_name}")))?
+                .shape
+                .dims()[0];
+            let shared_gate_up =
+                gg.qmatmul_concat_rows(&[&shared_gate_name, &shared_up_name])?;
             let shared_down = gg.qmatmul(&format!("{prefix}.ffn_down_shexp.weight"))?;
             Some(DenseMlp {
-                gate: shared_gate_w,
-                up: shared_up,
+                gate_up: shared_gate_up,
+                intermediate_size: shared_intermediate,
                 down: shared_down,
                 activation: MlpActivation::Silu,
             })
