@@ -549,18 +549,81 @@ impl<T> HipSlice<T> {
 impl<T> Drop for HipSlice<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // Inside a HIP graph capture, sync `hipFree` would abort
+            // the capture (HIP forbids synchronous device calls during
+            // capture). Inside capture we route through `hipFreeAsync`
+            // on the capture stream — this records a graph-managed
+            // free node, so the temporary's lifetime becomes part of
+            // the graph itself.
+            //
+            // Outside capture, sync `hipFree` is the fast path. Tested
+            // unconditional `hipFreeAsync` and it regressed decode by
+            // ~25% on ROCm 7.1.1, so we keep the branch.
             unsafe {
-                // Sync `hipFree` here even when the alloc came from
-                // `hipMallocAsync`. Tested `hipFreeAsync` and it tanked
-                // decode by ~25% — likely because the back-to-back
-                // async-alloc + async-free pattern serialises on the
-                // runtime's pool lock harder than the sync free does.
-                // Keeping `free_stream` on the struct in case a future
-                // ROCm release fixes this.
-                let _ = sys::hipFree(self.ptr);
+                let captured_to = capture_active_stream();
+                if !captured_to.is_null() {
+                    let _ = sys::hipFreeAsync(self.ptr, captured_to);
+                } else {
+                    let _ = sys::hipFree(self.ptr);
+                }
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Capture-aware allocator routing
+// ---------------------------------------------------------------------------
+//
+// While a HIP graph capture is in progress on this thread, all `HipSlice`
+// drops must be routed through `hipFreeAsync` on the capture stream so
+// they're recorded as graph-managed free nodes — see `with_capture`
+// below for the wrapper that sets this state up. Outside capture, drops
+// take the synchronous `hipFree` fast path because `hipFreeAsync` is
+// measurably slower in steady-state decode (see commit history).
+
+use std::cell::Cell;
+
+thread_local! {
+    /// Stream pointer of the capture currently active on this thread,
+    /// or null if no capture is in progress.
+    static CAPTURE_STREAM: Cell<sys::hipStream_t> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+#[inline]
+fn capture_active_stream() -> sys::hipStream_t {
+    CAPTURE_STREAM.with(|c| c.get())
+}
+
+/// Run `f` while HIP graph capture is active on `stream`. While `f`
+/// runs, every `HipSlice<T>` that goes out of scope on this thread is
+/// freed via `hipFreeAsync(stream)` instead of synchronous `hipFree` —
+/// the resulting free nodes get recorded into the graph alongside the
+/// kernel launches and async allocs, so the temporary's full lifetime
+/// is owned by the captured graph.
+///
+/// Use this to capture a model forward pass. Without it, temporaries
+/// that get dropped mid-forward would trip the runtime's "synchronous
+/// call inside capture" guard and abort the capture.
+pub fn with_capture<F>(stream: &HipStream, f: F) -> Result<HipGraph, DriverError>
+where
+    F: FnOnce() -> Result<(), DriverError>,
+{
+    // Reentrant captures aren't supported — the thread-local can only
+    // hold one stream at a time. Bail loudly so misuse is obvious.
+    let prev = CAPTURE_STREAM.with(|c| c.replace(stream.raw));
+    if !prev.is_null() {
+        // Restore and error out.
+        CAPTURE_STREAM.with(|c| c.set(prev));
+        return Err(DriverError::Hip(sys::hipError_t::hipErrorInvalidValue));
+    }
+    let result = (|| {
+        let capture = HipGraphCapture::begin(stream)?;
+        f()?;
+        capture.end()
+    })();
+    CAPTURE_STREAM.with(|c| c.set(std::ptr::null_mut()));
+    result
 }
 
 impl<T> std::fmt::Debug for HipSlice<T> {
@@ -946,5 +1009,48 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<HipGraph>();
         assert_send_sync::<HipGraphExec>();
+    }
+
+    /// `with_capture` defers `HipSlice` drops while capture is active.
+    /// This test exercises the path that the model forward will rely on:
+    /// allocate temporary buffers inside `with_capture`, let them drop,
+    /// and prove the capture survives + the buffers are freed afterwards.
+    #[test]
+    fn hip_graph_with_capture_defers_drops() {
+        let dev = match HipDevice::new(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let stream = HipStream::new(&dev).expect("create stream");
+
+        // Pre-existing buffer that we'll write into during capture.
+        let mut dst = stream.alloc::<u8>(64).expect("alloc dst");
+        // Need a stable host source for the htod copy inside capture.
+        let host = vec![0xABu8; 64];
+
+        let graph = with_capture(&stream, || {
+            // Allocate a tmp inside capture, copy data through it, drop
+            // it. Without `with_capture`'s deferred-free, the drop would
+            // call sync `hipFree` and abort the capture.
+            let mut tmp = stream.alloc::<u8>(64)?;
+            stream.memcpy_htod(&mut tmp, &host)?;
+            stream.memcpy_dtod(&mut dst, &tmp)?;
+            // tmp goes out of scope here — its drop should be deferred.
+            Ok(())
+        })
+        .expect("with_capture");
+
+        let exec = graph.instantiate().expect("instantiate");
+        // Replay the graph and verify dst contains 0xAB.
+        let zeros = vec![0u8; 64];
+        stream.memcpy_htod(&mut dst, &zeros).expect("zero dst");
+        stream.synchronize().expect("zero sync");
+        exec.launch(&stream).expect("graph launch");
+        stream.synchronize().expect("launch sync");
+        let dst_after = stream.clone_dtoh(&dst).expect("read dst");
+        assert!(
+            dst_after.iter().all(|&b| b == 0xAB),
+            "graph replay did not write the expected pattern"
+        );
     }
 }
