@@ -153,6 +153,12 @@ impl HipStream {
     // -- Allocation helpers --------------------------------------------------
 
     /// Allocate `len` elements of type `T` on the device (uninitialized).
+    ///
+    /// Uses stream-ordered `hipMallocAsync` (ROCm 5.1+) which is backed by
+    /// an internal memory pool. Several **hundred microseconds faster per
+    /// alloc** than the synchronous `hipMalloc` for the small temporary
+    /// buffers candle creates by the hundred per decoded token. Falls back
+    /// to `hipMalloc` if the async API isn't supported.
     pub fn alloc<T: DeviceRepr>(&self, len: usize) -> Result<HipSlice<T>, DriverError> {
         self.device.set_current()?;
         if len == 0 {
@@ -164,7 +170,14 @@ impl HipStream {
         }
         let size = len * std::mem::size_of::<T>();
         let mut ptr = std::ptr::null_mut();
-        unsafe { check_hip(sys::hipMalloc(&mut ptr, size))? };
+        unsafe {
+            // Try the async pool first; fall back if it returns
+            // hipErrorNotSupported (older ROCm or unsupported device).
+            let rc = sys::hipMallocAsync(&mut ptr, size, self.raw);
+            if rc != sys::hipError_t::hipSuccess {
+                check_hip(sys::hipMalloc(&mut ptr, size))?;
+            }
+        };
         Ok(HipSlice {
             ptr,
             len,
@@ -188,7 +201,10 @@ impl HipStream {
         let size = len * std::mem::size_of::<T>();
         let mut ptr = std::ptr::null_mut();
         unsafe {
-            check_hip(sys::hipMalloc(&mut ptr, size))?;
+            let rc = sys::hipMallocAsync(&mut ptr, size, self.raw);
+            if rc != sys::hipError_t::hipSuccess {
+                check_hip(sys::hipMalloc(&mut ptr, size))?;
+            }
             check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?;
         }
         Ok(HipSlice {

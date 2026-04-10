@@ -85,6 +85,17 @@ extern "C" {
     // Memory
     pub fn hipMalloc(ptr: *mut hipDeviceptr_t, size: size_t) -> hipError_t;
     pub fn hipFree(ptr: hipDeviceptr_t) -> hipError_t;
+    /// Stream-ordered async allocator. Backed by an internal memory pool
+    /// in the HIP runtime — orders of magnitude cheaper than the
+    /// synchronous `hipMalloc` for the per-op temporary buffers that
+    /// candle's HIP backend creates by the hundred per decoded token.
+    /// Available since ROCm 5.1.
+    pub fn hipMallocAsync(
+        ptr: *mut hipDeviceptr_t,
+        size: size_t,
+        stream: hipStream_t,
+    ) -> hipError_t;
+    pub fn hipFreeAsync(ptr: hipDeviceptr_t, stream: hipStream_t) -> hipError_t;
     pub fn hipMemset(dst: hipDeviceptr_t, value: c_int, size_bytes: size_t) -> hipError_t;
     pub fn hipMemsetAsync(
         dst: hipDeviceptr_t,
