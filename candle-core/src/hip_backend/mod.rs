@@ -2251,4 +2251,163 @@ mod graph_smoke {
         // The reference values should still be available — sanity check.
         assert_eq!(ref_vals.len(), m * n);
     }
+
+    /// Quantitative benchmark: capture a chained sequence of small ops
+    /// (representative of one transformer block worth of launches) and
+    /// time graph replay vs running the sequence without capture.
+    ///
+    /// The hypothesis being tested is that for short, launch-bound
+    /// sequences on gfx906/ROCm 7.1.1, replay amortises the per-launch
+    /// `hipModuleLaunchKernel` overhead and is materially faster than
+    /// back-to-back fresh launches. The qwen35-9B per-token decode is
+    /// estimated at ~960 launches × ~30 µs ≈ ~29 ms of pure launch cost
+    /// out of ~32 ms total — so closing that gap is the primary lever.
+    ///
+    /// This test deliberately uses tiny matrices so the kernel work
+    /// itself is dwarfed by launch overhead. Marked `#[ignore]` so it
+    /// only runs when explicitly invoked:
+    ///   `cargo test capture_replay_chained_bench -- --nocapture --ignored`
+    #[test]
+    #[ignore]
+    fn capture_replay_chained_bench() {
+        let dev = match Device::new_hip(0) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("no HIP device — skipping");
+                return;
+            }
+        };
+        let hip_dev = match &dev {
+            Device::Hip(d) => d.clone(),
+            _ => return,
+        };
+
+        // Tiny square matrices: kernel work ~negligible, launch
+        // overhead dominates. This isolates the launch-amortisation
+        // signal we want to measure.
+        let dim = 64usize;
+        let chain_len = 32usize;
+        let warmup = 16usize;
+        let iters = 100usize;
+
+        // Persistent input + a chain of distinct weight tensors so the
+        // matmul kernel parameters change slot-to-slot (more
+        // representative of a real layer sequence than reusing one weight).
+        let x = Tensor::arange(0f32, (dim * dim) as f32, &dev)
+            .expect("alloc x")
+            .reshape((dim, dim))
+            .expect("reshape x");
+        let weights: Vec<Tensor> = (0..chain_len)
+            .map(|i| {
+                let base = (i as f32) * 0.01;
+                Tensor::arange(base, base + (dim * dim) as f32, &dev)
+                    .expect("alloc w")
+                    .reshape((dim, dim))
+                    .expect("reshape w")
+            })
+            .collect();
+
+        // Closure that runs one "step" — `chain_len` (matmul + relu)
+        // pairs. We use `relu` (clamp_min(0)) because it's available in
+        // candle-core proper without pulling in candle-nn. The point of
+        // the test is launch count, not which activation.
+        // Returns the final tensor so the borrow checker keeps
+        // intermediates alive but the result is discarded.
+        let run_step = |w: &[Tensor]| -> crate::Result<Tensor> {
+            let mut h = x.clone();
+            for wi in w.iter() {
+                h = h.matmul(wi)?;
+                h = h.relu()?;
+            }
+            Ok(h)
+        };
+
+        // -------------------------------------------------------------
+        // Baseline: run the chain `iters` times without capture.
+        // -------------------------------------------------------------
+        for _ in 0..warmup {
+            let _ = run_step(&weights).expect("warmup");
+        }
+        hip_dev.synchronize().expect("warmup sync");
+
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = run_step(&weights).expect("baseline step");
+        }
+        hip_dev.synchronize().expect("baseline sync");
+        let baseline_total = t0.elapsed();
+        let baseline_per_step = baseline_total.as_secs_f64() / iters as f64;
+
+        // -------------------------------------------------------------
+        // Capture the same chain into a graph. The closure runs once
+        // and every Tensor allocated inside it gets dropped at the
+        // end — their `hipFreeAsync` calls become graph-managed free
+        // nodes (see `with_capture`).
+        // -------------------------------------------------------------
+        let stream = hip_dev.stream();
+        let capture_t0 = std::time::Instant::now();
+        let graph = hipdarc::driver::with_capture(stream, || {
+            run_step(&weights)
+                .map(|_| ())
+                .map_err(|e| hipdarc::error::DriverError::Message(format!("{e}")))
+        });
+        let graph = match graph {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("graph capture FAILED: {e:?}");
+                eprintln!(
+                    "  one of the kernels in the chain is using a synchronous HIP \
+                     call. This blocks the model-side integration."
+                );
+                return;
+            }
+        };
+        let exec = graph.instantiate().expect("instantiate");
+        let capture_total = capture_t0.elapsed();
+
+        // -------------------------------------------------------------
+        // Replay the captured graph `iters` times.
+        // -------------------------------------------------------------
+        for _ in 0..warmup {
+            exec.launch(stream).expect("warmup replay");
+        }
+        hip_dev.synchronize().expect("replay warmup sync");
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters {
+            exec.launch(stream).expect("replay");
+        }
+        hip_dev.synchronize().expect("replay sync");
+        let replay_total = t1.elapsed();
+        let replay_per_step = replay_total.as_secs_f64() / iters as f64;
+
+        let speedup = baseline_per_step / replay_per_step;
+
+        eprintln!();
+        eprintln!("=== HIP graph replay vs fresh launches ===");
+        eprintln!(
+            "  chain: {chain_len} (matmul → silu) pairs on {dim}×{dim} tiles"
+        );
+        eprintln!("  iters: {iters}, warmup: {warmup}");
+        eprintln!("  baseline:  {:>8.2} µs/step", baseline_per_step * 1e6);
+        eprintln!("  replay:    {:>8.2} µs/step", replay_per_step * 1e6);
+        eprintln!("  speedup:   {speedup:>8.2}×");
+        eprintln!(
+            "  capture overhead (1×): {:>8.2} ms (capture + instantiate)",
+            capture_total.as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "  break-even: {:.0} replays amortise the capture cost",
+            capture_total.as_secs_f64() / (baseline_per_step - replay_per_step).max(1e-9)
+        );
+
+        // Sanity: replay should not be slower than baseline for this
+        // workload. If it is, capture is broken or the graph is
+        // serialising on something unexpected.
+        assert!(
+            replay_per_step < baseline_per_step * 2.0,
+            "replay shouldn't be 2× slower than baseline; got {:.2}× slower",
+            replay_per_step / baseline_per_step,
+        );
+    }
 }
