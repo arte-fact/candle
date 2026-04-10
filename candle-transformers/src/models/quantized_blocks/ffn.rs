@@ -29,10 +29,19 @@ pub enum MlpActivation {
 }
 
 impl MlpActivation {
-    fn apply(&self, x: &Tensor) -> Result<Tensor> {
+    /// Fused activation: `activation(gate) * up` in a single launch on
+    /// HIP, falling back to the unfused chain on every other backend.
+    /// Saves one kernel launch and one intermediate buffer per FFN per
+    /// layer per token.
+    fn apply_with_mul(&self, gate: &Tensor, up: &Tensor) -> Result<Tensor> {
         match self {
-            MlpActivation::Silu => candle_nn::ops::silu(x),
-            MlpActivation::Gelu => x.gelu(),
+            MlpActivation::Silu => candle_nn::ops::silu_mul(gate, up),
+            MlpActivation::Gelu => {
+                // No fused gelu_mul kernel yet; gelu is rare enough that
+                // the unfused chain is fine.
+                let g = gate.gelu()?;
+                &g * up
+            }
         }
     }
 }
@@ -71,9 +80,10 @@ impl DenseMlp {
 
 impl Module for DenseMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = self.activation.apply(&self.gate.forward(x)?)?;
-        let up = self.up.forward(x)?;
-        self.down.forward(&(gate * up)?)
+        let gate_out = self.gate.forward(x)?;
+        let up_out = self.up.forward(x)?;
+        let activated = self.activation.apply_with_mul(&gate_out, &up_out)?;
+        self.down.forward(&activated)
     }
 }
 
@@ -220,14 +230,24 @@ impl MoeExperts {
             let up_exps = self.up_exps.as_ref().unwrap();
             let gate_out = gate_exps.indexed_moe_forward(&x_flat_3d, &topk_ids)?;
             let up_out = up_exps.indexed_moe_forward(&x_flat_3d, &topk_ids)?;
-            let activated = (candle_nn::ops::silu(&gate_out)? * up_out)?;
+            let activated = candle_nn::ops::silu_mul(&gate_out, &up_out)?;
             self.down_exps.indexed_moe_forward(&activated.contiguous()?, &topk_ids)?
         } else if let Some(ref gate_up_exps) = self.gate_up_exps {
-            // Fused gate+up experts
+            // Fused gate+up experts: one matmul output split into the
+            // gate half and the up half. The narrows are non-contiguous
+            // views into the same buffer; `silu_mul` falls back to the
+            // chained ops on non-contiguous inputs, so the fast HIP
+            // kernel never fires here. Calling `.contiguous()?` on each
+            // half once is cheaper than two extra kernels per layer per
+            // step.
             let gate_up = gate_up_exps.indexed_moe_forward(&x_flat_3d, &topk_ids)?;
-            let gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
-            let up = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
-            let activated = (candle_nn::ops::silu(&gate)? * up)?;
+            let gate = gate_up
+                .narrow(D::Minus1, 0, self.intermediate_size)?
+                .contiguous()?;
+            let up = gate_up
+                .narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?
+                .contiguous()?;
+            let activated = candle_nn::ops::silu_mul(&gate, &up)?;
             self.down_exps.indexed_moe_forward(&activated.contiguous()?, &topk_ids)?
         } else {
             candle::bail!("MoE has no expert weights");

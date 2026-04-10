@@ -334,3 +334,64 @@ test_device!(rms_norml, rms_norml_cpu, rms_norml_gpu, rms_norml_metal);
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+
+/// Verify the fused `silu_mul` matches the unfused chain `silu(gate) * up`
+/// to within a tight numerical tolerance.
+///
+/// Two phases:
+///  1. Tiny hand-crafted inputs that hit positive, negative, near-zero,
+///     and large magnitudes — catches sign/branch bugs in `silu_fwd`.
+///  2. FFN-shaped random inputs (B=1, L=8, H=4096) — the realistic decode
+///     case for a small/medium transformer FFN. Catches grid/block sizing
+///     bugs that wouldn't surface on tiny tensors.
+fn silu_mul(device: &Device) -> Result<()> {
+    use candle::DType;
+
+    // Phase 1: hand-crafted edge cases.
+    let gate = Tensor::new(
+        &[
+            [-3.0f32, -1.5, -0.1, 0.0, 0.5, 1.0, 2.0, 4.0],
+            [10.0, -10.0, 0.25, -0.25, 5.5, -5.5, 0.001, -0.001],
+        ],
+        device,
+    )?;
+    let up = Tensor::new(
+        &[
+            [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            [-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0, -8.0],
+        ],
+        device,
+    )?;
+    let fused = candle_nn::ops::silu_mul(&gate, &up)?;
+    let chained = (gate.silu()? * &up)?;
+    let diff = (fused - chained)?
+        .abs()?
+        .max_keepdim(1)?
+        .max_keepdim(0)?
+        .to_dtype(DType::F32)?
+        .to_vec2::<f32>()?;
+    assert!(
+        diff[0][0] < 1e-5,
+        "silu_mul edge-case mismatch on {device:?}: max abs diff = {}",
+        diff[0][0]
+    );
+
+    // Phase 2: FFN-realistic random inputs. (1, 8, 4096) is the
+    // decode-with-padding case for a small-FFN transformer; matches
+    // a real `up`/`gate` matmul output's shape and stride pattern.
+    let g = Tensor::randn(0f32, 1.0, (1, 8, 4096), device)?;
+    let u = Tensor::randn(0f32, 1.0, (1, 8, 4096), device)?;
+    let fused = candle_nn::ops::silu_mul(&g, &u)?;
+    let chained = (g.silu()? * &u)?;
+    let max_abs_diff = (fused - chained)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(
+        max_abs_diff < 1e-5,
+        "silu_mul FFN-shape mismatch on {device:?}: max abs diff = {max_abs_diff}",
+    );
+    Ok(())
+}
+test_device!(silu_mul, silu_mul_cpu, silu_mul_gpu, silu_mul_metal, silu_mul_hip);

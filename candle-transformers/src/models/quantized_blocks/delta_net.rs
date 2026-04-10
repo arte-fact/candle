@@ -383,8 +383,11 @@ impl DeltaNetLayer {
         )?;
         let output_normed = output_normed.reshape((b_sz, self.dims.d_inner))?;
 
-        let z_silu = candle_nn::ops::silu(&z)?;
-        let gated = (output_normed * z_silu)?;
+        // Fused: gated = silu(z) * output_normed in one launch instead
+        // of two, plus one fewer intermediate buffer per recurrent step.
+        // (Multiplication commutes, so this matches the original
+        // `output_normed * silu(z)`.)
+        let gated = candle_nn::ops::silu_mul(&z, &output_normed)?;
 
         // 9. Output projection
         let out = self.ssm_out.forward(&gated)?;
@@ -560,8 +563,8 @@ impl DeltaNetLayer {
             )?;
             let output_normed = output_normed.reshape((1, d_inner))?;
 
-            let z_silu = candle_nn::ops::silu(&z_t)?;
-            let gated = (output_normed * z_silu)?;
+            // Fused silu(z_t) * output_normed in one launch.
+            let gated = candle_nn::ops::silu_mul(&z_t, &output_normed)?;
             gated_outputs.push(gated);
         }
 

@@ -230,3 +230,35 @@ UNARY_OP(float, usign_f32, sign_(x))
 UNARY_OP(double, usign_f64, sign_(x))
 UNARY_OP(float, usigmoid_f32, sigmoid_fwd(x))
 UNARY_OP(double, usigmoid_f64, sigmoid_fwd(x))
+
+// ---------------------------------------------------------------------------
+// Fused SwiGLU: out[i] = silu(gate[i]) * up[i]
+// ---------------------------------------------------------------------------
+//
+// One launch instead of two (silu + bmul) plus one fewer intermediate
+// allocation per FFN per layer. The qwen35-9B per-token decode does this
+// 32 times — fused saves ~32 launches and ~32 small allocs per token.
+//
+// Contiguous-only because the FFN inputs are always the output of an
+// `up`/`gate` matmul which is contiguous by construction. The strided
+// path is not needed in any model and would just bloat the kernel.
+
+#define SILU_MUL_OP(TYPENAME, FN_NAME)                                         \
+extern "C" __global__ void FN_NAME(                                            \
+    const size_t numel,                                                        \
+    const TYPENAME *__restrict__ gate,                                         \
+    const TYPENAME *__restrict__ up,                                           \
+    TYPENAME *__restrict__ out                                                 \
+) {                                                                            \
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;               \
+         i < numel;                                                            \
+         i += blockDim.x * gridDim.x) {                                        \
+        TYPENAME g = gate[i];                                                  \
+        out[i] = silu_fwd(g) * up[i];                                          \
+    }                                                                          \
+}
+
+SILU_MUL_OP(float,         silu_mul_f32)
+SILU_MUL_OP(double,        silu_mul_f64)
+SILU_MUL_OP(__half,        silu_mul_f16)
+SILU_MUL_OP(hip_bfloat16,  silu_mul_bf16)

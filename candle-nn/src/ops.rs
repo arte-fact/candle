@@ -835,6 +835,181 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }
 
+// ---------------------------------------------------------------------------
+// Fused SwiGLU activation: silu(gate) * up
+// ---------------------------------------------------------------------------
+//
+// Replaces the two-launch sequence
+//     let h = gate.silu()?;
+//     let out = (&h * up)?;
+// with a single fused kernel launch on HIP. The intermediate `h` allocation
+// is also eliminated.
+//
+// On non-HIP backends, [`silu_mul`] falls back to the chained ops, so the
+// op is safe to call from device-agnostic model code.
+
+#[derive(Debug, Clone)]
+struct SiluMul;
+
+impl candle::CustomOp2 for SiluMul {
+    fn name(&self) -> &'static str {
+        "silu-mul"
+    }
+
+    /// Reference CPU implementation. Not called from [`silu_mul`] (which
+    /// dispatches the chained ops directly on CPU) — this exists so the
+    /// op can be exercised from custom-op-based test paths.
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        fn inner<T: candle::WithDType + num_traits::Float>(
+            gate: &[T],
+            l1: &Layout,
+            up: &[T],
+            l2: &Layout,
+        ) -> Result<(CpuStorage, Shape)> {
+            let gate = match l1.contiguous_offsets() {
+                None => candle::bail!("silu_mul: gate must be contiguous"),
+                Some((o1, o2)) => &gate[o1..o2],
+            };
+            let up = match l2.contiguous_offsets() {
+                None => candle::bail!("silu_mul: up must be contiguous"),
+                Some((o1, o2)) => &up[o1..o2],
+            };
+            if gate.len() != up.len() {
+                candle::bail!(
+                    "silu_mul: gate/up length mismatch {} vs {}",
+                    gate.len(),
+                    up.len()
+                );
+            }
+            let mut out = vec![T::zero(); gate.len()];
+            for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up.iter())) {
+                // silu(x) = x / (1 + exp(-x))
+                let s = g / (T::one() + (-g).exp());
+                *o = s * u;
+            }
+            let storage = candle::WithDType::to_cpu_storage_owned(out);
+            Ok((storage, l1.shape().clone()))
+        }
+        match (s1, s2) {
+            (CpuStorage::F32(g), CpuStorage::F32(u)) => inner::<f32>(g, l1, u, l2),
+            (CpuStorage::F16(g), CpuStorage::F16(u)) => inner::<half::f16>(g, l1, u, l2),
+            (CpuStorage::BF16(g), CpuStorage::BF16(u)) => inner::<half::bf16>(g, l1, u, l2),
+            (CpuStorage::F64(g), CpuStorage::F64(u)) => inner::<f64>(g, l1, u, l2),
+            _ => {
+                use candle::backend::BackendStorage;
+                candle::bail!("silu_mul: unsupported dtype {:?}", s1.dtype())
+            }
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    fn hip_fwd(
+        &self,
+        s1: &candle::HipStorage,
+        l1: &Layout,
+        s2: &candle::HipStorage,
+        l2: &Layout,
+    ) -> Result<(candle::HipStorage, Shape)> {
+        use candle::hip_backend::hipdarc::driver::{
+            DeviceRepr, HipSlice, LaunchConfig, ValidAsZeroBits,
+        };
+        use candle::hip_backend::{kernels, Map2, WrapErr};
+        use candle::{hip_backend::HipDevice, WithDType};
+
+        struct S;
+        impl Map2 for S {
+            fn f<T: DeviceRepr + WithDType + ValidAsZeroBits>(
+                &self,
+                gate: &HipSlice<T>,
+                gate_l: &Layout,
+                up: &HipSlice<T>,
+                up_l: &Layout,
+                dev: &HipDevice,
+            ) -> Result<HipSlice<T>> {
+                // Both inputs come from a matmul output → contiguous in
+                // every model that uses silu_mul. Refuse non-contiguous
+                // rather than emit a strided variant we'd never hit.
+                let gate = match gate_l.contiguous_offsets() {
+                    None => candle::bail!("silu_mul: gate must be contiguous"),
+                    Some((o1, o2)) => gate.slice(o1..o2),
+                };
+                let up = match up_l.contiguous_offsets() {
+                    None => candle::bail!("silu_mul: up must be contiguous"),
+                    Some((o1, o2)) => up.slice(o1..o2),
+                };
+                let el = gate_l.shape().elem_count();
+                if up_l.shape().elem_count() != el {
+                    candle::bail!(
+                        "silu_mul: shape mismatch {:?} vs {:?}",
+                        gate_l.shape(),
+                        up_l.shape()
+                    );
+                }
+
+                let cfg = LaunchConfig::for_num_elems(el as u32);
+                let kernel_name = format!("silu_mul_{}", T::DTYPE.as_str());
+                let func = dev.get_or_load_func(&kernel_name, &kernels::UNARY)?;
+                let out = unsafe { dev.alloc::<T>(el)? };
+
+                let mut builder = func.builder();
+                let el_arg = el;
+                builder.arg(&el_arg);
+                builder.arg(&gate);
+                builder.arg(&up);
+                builder.arg(&out);
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok(out)
+            }
+        }
+
+        use candle::backend::BackendStorage;
+        let dev = s1.device();
+        let slice = S.map(&s1.slice, l1, &s2.slice, l2, dev)?;
+        let dst = candle::HipStorage {
+            slice,
+            device: dev.clone(),
+        };
+        Ok((dst, l1.shape().clone()))
+    }
+}
+
+/// Compute `silu(gate) * up` element-wise.
+///
+/// On HIP with contiguous inputs, this lowers to a single fused kernel
+/// launch — no intermediate allocation, no separate silu pass. On every
+/// other backend, or when either input is non-contiguous, it falls back
+/// to the chained `gate.silu()? * up`, which is mathematically identical
+/// and uses each backend's existing kernels.
+///
+/// This is the SwiGLU activation used by every modern transformer FFN.
+/// Applied 32× per qwen35-9B decode token, fused saves ~32 launches +
+/// ~32 small allocations per token vs the unfused chain.
+pub fn silu_mul(gate: &Tensor, up: &Tensor) -> Result<Tensor> {
+    if gate.shape() != up.shape() {
+        candle::bail!(
+            "silu_mul: shape mismatch {:?} vs {:?}",
+            gate.shape(),
+            up.shape()
+        )
+    }
+    #[cfg(feature = "hip")]
+    if matches!(gate.device(), candle::Device::Hip(_))
+        && gate.is_contiguous()
+        && up.is_contiguous()
+    {
+        return gate.apply_op2_no_bwd(up, &SiluMul);
+    }
+    let _ = SiluMul; // silence unused warning when hip feature is off
+    let h = gate.silu()?;
+    &h * up
+}
+
 #[derive(Debug, Clone)]
 struct LayerNorm {
     eps: f32,
