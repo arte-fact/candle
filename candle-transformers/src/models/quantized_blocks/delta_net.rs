@@ -396,17 +396,36 @@ impl DeltaNetLayer {
 
     /// Multi-token forward (prefill).
     ///
-    /// Batches the position-independent linear projections (`wqkv`,
-    /// `wqkv_gate`, `ssm_alpha`/`ssm_beta` or `ssm_ba`, `ssm_out`) across
-    /// **all** prompt tokens in one shot, then runs only the recurrent
-    /// pieces (conv1d state shift and delta-net state update) inside a
-    /// per-token loop. The recurrent state at step `t` depends on the
-    /// state at step `t-1`, so those steps remain sequential — but each
-    /// of them is now small because the heavy matmuls happen outside
-    /// the loop.
+    /// Fully batched path: all position-independent linear projections
+    /// are run once over the full prompt, and every downstream op
+    /// (conv1d, L2 norm, GQA head repeat, delta-net recurrence,
+    /// ssm_norm, silu_mul, output projection) operates on `(B*L, …)`
+    /// tensors in one shot.
     ///
-    /// On 4×MI50 with qwen3next 45 GB the GDN-layer prefill speed roughly
-    /// doubled vs the previous "call `forward_step` once per token" path.
+    /// The key optimisation over the pre-Phase-2 version is that the
+    /// delta-net recurrence is now a single call to
+    /// [`delta_net_step_vectorized`] with `L = seq_len`. On HIP this
+    /// dispatches to one `gated_delta_net.cu` launch that keeps the
+    /// `(S_v, S_v)` state register-resident across every token of the
+    /// prompt — the warp loads the state once per launch, iterates
+    /// all L recurrence steps, and writes it back once. This replaces
+    /// the ~8-op tensor chain × `seq_len` launches that dominated the
+    /// candle rocprofv3 breakdown (842k pointwise ops / 4948 ms on
+    /// qwen35-9B 1-GPU prefill).
+    ///
+    /// Conv1d is still position-dependent (state[t] = f(state[t-1],
+    /// x[t])) but its K-step window is a trivial sliding dot product,
+    /// expressed here as K broadcast_mul + add passes over the
+    /// `(L+K-1, channels)` concatenation of conv_state and qkv_mixed.
+    /// That's `K ≈ 4` tensor-op launches per layer instead of
+    /// `~5 × seq_len` in the old per-token loop.
+    ///
+    /// Fallback: `B > 1` and the `CANDLE_GDN_PER_TOKEN` env var both
+    /// route back to the legacy `forward_step`-per-token path. The
+    /// env var is kept as a diagnostic A/B switch; `B > 1` is a
+    /// practical restriction because the conv_state tensors in
+    /// `GdnState` are stored with a single batch row and the batched
+    /// conv1d path below assumes `B = 1`.
     fn forward_prefill(&self, x: &Tensor, state: &mut GdnState) -> Result<Tensor> {
         let (b_sz, seq_len, hidden) = x.dims3()?;
         if seq_len == 1 {
@@ -428,9 +447,10 @@ impl DeltaNetLayer {
             }
             return Tensor::stack(&outputs, 1);
         }
-        // Per-token loop assumes B=1 so the per-step `narrow(0, t, 1)`
-        // produces a contiguous slice without a copy. For B>1 fall back
-        // to the legacy per-token forward_step path.
+        // Batched path assumes B=1; for B>1 fall back to the legacy
+        // per-token forward_step path. None of the models we run today
+        // have B>1 prefill, so this is a correctness safety net, not a
+        // perf path.
         if b_sz != 1 {
             let mut outputs = Vec::with_capacity(seq_len);
             for t in 0..seq_len {
@@ -442,24 +462,20 @@ impl DeltaNetLayer {
         }
 
         // ----- Stage 1: batched linear projections for all tokens ---------
-        // Keep everything in (B*L, X) layout from here on. With B=1 the
-        // per-step row at index t is contiguous (just one row of a flat
-        // (L, X) tensor) so the recurrent loop can `narrow(0, t, 1)`
-        // without triggering an internal copy.
         let bl = b_sz * seq_len;
         let x_flat = x.reshape((bl, hidden))?;
-        let qkv_mixed = self.wqkv.forward(&x_flat)?; // (B*L, conv_channels)
-        let z = self.wqkv_gate.forward(&x_flat)?; // (B*L, d_inner)
+        let qkv_mixed = self.wqkv.forward(&x_flat)?; // (L, conv_channels)
+        let z = self.wqkv_gate.forward(&x_flat)?; // (L, d_inner)
 
         // Alpha / beta — same auto-detect logic as forward_step but batched.
         let (alpha, beta) = match &self.ba_proj {
             BaProj::Split { alpha, beta } => {
-                let a = alpha.forward(&x_flat)?; // (B*L, num_v_heads)
+                let a = alpha.forward(&x_flat)?; // (L, num_v_heads)
                 let b = candle_nn::ops::sigmoid(&beta.forward(&x_flat)?)?;
                 (a, b)
             }
             BaProj::Fused { ba } => {
-                let mixed = ba.forward(&x_flat)?; // (B*L, 2*num_v_heads)
+                let mixed = ba.forward(&x_flat)?; // (L, 2*num_v_heads)
                 let v_per_k = self.dims.num_v_heads / self.dims.num_k_heads;
                 let ba_new_dim = 2 * v_per_k;
                 let mixed = mixed.reshape((bl, self.dims.num_k_heads, ba_new_dim))?;
@@ -472,18 +488,12 @@ impl DeltaNetLayer {
             }
         };
 
-        // Decay gate: softplus(alpha + dt_bias) * A. Single elementwise
-        // pass over (B*L, num_v_heads).
+        // Decay gate: softplus(alpha + dt_bias) * A, all at once.
         let alpha_biased = alpha.broadcast_add(&self.ssm_dt)?;
         let alpha_sp = softplus(&alpha_biased)?;
-        let gate = alpha_sp.broadcast_mul(&self.ssm_a)?; // (B*L, num_v_heads)
+        let gate_flat = alpha_sp.broadcast_mul(&self.ssm_a)?; // (L, num_v_heads)
 
-        // ----- Stage 2: per-token recurrent loop --------------------------
-        // Each iteration only touches the conv1d shift, the delta-net state
-        // update, and the per-head ssm_norm. All the heavy matmuls already
-        // happened above. Per-step access is `narrow(0, t, 1)` on the
-        // contiguous (B*L, X) tensors — for B=1 this is a single contiguous
-        // row, so no copies happen.
+        // Dimension shortcuts used below.
         let qk_size = self.dims.head_k_dim * self.dims.num_k_heads;
         let v_size = self.dims.head_v_dim * self.dims.num_v_heads;
         let s_v = self.dims.head_v_dim;
@@ -493,86 +503,151 @@ impl DeltaNetLayer {
         let n_k = self.dims.num_k_heads;
         let d_inner = self.dims.d_inner;
 
-        let mut gated_outputs: Vec<Tensor> = Vec::with_capacity(seq_len);
-        for t in 0..seq_len {
-            // narrow(0, t, 1) on a contiguous (L, X) tensor returns a
-            // contiguous (1, X) view — zero copy.
-            let qkv_mixed_t = qkv_mixed.narrow(0, t, 1)?; // (1, conv_channels)
-            let z_t = z.narrow(0, t, 1)?; // (1, d_inner)
-            let gate_t = gate.narrow(0, t, 1)?; // (1, num_v_heads)
-            let beta_t = beta.narrow(0, t, 1)?; // (1, num_v_heads)
+        // ----- Stage 2: batched conv1d ------------------------------------
+        //
+        // The old per-token conv1d shifted `conv_state` by one row and
+        // computed one K-row window's dot product against
+        // `ssm_conv1d`. Batched equivalent: concatenate the initial
+        // `conv_state` (K-1 rows) with the full prompt `qkv_mixed`
+        // (L rows) along dim 0, producing `stacked` of shape
+        // `(L + K - 1, conv_channels)`. Each of the L output rows is a
+        // sliding K-window dot product:
+        //
+        //     conv_out[t, c] = Σ_{j=0..K} stacked[t+j, c] * weight[j, c]
+        //
+        // which we unroll into K `broadcast_mul + add` passes. The
+        // new conv_state is the last (K-1) rows of `stacked`.
+        let conv_state_prev = state.conv_states[self.recurrent_idx].clone(); // (1, K-1, channels)
+        let conv_state_2d = conv_state_prev.squeeze(0)?; // (K-1, channels)
+        let stacked = Tensor::cat(&[&conv_state_2d, &qkv_mixed], 0)?; // (L + K - 1, channels)
 
-            // Conv1d step: shift state, append new token, apply weights, silu.
-            // qkv_mixed_t is already (1, conv_channels), unsqueeze to
-            // (1, 1, conv_channels) to cat with the (1, K-1, conv_channels)
-            // conv_state along dim 1.
-            let conv_state = &mut state.conv_states[self.recurrent_idx];
-            let qkv_expanded = qkv_mixed_t.unsqueeze(1)?; // (1, 1, conv_channels)
-            let conv_input = Tensor::cat(&[conv_state.clone(), qkv_expanded], 1)?;
-            *conv_state = conv_input.narrow(1, 1, conv_kernel - 1)?.contiguous()?;
-            let conv_out = conv_input
-                .broadcast_mul(&self.ssm_conv1d.unsqueeze(0)?)?
-                .sum(1)?; // (1, conv_channels)
-            let conv_out = candle_nn::ops::silu(&conv_out)?;
-
-            // Split conv_out into Q, K, V along the channel dim.
-            let q = conv_out.narrow(D::Minus1, 0, qk_size)?;
-            let k = conv_out.narrow(D::Minus1, qk_size, qk_size)?;
-            let v = conv_out.narrow(D::Minus1, 2 * qk_size, v_size)?;
-
-            let q = q.reshape((1, n_k, self.dims.head_k_dim))?;
-            let k = k.reshape((1, n_k, self.dims.head_k_dim))?;
-            let v = v.reshape((1, h_v, self.dims.head_v_dim))?;
-
-            let q = l2_norm(&q, self.rms_norm_eps)?;
-            let k = l2_norm(&k, self.rms_norm_eps)?;
-
-            // GQA-style head repeat (tile order, matches ggml_repeat).
-            let (q, k) = if n_k != h_v {
-                let rep = h_v / n_k;
-                let q = q
-                    .unsqueeze(1)?
-                    .expand((1, rep, n_k, self.dims.head_k_dim))?
-                    .reshape((1, h_v, self.dims.head_k_dim))?;
-                let k = k
-                    .unsqueeze(1)?
-                    .expand((1, rep, n_k, self.dims.head_k_dim))?
-                    .reshape((1, h_v, self.dims.head_k_dim))?;
-                (q, k)
-            } else {
-                (q, k)
-            };
-
-            // Reshape for the (B, H, 1, S_v) delta-net step.
-            let q_scaled = (q * scale)?.reshape((1, h_v, 1, s_v))?.contiguous()?;
-            let k_4d = k.reshape((1, h_v, 1, s_v))?.contiguous()?;
-            let v_4d = v.reshape((1, h_v, 1, s_v))?.contiguous()?;
-            let gate_4d = gate_t.reshape((1, h_v, 1, 1))?.contiguous()?;
-            let beta_4d = beta_t.reshape((1, h_v, 1, 1))?.contiguous()?;
-
-            let net_state = &mut state.net_states[self.recurrent_idx];
-            let output_4d = delta_net_step_vectorized(
-                &q_scaled, &k_4d, &v_4d, &gate_4d, &beta_4d, net_state,
-            )?;
-
-            // Per-head RMS norm + silu(z) gate.
-            let output = output_4d.squeeze(2)?; // (1, h_v, s_v)
-            let output = output.reshape((1, d_inner))?;
-            let output_normed = self.ssm_norm.forward(
-                &output.reshape((h_v, self.dims.head_v_dim))?,
-            )?;
-            let output_normed = output_normed.reshape((1, d_inner))?;
-
-            // Fused silu(z_t) * output_normed in one launch.
-            let gated = candle_nn::ops::silu_mul(&z_t, &output_normed)?;
-            gated_outputs.push(gated);
+        // Window 0 contribution initialises conv_out — avoids a zeros
+        // alloc + one extra add pass. ssm_conv1d.narrow(0, j, 1) is
+        // shape (1, channels); broadcast_mul vs (L, channels) gives
+        // (L, channels).
+        let mut conv_out = stacked
+            .narrow(0, 0, seq_len)?
+            .broadcast_mul(&self.ssm_conv1d.narrow(0, 0, 1)?)?;
+        for j in 1..conv_kernel {
+            let window = stacked.narrow(0, j, seq_len)?;
+            let weight = self.ssm_conv1d.narrow(0, j, 1)?;
+            conv_out = (conv_out + window.broadcast_mul(&weight)?)?;
         }
+        let conv_out = candle_nn::ops::silu(&conv_out)?; // (L, conv_channels)
+
+        // Update conv_state: the last (K-1) rows of `stacked` are the
+        // window that step t=seq_len-1 consumed minus the oldest row.
+        state.conv_states[self.recurrent_idx] = stacked
+            .narrow(0, seq_len, conv_kernel - 1)?
+            .unsqueeze(0)?
+            .contiguous()?;
+
+        // ----- Stage 2b: split Q, K, V and reshape to head form -----------
+        let q_flat = conv_out.narrow(D::Minus1, 0, qk_size)?;
+        let k_flat = conv_out.narrow(D::Minus1, qk_size, qk_size)?;
+        let v_flat = conv_out.narrow(D::Minus1, 2 * qk_size, v_size)?;
+
+        // (L, qk_size) → (L, n_k, head_k_dim).
+        let q_heads = q_flat.reshape((seq_len, n_k, self.dims.head_k_dim))?;
+        let k_heads = k_flat.reshape((seq_len, n_k, self.dims.head_k_dim))?;
+        let v_heads = v_flat.reshape((seq_len, h_v, s_v))?;
+
+        // L2 norm on the head_k_dim axis.
+        let q_normed = l2_norm(&q_heads, self.rms_norm_eps)?;
+        let k_normed = l2_norm(&k_heads, self.rms_norm_eps)?;
+
+        // ----- Stage 2c: reshape into (B=1, h_v, L, S_v) for the GDN kernel
+        //
+        // GQA head repeat uses the same tile convention as the
+        // per-token path (`unsqueeze → expand → reshape`) — see the
+        // `test_gqa_tile_order_matches_ggml_repeat` regression for
+        // why this ordering matches ggml_repeat. On the batched
+        // tensor we insert the rep axis at position 1 so the
+        // subsequent reshape squashes (rep, n_k) into h_v in tile
+        // order `[h0, h1, ..., h0, h1, ...]`.
+        let (q_hv_last, k_hv_last) = if n_k != h_v {
+            let rep = h_v / n_k;
+            let q = q_normed
+                .unsqueeze(1)? // (L, 1, n_k, head)
+                .expand((seq_len, rep, n_k, self.dims.head_k_dim))?
+                .reshape((seq_len, h_v, self.dims.head_k_dim))?;
+            let k = k_normed
+                .unsqueeze(1)?
+                .expand((seq_len, rep, n_k, self.dims.head_k_dim))?
+                .reshape((seq_len, h_v, self.dims.head_k_dim))?;
+            (q, k)
+        } else {
+            (q_normed, k_normed)
+        };
+
+        // (L, h_v, head) → (1, h_v, L, head). The transpose is
+        // necessary because the GDN kernel expects the L dim as the
+        // second-to-last (matches the warp-column-per-token layout
+        // upstream). `reshape` handles the expand->materialize case
+        // implicitly via `copy_strided_src` when the source is
+        // non-contiguous.
+        let q_for_gdn = q_hv_last
+            .unsqueeze(0)? // (1, L, h_v, head)
+            .transpose(1, 2)?
+            .contiguous()?; // (1, h_v, L, head)
+        let k_for_gdn = k_hv_last
+            .unsqueeze(0)?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let v_for_gdn = v_heads
+            .unsqueeze(0)?
+            .transpose(1, 2)?
+            .contiguous()?; // (1, h_v, L, S_v)
+
+        // Pre-scale q by 1/sqrt(head_k_dim). Same convention as the
+        // per-token path.
+        let q_scaled = (q_for_gdn * scale)?;
+
+        // gate / beta are currently (L, h_v). The kernel wants
+        // (1, h_v, L, 1) — reshape + transpose + unsqueeze + contig.
+        let gate_4d = gate_flat
+            .unsqueeze(0)? // (1, L, h_v)
+            .transpose(1, 2)? // (1, h_v, L)
+            .contiguous()?
+            .unsqueeze(3)?; // (1, h_v, L, 1)
+        let beta_4d = beta
+            .unsqueeze(0)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .unsqueeze(3)?;
+
+        // ----- Stage 2d: ONE fused delta-net kernel call ------------------
+        //
+        // On HIP this is one `gated_delta_net.cu` launch that keeps
+        // the `(S_v, S_v)` state register-resident across the entire
+        // L-token recurrence. On CPU it falls back to a per-token
+        // loop over the single-step tensor-op chain.
+        let net_state = &mut state.net_states[self.recurrent_idx];
+        let output_4d = delta_net_step_vectorized(
+            &q_scaled, &k_for_gdn, &v_for_gdn, &gate_4d, &beta_4d, net_state,
+        )?; // (1, h_v, L, S_v)
+
+        // (1, h_v, L, S_v) → (L, h_v, S_v) → (L, d_inner)
+        let output = output_4d
+            .transpose(1, 2)? // (1, L, h_v, S_v)
+            .contiguous()?
+            .squeeze(0)?; // (L, h_v, S_v)
+        let output = output.reshape((seq_len, d_inner))?;
+
+        // ----- Stage 2e: batched ssm_norm + silu_mul ----------------------
+        //
+        // ssm_norm weight is `[head_v_dim]`, applied per head. Reshape
+        // to `(L * h_v, head_v_dim)` so one rmsnorm call covers every
+        // (token, head) slot; then fold back to `(L, d_inner)` for
+        // the silu_mul gate.
+        let output_normed = self
+            .ssm_norm
+            .forward(&output.reshape((seq_len * h_v, s_v))?)?;
+        let output_normed = output_normed.reshape((seq_len, d_inner))?;
+        let gated = candle_nn::ops::silu_mul(&z, &output_normed)?; // (L, d_inner)
 
         // ----- Stage 3: batched output projection -------------------------
-        // Concat the per-token gated outputs along dim 0 → (B*L=L, d_inner)
-        // and run the d_inner → hidden projection in a single matmul.
-        let gated_flat = Tensor::cat(&gated_outputs, 0)?; // (L, d_inner)
-        let out_flat = self.ssm_out.forward(&gated_flat)?; // (L, hidden)
+        let out_flat = self.ssm_out.forward(&gated)?; // (L, hidden)
         out_flat.reshape((b_sz, seq_len, hidden))
     }
 }
@@ -586,32 +661,35 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     max_x + stable
 }
 
-/// Vectorized delta net autoregressive step (single token, L=1).
+/// Vectorized delta net autoregressive step.
 ///
 /// Reference: llama.cpp delta-net-base.cpp lines 288-370
 ///
-/// State update (per (b, h)):
+/// State update (per (b, h), per token t):
 ///   state = state * exp(gate)
 ///   sk = k @ state            // (1, S_v) @ (S_v, S_v) → (1, S_v)
 ///   d = (v - sk) * beta       // (1, S_v)
 ///   state += k^T @ d          // (S_v, 1) @ (1, S_v) → (S_v, S_v)
 ///   output = q @ state        // (1, S_v) @ (S_v, S_v) → (1, S_v)
 ///
-/// All shapes use candle's row-major (B, H, ..., ...) layout. State is
-/// (B, H, S_v, S_v). q/k/v are (B, H, 1, S_v). gate/beta are (B, H, 1, 1).
+/// All shapes use candle's row-major (B, H, ..., ...) layout.
+/// q/k/v are `(B, H, L, S_v)`, gate/beta `(B, H, L, 1)`, and state
+/// `(B, H, S_v, S_v)`. The function handles any `L ≥ 1`.
 ///
 /// On HIP with S_v=128 and contiguous f32 inputs, this lowers to a
 /// single fused kernel launch via `candle::hip_backend::
 /// gated_delta_net_step_fused` — replacing the ~8 tensor-op launches
-/// below with one. The fallback path (CPU, non-128 S_v, non-f32, or
-/// non-contiguous inputs) stays on the tensor-op chain for
-/// correctness.
+/// below with one, and (when `L > 1`) amortizing the state load/store
+/// across every token in a single warp-resident recurrence loop.
+/// The fallback path (CPU, non-128 S_v, non-f32, or non-contiguous)
+/// handles `L > 1` by looping over tokens and reusing the single-step
+/// tensor-op chain per iteration — correct but unfused.
 fn delta_net_step_vectorized(
-    q: &Tensor,         // (B, H, 1, S_v) — must be pre-scaled by 1/sqrt(S_k)
-    k: &Tensor,         // (B, H, 1, S_v)
-    v: &Tensor,         // (B, H, 1, S_v)
-    gate: &Tensor,      // (B, H, 1, 1)
-    beta: &Tensor,      // (B, H, 1, 1)
+    q: &Tensor,         // (B, H, L, S_v) — must be pre-scaled by 1/sqrt(S_k)
+    k: &Tensor,         // (B, H, L, S_v)
+    v: &Tensor,         // (B, H, L, S_v)
+    gate: &Tensor,      // (B, H, L, 1)
+    beta: &Tensor,      // (B, H, L, 1)
     state: &mut Tensor, // (B, H, S_v, S_v)
 ) -> Result<Tensor> {
     // HIP fast path: single fused kernel launch. Falls through to the
@@ -631,6 +709,44 @@ fn delta_net_step_vectorized(
         }
     }
 
+    // CPU / unsupported fallback — per-token loop. This is the slow
+    // path that used to live inside `forward_prefill` when the HIP
+    // kernel was not yet ported; it's now only hit by unit tests or
+    // unsupported configurations. Keeping the tensor-op math here
+    // (rather than a from-scratch scalar reimplementation) ensures
+    // the fallback stays consistent with the single-token path we
+    // already ship on non-HIP devices.
+    let (_b, _h, seq_len, _s_v) = q.dims4()?;
+    if seq_len == 1 {
+        return delta_net_single_step(q, k, v, gate, beta, state);
+    }
+    let mut outputs = Vec::with_capacity(seq_len);
+    for t in 0..seq_len {
+        // narrow along the L axis picks a contiguous (B, H, 1, S_v)
+        // slice — zero-copy because the stride on dim 2 is S_v.
+        let q_t = q.narrow(2, t, 1)?;
+        let k_t = k.narrow(2, t, 1)?;
+        let v_t = v.narrow(2, t, 1)?;
+        let gate_t = gate.narrow(2, t, 1)?;
+        let beta_t = beta.narrow(2, t, 1)?;
+        let out_t = delta_net_single_step(&q_t, &k_t, &v_t, &gate_t, &beta_t, state)?;
+        outputs.push(out_t);
+    }
+    // Concatenate along the L axis to match the batched HIP path's
+    // output shape `(B, H, L, S_v)`.
+    Tensor::cat(&outputs, 2)
+}
+
+/// Single-token CPU tensor-op implementation of the delta-net step.
+/// Mirrors the pre-Phase-2 body of [`delta_net_step_vectorized`].
+fn delta_net_single_step(
+    q: &Tensor,         // (B, H, 1, S_v)
+    k: &Tensor,         // (B, H, 1, S_v)
+    v: &Tensor,         // (B, H, 1, S_v)
+    gate: &Tensor,      // (B, H, 1, 1)
+    beta: &Tensor,      // (B, H, 1, 1)
+    state: &mut Tensor, // (B, H, S_v, S_v)
+) -> Result<Tensor> {
     // 1. Apply decay: state = state * exp(gate)
     let g_exp = gate.exp()?;
     *state = state.broadcast_mul(&g_exp)?;
@@ -1205,5 +1321,163 @@ mod tests {
                 "step {t}: state drift too large: max_abs={max_abs_state}"
             );
         }
+    }
+
+    /// Phase 2 regression: the fused kernel's **internal** token loop
+    /// must produce the same result as an external loop of single-step
+    /// calls. The `gated_delta_net.cu` kernel was ported from turbo
+    /// with an `n_tokens` parameter, but until Phase 2 we only ever
+    /// called it with `L=1`; this test exercises the L>1 code path in
+    /// isolation (no forward_prefill scaffolding) so any drift in the
+    /// kernel's inner loop shows up here rather than as a whole-model
+    /// perplexity surprise.
+    ///
+    /// Batched: one call with `q, k, v` of shape `(1, H, L, 128)`.
+    /// Looped:  L calls with `(1, H, 1, 128)` slices carved from the
+    ///          same inputs, threading `state` through each iteration.
+    /// Both must agree within FMA rounding at the end of the L steps.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_gated_delta_net_batched_matches_looped_s128_l5() {
+        let dev_hip = match candle::Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let b = 1usize;
+        let h = 4usize;
+        let l = 5usize;
+        let s_v = 128usize;
+
+        // Deterministic, small-magnitude inputs. The magnitude keeps
+        // the recurrence numerically stable across L=5 steps.
+        let qkv_len = b * h * l * s_v;
+        let gb_len = b * h * l;
+        let state_len = b * h * s_v * s_v;
+        let q_vals: Vec<f32> =
+            (0..qkv_len).map(|i| ((i as f32) * 0.00037).sin() * 0.08).collect();
+        let k_vals: Vec<f32> =
+            (0..qkv_len).map(|i| ((i as f32) * 0.00053).cos() * 0.08).collect();
+        let v_vals: Vec<f32> =
+            (0..qkv_len).map(|i| ((i as f32) * 0.00041).sin() * 0.08).collect();
+        let gate_vals: Vec<f32> = (0..gb_len)
+            .map(|i| -0.04 - ((i as f32) * 0.01).sin() * 0.03)
+            .collect();
+        let beta_vals: Vec<f32> = (0..gb_len)
+            .map(|i| 0.6 + ((i as f32) * 0.013).cos() * 0.1)
+            .collect();
+        let state_vals: Vec<f32> = (0..state_len)
+            .map(|i| ((i as f32) * 0.00013).cos() * 0.01)
+            .collect();
+
+        // Batched inputs: (1, H, L, S_v) and (1, H, L, 1).
+        let q_batched = Tensor::from_slice(&q_vals, (b, h, l, s_v), &dev_hip).unwrap();
+        let k_batched = Tensor::from_slice(&k_vals, (b, h, l, s_v), &dev_hip).unwrap();
+        let v_batched = Tensor::from_slice(&v_vals, (b, h, l, s_v), &dev_hip).unwrap();
+        let gate_batched =
+            Tensor::from_slice(&gate_vals, (b, h, l, 1), &dev_hip).unwrap();
+        let beta_batched =
+            Tensor::from_slice(&beta_vals, (b, h, l, 1), &dev_hip).unwrap();
+        let mut state_batched =
+            Tensor::from_slice(&state_vals, (b, h, s_v, s_v), &dev_hip).unwrap();
+
+        // Path A: single batched call.
+        let out_batched = delta_net_step_vectorized(
+            &q_batched,
+            &k_batched,
+            &v_batched,
+            &gate_batched,
+            &beta_batched,
+            &mut state_batched,
+        )
+        .unwrap();
+        assert_eq!(out_batched.dims(), &[b, h, l, s_v]);
+
+        // Path B: L=1 loop, same inputs carved out per step. The
+        // single-step calls hit the L=1 kernel instantiation.
+        let mut state_looped =
+            Tensor::from_slice(&state_vals, (b, h, s_v, s_v), &dev_hip).unwrap();
+        let mut per_step_outs: Vec<Tensor> = Vec::with_capacity(l);
+        for t in 0..l {
+            // narrow(2, t, 1) picks one token slice — contiguous
+            // because the L axis has stride S_v on a contiguous
+            // (B, H, L, S_v) tensor.
+            let q_t = q_batched.narrow(2, t, 1).unwrap().contiguous().unwrap();
+            let k_t = k_batched.narrow(2, t, 1).unwrap().contiguous().unwrap();
+            let v_t = v_batched.narrow(2, t, 1).unwrap().contiguous().unwrap();
+            let gate_t = gate_batched.narrow(2, t, 1).unwrap().contiguous().unwrap();
+            let beta_t = beta_batched.narrow(2, t, 1).unwrap().contiguous().unwrap();
+            let out_t = delta_net_step_vectorized(
+                &q_t,
+                &k_t,
+                &v_t,
+                &gate_t,
+                &beta_t,
+                &mut state_looped,
+            )
+            .unwrap();
+            per_step_outs.push(out_t);
+        }
+        let out_looped = Tensor::cat(&per_step_outs, 2).unwrap();
+
+        // Compare attn output.
+        let dev_cpu = candle::Device::Cpu;
+        let a_vals: Vec<f32> = out_batched
+            .to_device(&dev_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let b_vals: Vec<f32> = out_looped
+            .to_device(&dev_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(a_vals.len(), b_vals.len());
+        let max_abs = a_vals
+            .iter()
+            .zip(b_vals.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        // Both paths run the exact same math on the same hardware —
+        // the only source of drift is that the batched call keeps
+        // state in registers across L while the looped path writes
+        // state to DRAM and re-loads each step. FMA accumulation
+        // order is identical so drift should be zero; 1e-5 is
+        // defensive slack.
+        assert!(
+            max_abs < 1e-5,
+            "batched vs looped attn drift: max_abs={max_abs}"
+        );
+
+        // Compare final state.
+        let s_a: Vec<f32> = state_batched
+            .to_device(&dev_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let s_b: Vec<f32> = state_looped
+            .to_device(&dev_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let max_abs_state = s_a
+            .iter()
+            .zip(s_b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_state < 1e-5,
+            "batched vs looped state drift: max_abs={max_abs_state}"
+        );
     }
 }
