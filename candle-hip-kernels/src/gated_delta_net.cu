@@ -68,7 +68,17 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
     const float * __restrict__ state_in,
     float * __restrict__ state_out,
     float * __restrict__ attn_out,
-    int B, int H, int L) {
+    int B, int H, int L, int n_rep) {
+
+    // `H` is the number of V heads (== state heads == output heads).
+    // Q and K have `H / n_rep` heads (the GQA K/V head count), and each
+    // group of `n_rep` V heads shares one Q head and one K head.
+    // `n_rep == 1` reduces to the original no-GQA case.
+    //
+    // Phase 3: eliminating the caller's GQA expand→reshape (which
+    // materialised Q and K as ~7680 ucopy_f32 kernels per forward pass
+    // on qwen35-9B decode) by teaching the kernel to do the head
+    // broadcast implicitly via `h_idx / n_rep`.
 
     constexpr int warp_size     = WARP_SIZE;
     constexpr int rows_per_lane = S_v / warp_size;
@@ -83,16 +93,27 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
         return;
     }
 
-    // (b, h) slice base offsets.
-    const int bh = b_idx * H + h_idx;
-    const float * q_bh        = q         + (int64_t)bh * L * S_v;
-    const float * k_bh        = k         + (int64_t)bh * L * S_v;
-    const float * v_bh        = v         + (int64_t)bh * L * S_v;
-    const float * gate_bh     = gate      + (int64_t)bh * L;
-    const float * beta_bh     = beta      + (int64_t)bh * L;
-    const float * state_in_bh = state_in  + (int64_t)bh * S_v * S_v;
-    float *       state_out_bh = state_out + (int64_t)bh * S_v * S_v;
-    float *       attn_bh      = attn_out  + (int64_t)bh * L * S_v;
+    // V / state / attn_out / gate / beta are indexed by (b, h_idx).
+    // Q / K are indexed by (b, h_idx % H_kv) — the GQA-shared head.
+    //
+    // The caller expanded Q/K via `unsqueeze(1) + expand(rep, h_kv) +
+    // reshape(h_v)` which places the rep axis OUTER and the h_kv axis
+    // INNER. After reshape the flat h_v index maps to source h_kv
+    // as `h_kv_src = h_v % h_kv` (the "tile" pattern, matching
+    // ggml_repeat_4d). This is NOT `h_idx / n_rep` — that would be
+    // the interleave pattern from `repeat_interleave`.
+    const int H_kv    = H / n_rep;
+    const int h_kv    = h_idx % H_kv;
+    const int bh      = b_idx * H    + h_idx;
+    const int bh_kv   = b_idx * H_kv + h_kv;
+    const float * q_bh        = q         + (int64_t)bh_kv * L * S_v;
+    const float * k_bh        = k         + (int64_t)bh_kv * L * S_v;
+    const float * v_bh        = v         + (int64_t)bh    * L * S_v;
+    const float * gate_bh     = gate      + (int64_t)bh    * L;
+    const float * beta_bh     = beta      + (int64_t)bh    * L;
+    const float * state_in_bh = state_in  + (int64_t)bh    * S_v * S_v;
+    float *       state_out_bh = state_out + (int64_t)bh   * S_v * S_v;
+    float *       attn_bh      = attn_out  + (int64_t)bh   * L * S_v;
 
     // Load column `col` of state_in into registers:
     //   s_shard[r] = state_in[i, col] with i = r * warp_size + lane.
@@ -171,6 +192,13 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
 // S_v=128 covers qwen35 / qwen3next / any model using the default
 // ssm.state_size from the GGUF metadata. Adding more S_v values later
 // is mechanical — copy the extern "C" wrapper below with a new name.
+//
+// Phase 3: the kernel now accepts an `n_rep` parameter and indexes
+// Q/K by `h_idx / n_rep` to do GQA head broadcast implicitly. The
+// caller passes Q/K at `H / n_rep` heads (the KV head count) and
+// V/state/gate/beta at `H` heads (the V/output head count).
+// When `n_rep == 1` the behaviour is identical to the pre-Phase-3
+// kernel.
 extern "C" __global__ void gated_delta_net_step_s128_f32(
     const float * __restrict__ q,
     const float * __restrict__ k,
@@ -180,6 +208,6 @@ extern "C" __global__ void gated_delta_net_step_s128_f32(
     const float * __restrict__ state_in,
     float * __restrict__ state_out,
     float * __restrict__ attn_out,
-    int B, int H, int L) {
-    gated_delta_net_step_impl<128>(q, k, v, gate, beta, state_in, state_out, attn_out, B, H, L);
+    int B, int H, int L, int n_rep) {
+    gated_delta_net_step_impl<128>(q, k, v, gate, beta, state_in, state_out, attn_out, B, H, L, n_rep);
 }

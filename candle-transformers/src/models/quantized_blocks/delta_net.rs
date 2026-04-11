@@ -320,42 +320,27 @@ impl DeltaNetLayer {
         let q = l2_norm(&q, self.rms_norm_eps)?;
         let k = l2_norm(&k, self.rms_norm_eps)?;
 
-        // Repeat Q/K heads to match V heads if needed (GQA-style for delta net).
-        //
-        // ggml_repeat_4d TILES the head dimension: dst[i*nk + k] = src[k].
-        // So output head 0 = source head 0, output head 1 = source head 1,
-        // ..., output head nk = source head 0 (wrap around).
-        // This is "tile" (PyTorch .repeat()), NOT "interleave"
-        // (PyTorch .repeat_interleave()).
-        //
-        // To match in candle, we unsqueeze along axis 1 (NOT 2) and expand,
-        // which produces head order [h0, h1, ..., h_{nk-1}, h0, h1, ...].
-        let (q, k) = if self.dims.num_k_heads != self.dims.num_v_heads {
-            let rep = self.dims.num_v_heads / self.dims.num_k_heads;
-            let q = q.unsqueeze(1)?
-                .expand((b_sz, rep, self.dims.num_k_heads, self.dims.head_k_dim))?
-                .reshape((b_sz, self.dims.num_v_heads, self.dims.head_k_dim))?;
-            let k = k.unsqueeze(1)?
-                .expand((b_sz, rep, self.dims.num_k_heads, self.dims.head_k_dim))?
-                .reshape((b_sz, self.dims.num_v_heads, self.dims.head_k_dim))?;
-            (q, k)
-        } else {
-            (q, k)
-        };
+        // P3: GQA expand DELETED from this path — the fused GDN kernel
+        // now does the `h_idx / n_rep` indexing internally (see
+        // `gated_delta_net_step_fused`). Q/K stay at their native
+        // `num_k_heads` head count. This removes ~2 ucopy_f32 launches
+        // per forward_step call. `delta_net_step_vectorized` itself
+        // knows how to expand Q/K for the CPU fallback.
 
         // 7. Delta net autoregressive step (vectorized)
-        // Reshape to (B, H, 1, S_v) for delta_net_step_vectorized
-        // Note: head_k_dim == head_v_dim for delta net (qwen35 uses S_k=S_v=128)
+        // Reshape q/k to (B, n_k_heads, 1, S_v); v to (B, n_v_heads, 1, S_v).
+        // head_k_dim == head_v_dim for delta net (qwen35 uses S_k=S_v=128).
         let s_v = self.dims.head_v_dim;
         let h_v = self.dims.num_v_heads;
+        let n_k = self.dims.num_k_heads;
         let scale = 1.0 / (self.dims.head_k_dim as f64).sqrt();
         let q_scaled = (q * scale)?
-            .reshape((b_sz, h_v, 1, s_v))?
+            .reshape((b_sz, n_k, 1, s_v))?
             .contiguous()?;
-        let k_4d = k.reshape((b_sz, h_v, 1, s_v))?.contiguous()?;
+        let k_4d = k.reshape((b_sz, n_k, 1, s_v))?.contiguous()?;
         let v_4d = v.reshape((b_sz, h_v, 1, s_v))?.contiguous()?;
 
-        // gate, beta: (B, H) → (B, H, 1, 1) for broadcast
+        // gate, beta: (B, H_v) → (B, H_v, 1, 1) for broadcast
         let gate_4d = gate.reshape((b_sz, h_v, 1, 1))?.contiguous()?;
         let beta_4d = beta.reshape((b_sz, h_v, 1, 1))?.contiguous()?;
 
@@ -556,41 +541,20 @@ impl DeltaNetLayer {
         let q_normed = l2_norm(&q_heads, self.rms_norm_eps)?;
         let k_normed = l2_norm(&k_heads, self.rms_norm_eps)?;
 
-        // ----- Stage 2c: reshape into (B=1, h_v, L, S_v) for the GDN kernel
+        // ----- Stage 2c: reshape into (B=1, H_kv, L, S_v) for Q/K and
+        // (B=1, H_v, L, S_v) for V. The GDN kernel handles GQA via
+        // `h_idx / n_rep` indexing (post-P3), so Q/K stay at their
+        // native `n_k_heads` head count — no expand→reshape ucopy.
         //
-        // GQA head repeat uses the same tile convention as the
-        // per-token path (`unsqueeze → expand → reshape`) — see the
-        // `test_gqa_tile_order_matches_ggml_repeat` regression for
-        // why this ordering matches ggml_repeat. On the batched
-        // tensor we insert the rep axis at position 1 so the
-        // subsequent reshape squashes (rep, n_k) into h_v in tile
-        // order `[h0, h1, ..., h0, h1, ...]`.
-        let (q_hv_last, k_hv_last) = if n_k != h_v {
-            let rep = h_v / n_k;
-            let q = q_normed
-                .unsqueeze(1)? // (L, 1, n_k, head)
-                .expand((seq_len, rep, n_k, self.dims.head_k_dim))?
-                .reshape((seq_len, h_v, self.dims.head_k_dim))?;
-            let k = k_normed
-                .unsqueeze(1)?
-                .expand((seq_len, rep, n_k, self.dims.head_k_dim))?
-                .reshape((seq_len, h_v, self.dims.head_k_dim))?;
-            (q, k)
-        } else {
-            (q_normed, k_normed)
-        };
-
-        // (L, h_v, head) → (1, h_v, L, head). The transpose is
-        // necessary because the GDN kernel expects the L dim as the
-        // second-to-last (matches the warp-column-per-token layout
-        // upstream). `reshape` handles the expand->materialize case
-        // implicitly via `copy_strided_src` when the source is
-        // non-contiguous.
-        let q_for_gdn = q_hv_last
-            .unsqueeze(0)? // (1, L, h_v, head)
+        // Only one `transpose + contiguous` per tensor remains
+        // (converting from `(L, H_kv, head)` to `(1, H_kv, L, head)`).
+        // For `n_rep = 3` this halves the Q/K memcopy vs the old path
+        // that first expanded to `n_v_head` then transposed.
+        let q_for_gdn = q_normed
+            .unsqueeze(0)? // (1, L, n_k, head)
             .transpose(1, 2)?
-            .contiguous()?; // (1, h_v, L, head)
-        let k_for_gdn = k_hv_last
+            .contiguous()?; // (1, n_k, L, head)
+        let k_for_gdn = k_normed
             .unsqueeze(0)?
             .transpose(1, 2)?
             .contiguous()?;
@@ -700,18 +664,19 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 /// handles `L > 1` by looping over tokens and reusing the single-step
 /// tensor-op chain per iteration — correct but unfused.
 fn delta_net_step_vectorized(
-    q: &Tensor,         // (B, H, L, S_v) — must be pre-scaled by 1/sqrt(S_k)
-    k: &Tensor,         // (B, H, L, S_v)
-    v: &Tensor,         // (B, H, L, S_v)
-    gate: &Tensor,      // (B, H, L, 1)
-    beta: &Tensor,      // (B, H, L, 1)
-    state: &mut Tensor, // (B, H, S_v, S_v)
+    q: &Tensor,         // (B, H_kv, L, S_v) — may have fewer heads than V (GQA)
+    k: &Tensor,         // (B, H_kv, L, S_v)
+    v: &Tensor,         // (B, H_v,  L, S_v)
+    gate: &Tensor,      // (B, H_v,  L, 1)
+    beta: &Tensor,      // (B, H_v,  L, 1)
+    state: &mut Tensor, // (B, H_v,  S_v, S_v)
 ) -> Result<Tensor> {
-    // HIP fast path: single fused kernel launch. Falls through to the
-    // tensor-op chain when any precondition fails (non-HIP, non-f32,
-    // unsupported S_v, non-contiguous input). Keeping the fallback
-    // means the CPU-only test path and any future S_v variant still
-    // work unchanged.
+    // HIP fast path: the fused kernel handles GQA natively via an
+    // `n_rep = h_v / h_kv` parameter. Q/K can be passed at their native
+    // `H_kv` head count — the kernel indexes them by `h_idx / n_rep`
+    // inside the recurrence loop, so no `.expand().reshape()` round
+    // trip materialises intermediate (h_v-shaped) Q/K on the caller
+    // side. P3: this eliminates ~2 ucopy_f32 launches per GDN step.
     #[cfg(feature = "hip")]
     {
         if matches!(q.device(), candle::Device::Hip(_))
@@ -724,31 +689,43 @@ fn delta_net_step_vectorized(
         }
     }
 
-    // CPU / unsupported fallback — per-token loop. This is the slow
-    // path that used to live inside `forward_prefill` when the HIP
-    // kernel was not yet ported; it's now only hit by unit tests or
-    // unsupported configurations. Keeping the tensor-op math here
-    // (rather than a from-scratch scalar reimplementation) ensures
-    // the fallback stays consistent with the single-token path we
-    // already ship on non-HIP devices.
-    let (_b, _h, seq_len, _s_v) = q.dims4()?;
+    // CPU / unsupported fallback. The CPU tensor-op chain assumes all
+    // of Q, K, V have the same H dim, so we expand Q/K to match V's
+    // head count first. This is the same shape that was used before
+    // Phase 3 of P3; only the HIP path benefits from the new zero-copy
+    // shortcut.
+    let (b_sz, h_kv, seq_len, s_v_q) = q.dims4()?;
+    let (_, h_v, _, s_v_v) = v.dims4()?;
+    assert_eq!(s_v_q, s_v_v, "Q and V last dim must match");
+    let (q_eff, k_eff) = if h_kv != h_v {
+        let rep = h_v / h_kv;
+        let expand_shape = (b_sz, rep, h_kv, seq_len, s_v_q);
+        let merged_shape = (b_sz, h_v, seq_len, s_v_q);
+        let q_e = q
+            .unsqueeze(1)?
+            .expand(expand_shape)?
+            .reshape(merged_shape)?;
+        let k_e = k
+            .unsqueeze(1)?
+            .expand(expand_shape)?
+            .reshape(merged_shape)?;
+        (q_e, k_e)
+    } else {
+        (q.clone(), k.clone())
+    };
     if seq_len == 1 {
-        return delta_net_single_step(q, k, v, gate, beta, state);
+        return delta_net_single_step(&q_eff, &k_eff, v, gate, beta, state);
     }
     let mut outputs = Vec::with_capacity(seq_len);
     for t in 0..seq_len {
-        // narrow along the L axis picks a contiguous (B, H, 1, S_v)
-        // slice — zero-copy because the stride on dim 2 is S_v.
-        let q_t = q.narrow(2, t, 1)?;
-        let k_t = k.narrow(2, t, 1)?;
+        let q_t = q_eff.narrow(2, t, 1)?;
+        let k_t = k_eff.narrow(2, t, 1)?;
         let v_t = v.narrow(2, t, 1)?;
         let gate_t = gate.narrow(2, t, 1)?;
         let beta_t = beta.narrow(2, t, 1)?;
         let out_t = delta_net_single_step(&q_t, &k_t, &v_t, &gate_t, &beta_t, state)?;
         outputs.push(out_t);
     }
-    // Concatenate along the L axis to match the batched HIP path's
-    // output shape `(B, H, L, S_v)`.
     Tensor::cat(&outputs, 2)
 }
 
@@ -1541,6 +1518,101 @@ mod tests {
         assert!(
             max_abs_state < 1e-5,
             "batched vs looped state drift: max_abs={max_abs_state}"
+        );
+    }
+
+    /// P3 regression: the fused GDN kernel must handle GQA correctly
+    /// when `h_v > h_kv` (Q/K have fewer heads than V). The kernel's
+    /// `h_idx / n_rep` broadcast is exercised on HIP; the CPU fallback
+    /// expands Q/K via unsqueeze+expand+reshape and runs the same
+    /// tensor-op chain. Both paths must agree within FMA rounding.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_gated_delta_net_gqa_matches_cpu_s128_n_rep_4() {
+        let dev_hip = match candle::Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let dev_cpu = candle::Device::Cpu;
+        let b = 1usize;
+        let h_kv = 4usize;   // Q/K heads
+        let n_rep = 4usize;
+        let h_v = h_kv * n_rep; // V/state heads = 16
+        let l = 3usize;
+        let s_v = 128usize;
+
+        // Deterministic inputs at the GQA head counts.
+        let qkv_kv_len = b * h_kv * l * s_v;
+        let v_len = b * h_v * l * s_v;
+        let gb_len = b * h_v * l;
+        let state_len = b * h_v * s_v * s_v;
+        let q_vals: Vec<f32> =
+            (0..qkv_kv_len).map(|i| ((i as f32) * 0.00037).sin() * 0.08).collect();
+        let k_vals: Vec<f32> =
+            (0..qkv_kv_len).map(|i| ((i as f32) * 0.00053).cos() * 0.08).collect();
+        let v_vals: Vec<f32> =
+            (0..v_len).map(|i| ((i as f32) * 0.00041).sin() * 0.08).collect();
+        let gate_vals: Vec<f32> =
+            (0..gb_len).map(|i| -0.05 - ((i as f32) * 0.01).sin() * 0.02).collect();
+        let beta_vals: Vec<f32> =
+            (0..gb_len).map(|i| 0.6 + ((i as f32) * 0.013).cos() * 0.1).collect();
+        let state_vals: Vec<f32> =
+            (0..state_len).map(|i| ((i as f32) * 0.00013).cos() * 0.01).collect();
+
+        let q_hip = Tensor::from_slice(&q_vals, (b, h_kv, l, s_v), &dev_hip).unwrap();
+        let k_hip = Tensor::from_slice(&k_vals, (b, h_kv, l, s_v), &dev_hip).unwrap();
+        let v_hip = Tensor::from_slice(&v_vals, (b, h_v, l, s_v), &dev_hip).unwrap();
+        let gate_hip = Tensor::from_slice(&gate_vals, (b, h_v, l, 1), &dev_hip).unwrap();
+        let beta_hip = Tensor::from_slice(&beta_vals, (b, h_v, l, 1), &dev_hip).unwrap();
+        let mut state_hip = Tensor::from_slice(&state_vals, (b, h_v, s_v, s_v), &dev_hip).unwrap();
+
+        let q_cpu = Tensor::from_slice(&q_vals, (b, h_kv, l, s_v), &dev_cpu).unwrap();
+        let k_cpu = Tensor::from_slice(&k_vals, (b, h_kv, l, s_v), &dev_cpu).unwrap();
+        let v_cpu = Tensor::from_slice(&v_vals, (b, h_v, l, s_v), &dev_cpu).unwrap();
+        let gate_cpu = Tensor::from_slice(&gate_vals, (b, h_v, l, 1), &dev_cpu).unwrap();
+        let beta_cpu = Tensor::from_slice(&beta_vals, (b, h_v, l, 1), &dev_cpu).unwrap();
+        let mut state_cpu = Tensor::from_slice(&state_vals, (b, h_v, s_v, s_v), &dev_cpu).unwrap();
+
+        // HIP path: GQA kernel, Q/K at n_k_heads.
+        let out_hip = delta_net_step_vectorized(
+            &q_hip, &k_hip, &v_hip, &gate_hip, &beta_hip, &mut state_hip,
+        )
+        .unwrap();
+
+        // CPU path: expand-reshape then run tensor-op chain.
+        let out_cpu = delta_net_step_vectorized(
+            &q_cpu, &k_cpu, &v_cpu, &gate_cpu, &beta_cpu, &mut state_cpu,
+        )
+        .unwrap();
+
+        let a_vals: Vec<f32> = out_hip
+            .to_device(&dev_cpu).unwrap()
+            .flatten_all().unwrap().to_vec1().unwrap();
+        let b_vals: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(a_vals.len(), b_vals.len());
+        let max_abs = a_vals.iter().zip(b_vals.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        // FMA order diverges slightly across CPU (sequential) and HIP
+        // (warp shuffle), so we allow a small slack.
+        assert!(
+            max_abs < 5e-4,
+            "GQA n_rep=4 attn drift: max_abs={max_abs}"
+        );
+
+        let s_a: Vec<f32> = state_hip
+            .to_device(&dev_cpu).unwrap()
+            .flatten_all().unwrap().to_vec1().unwrap();
+        let s_b: Vec<f32> = state_cpu.flatten_all().unwrap().to_vec1().unwrap();
+        let max_abs_state = s_a.iter().zip(s_b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_state < 5e-4,
+            "GQA n_rep=4 state drift: max_abs={max_abs_state}"
         );
     }
 }

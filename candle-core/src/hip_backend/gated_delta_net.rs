@@ -105,23 +105,35 @@ pub fn gated_delta_net_step_fused(
     }
 
     // --- Shapes ------------------------------------------------------
-    let (b_sz, h_v, seq_len, s_v) = q.dims4()?;
-    if (b_sz, h_v, seq_len, s_v) != k.dims4()? {
+    //
+    // Phase 3: accept GQA inputs where Q and K have `h_kv = h_v / n_rep`
+    // heads (the KV head count) and V / state / gate / beta have the
+    // full `h_v` V head count. The kernel does the h_idx / n_rep index
+    // broadcast implicitly. When n_rep == 1 this reduces to the pre-3
+    // behaviour.
+    let (b_sz, h_v, seq_len, s_v) = v.dims4()?;
+    let (_, h_kv_q, _, _) = q.dims4()?;
+    if q.dims4()? != (b_sz, h_kv_q, seq_len, s_v) {
+        crate::bail!(
+            "gated_delta_net_step_fused: q shape {:?} incompatible with v {:?}",
+            q.dims(),
+            v.dims()
+        );
+    }
+    if k.dims4()? != (b_sz, h_kv_q, seq_len, s_v) {
         crate::bail!(
             "gated_delta_net_step_fused: k shape {:?} != q shape {:?}",
             k.dims(),
             q.dims()
         );
     }
-    if (b_sz, h_v, seq_len, s_v) != v.dims4()? {
+    if h_v % h_kv_q != 0 {
         crate::bail!(
-            "gated_delta_net_step_fused: v shape {:?} != q shape {:?}",
-            v.dims(),
-            q.dims()
+            "gated_delta_net_step_fused: h_v ({h_v}) not divisible by h_kv ({h_kv_q})"
         );
     }
-    // gate / beta: elem count must be B*H*L. Accept any rank as long as
-    // total elements match — the kernel reads a flat buffer.
+    let n_rep = h_v / h_kv_q;
+    // gate / beta: elem count must be B*h_v*L (one per V head per token).
     let gb_elems = b_sz * h_v * seq_len;
     if gate.elem_count() != gb_elems {
         crate::bail!(
@@ -137,7 +149,7 @@ pub fn gated_delta_net_step_fused(
             gb_elems
         );
     }
-    // State: (B, H, S_v, S_v)
+    // State: (B, H_v, S_v, S_v)
     let (sb, sh, s1, s2) = state.dims4()?;
     if (sb, sh, s1, s2) != (b_sz, h_v, s_v, s_v) {
         crate::bail!(
@@ -251,9 +263,11 @@ pub fn gated_delta_net_step_fused(
     let b_arg = b_sz as i32;
     let h_arg = h_v as i32;
     let l_arg = seq_len as i32;
+    let n_rep_arg = n_rep as i32;
     builder.arg(&b_arg);
     builder.arg(&h_arg);
     builder.arg(&l_arg);
+    builder.arg(&n_rep_arg);
     // SAFETY: ffi — kernel contract is validated above (shapes, dtype, contiguous).
     unsafe { builder.launch(cfg) }.w()?;
 
