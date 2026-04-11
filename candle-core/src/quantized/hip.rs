@@ -464,11 +464,19 @@ fn mul_mat_q_v2_with_tile_n(
     // Pick the kernel name + tile size. The fallback (`_`) clamps any
     // unsupported hint (or 0) to the default TILE_N=32.
     let (kernel_name, tile_n): (&str, usize) = match dtype {
-        GgmlDType::Q4_0 => match tile_n_hint {
-            8 => ("mul_mat_q4_0_gfx906_v2", 8),
-            16 => ("mul_mat_q4_0_gfx906_v2_tile16", 16),
-            _ => ("mul_mat_q4_0_gfx906_v2_tile32", 32),
-        },
+        GgmlDType::Q4_0 => {
+            // Phase 2d v2f: same lane-scratch fix as Q4_1 — drop the
+            // per-col bounds check, pad Y to TILE_N.
+            let want_legacy = std::env::var("CANDLE_MMQ_VARIANT")
+                .map(|s| s == "v2_legacy")
+                .unwrap_or(false);
+            match tile_n_hint {
+                8 => ("mul_mat_q4_0_gfx906_v2", 8),
+                16 => ("mul_mat_q4_0_gfx906_v2_tile16", 16),
+                _ if want_legacy => ("mul_mat_q4_0_gfx906_v2_tile32", 32),
+                _ => ("mul_mat_q4_0_gfx906_v2f_tile32", 32),
+            }
+        }
         GgmlDType::Q4_1 => {
             // Phase 2d: `CANDLE_MMQ_VARIANT` picks the Q4_1 TILE_N=32
             // variant. See BENCH-PMC-VALU-VMEM-2026-04-11.md for the
@@ -501,22 +509,39 @@ fn mul_mat_q_v2_with_tile_n(
                 _ => ("mul_mat_q4_1_gfx906_v2f_tile32", 32),
             }
         }
-        GgmlDType::Q8_0 => match tile_n_hint {
-            8 => ("mul_mat_q8_0_gfx906_v2", 8),
-            16 => ("mul_mat_q8_0_gfx906_v2_tile16", 16),
-            _ => ("mul_mat_q8_0_gfx906_v2_tile32", 32),
-        },
+        GgmlDType::Q8_0 => {
+            let want_legacy = std::env::var("CANDLE_MMQ_VARIANT")
+                .map(|s| s == "v2_legacy")
+                .unwrap_or(false);
+            match tile_n_hint {
+                8 => ("mul_mat_q8_0_gfx906_v2", 8),
+                16 => ("mul_mat_q8_0_gfx906_v2_tile16", 16),
+                _ if want_legacy => ("mul_mat_q8_0_gfx906_v2_tile32", 32),
+                _ => ("mul_mat_q8_0_gfx906_v2f_tile32", 32),
+            }
+        }
         // P5: K-quant MMQ. Q5_K is the qwen35-9B output head tensor and
         // sits at ~35% of total GPU time in the chunked-vector fallback.
         // Each super-block is 256 K-elements with 8 sub-blocks — the
         // kernel loads one super-block per K iteration, precomputes
         // 8 sub-scales/mins via get_scale_min_k4, and unrolls the
         // 8-sub-block dp4a loop.
-        GgmlDType::Q5K => match tile_n_hint {
-            8 => ("mul_mat_q5_K_gfx906_v2", 8),
-            16 => ("mul_mat_q5_K_gfx906_v2_tile16", 16),
-            _ => ("mul_mat_q5_K_gfx906_v2_tile32", 32),
-        },
+        GgmlDType::Q5K => {
+            // Phase 2d v2f: Q5_K had the biggest absolute lane-scratch
+            // footprint (3608 lane moves vs Q4_1's 574) because the
+            // unrolled inner body is 8× larger (8 sub-blocks per K
+            // super-block). Dropping the per-col bounds check should
+            // give the biggest absolute savings here.
+            let want_legacy = std::env::var("CANDLE_MMQ_VARIANT")
+                .map(|s| s == "v2_legacy")
+                .unwrap_or(false);
+            match tile_n_hint {
+                8 => ("mul_mat_q5_K_gfx906_v2", 8),
+                16 => ("mul_mat_q5_K_gfx906_v2_tile16", 16),
+                _ if want_legacy => ("mul_mat_q5_K_gfx906_v2_tile32", 32),
+                _ => ("mul_mat_q5_K_gfx906_v2f_tile32", 32),
+            }
+        }
         _ => return Ok(None),
     };
 

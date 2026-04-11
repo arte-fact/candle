@@ -4913,6 +4913,84 @@ mul_mat_q4_0_gfx906_v2_tile32(
     mul_mat_q4_0_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Phase 2d v2f: Q4_0 fast-path kernel without per-col bounds check.
+// Caller must pad the Y quant buffer to ceil(total_b / TILE_N) * TILE_N.
+// See `mul_mat_q4_1_gfx906_impl_fast` for the full rationale.
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_fast(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_0 * x = (const block_q4_0 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK4_0;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        int x_lo[4] = {0, 0, 0, 0};
+        int x_hi[4] = {0, 0, 0, 0};
+        float scale_x = 0.0f;
+
+        if (row_valid) {
+            const block_q4_0 * bx = &x[row * blocks_per_row_x + ib];
+            scale_x = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = get_int_from_uint8(bx->qs, j);
+                x_lo[j] = p & 0x0F0F0F0F;
+                x_hi[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        // Unconditional col loop — no bounds check.
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float2 ds8f = __half22float2(by->ds);
+            const float d8 = ds8f.x;
+            const float s8 = ds8f.y;
+            const int * y_packed = (const int *) by->qs;
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+            }
+            sums[c] += scale_x * (sumi * d8 - 8.0f * s8);
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q4_0_gfx906_v2f_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_0_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 // =============================================================================
 // Phase 2d — Q4_1 × Q8_1 matrix matmul for gfx906.
 //
@@ -5492,6 +5570,75 @@ mul_mat_q8_0_gfx906_v2_tile32(
     mul_mat_q8_0_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Phase 2d v2f: Q8_0 fast-path kernel without per-col bounds check.
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q8_0_gfx906_impl_fast(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK8_0;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        int x_q[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        float d8_x = 0.0f;
+
+        if (row_valid) {
+            const block_q8_0 * bx = &x[row * blocks_per_row_x + ib];
+            d8_x = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                x_q[j] = get_int_from_int8(bx->qs, j);
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float d8_y = __half2float(__low2half(by->ds));
+            const int * y_packed = (const int *) by->qs;
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                sumi = ggml_cuda_dp4a(x_q[j], y_packed[j], sumi);
+            }
+            sums[c] += d8_x * d8_y * (float) sumi;
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q8_0_gfx906_v2f_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q8_0_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 // =============================================================================
 // P5 — Q5_K × Q8_1 matrix matmul for gfx906 (K-quant MMQ).
 //
@@ -5691,4 +5838,126 @@ mul_mat_q5_K_gfx906_v2_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q5_K_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// Phase 2d v2f: Q5_K fast-path kernel without per-col bounds check.
+// Same structure as the standard Q5_K kernel but drops the
+// `if (col >= ncols_y) break;` inside the fully-unrolled col loop.
+// Q5_K has 8 sub-blocks per super-block so the unrolled inner body
+// is 8× larger than Q4_1 — the lane-scratch overhead from the
+// per-col predicate was 3608 instructions (18 %) vs 574 (26 %) on
+// Q4_1, so the absolute win should be largest here.
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q5_K_gfx906_impl_fast(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q5_K * x = (const block_q5_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK_K;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int q8_per_super = QK_K / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        float super_d = 0.0f, super_dmin = 0.0f;
+        uint8_t sub_sc[8] = {0};
+        uint8_t sub_m[8]  = {0};
+        int qh_word[8] = {0};
+
+        const block_q5_K * bx = nullptr;
+        if (row_valid) {
+            bx = &x[row * blocks_per_row_x + ib];
+            const float2 dmf = __half22float2(bx->dm);
+            super_d    = dmf.x;
+            super_dmin = dmf.y;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                get_scale_min_k4(j, bx->scales, sub_sc[j], sub_m[j]);
+            }
+            const int * qh_ptr = (const int *) bx->qh;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                qh_word[j] = qh_ptr[j];
+            }
+        }
+
+        float sumf_d[TILE_N] = {0.0f};
+        float sumf_m[TILE_N] = {0.0f};
+
+        #pragma unroll
+        for (int sub = 0; sub < q8_per_super; ++sub) {
+            const int il   = sub >> 1;
+            const int half = sub & 1;
+
+            int v[8] = {0};
+            if (row_valid) {
+                const int * ql_ptr = (const int *) (bx->qs + 32 * il);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int ql_word = ql_ptr[j];
+                    const int vl = (half == 0)
+                        ? (ql_word & 0x0F0F0F0F)
+                        : ((ql_word >> 4) & 0x0F0F0F0F);
+                    const int vh = ((qh_word[j] >> sub) << 4) & 0x10101010;
+                    v[j] = vl | vh;
+                }
+            }
+
+            const float sc_f = (float) sub_sc[sub];
+            const float m_f  = (float) sub_m[sub];
+
+            // UNCONDITIONAL col loop — no per-col bounds check.
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int col = tile_n + c;
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib * q8_per_super + sub];
+                const float d8 = __half2float(__low2half(by->ds));
+                const int * y_packed = (const int *) by->qs;
+                int sumi_d = 0;
+                int sumi_y = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int y_j = y_packed[j];
+                    sumi_d = ggml_cuda_dp4a(v[j], y_j, sumi_d);
+                    sumi_y = ggml_cuda_dp4a(0x01010101, y_j, sumi_y);
+                }
+                sumf_d[c] += d8 * ((float) sumi_d) * sc_f;
+                sumf_m[c] += d8 * ((float) sumi_y) * m_f;
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            sums[c] += super_d * sumf_d[c] - super_dmin * sumf_m[c];
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q5_K_gfx906_v2f_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q5_K_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
