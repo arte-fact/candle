@@ -431,12 +431,55 @@ fn mul_mat_q_v2(
     total_b: usize,
     dev: &HipDevice,
 ) -> Result<Option<HipStorage>> {
-    // Pick the kernel by dtype. Phase 2d covers Q4_0/Q4_1/Q8_0; everything
-    // else still falls through to the chunked-vector path.
-    let kernel_name = match dtype {
-        GgmlDType::Q4_0 => "mul_mat_q4_0_gfx906_v2",
-        GgmlDType::Q4_1 => "mul_mat_q4_1_gfx906_v2",
-        GgmlDType::Q8_0 => "mul_mat_q8_0_gfx906_v2",
+    // Phase 2c: widened N-tile variants. Default is TILE_N=32, which gives
+    // ~1.35× prefill on qwen35-9B Q4_1 vs the Phase 2d baseline of TILE_N=8.
+    // The wider tile amortises the per-K X load across more output columns
+    // per thread, raising arithmetic intensity without growing the block
+    // beyond 1 warp or adding LDS staging. Measured on MI50 1 GPU, 1149-tok
+    // prompt (pp ~145 → ~196 t/s); TILE_N=64 regressed below baseline on
+    // the same workload (too few blocks for CU saturation on a 1024-col
+    // projection). The `CANDLE_MMQ_TILE_N=8|16|32|64` env var selects a
+    // specific variant for A/B diagnostics.
+    let tile_n: usize = std::env::var("CANDLE_MMQ_TILE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(32);
+    mul_mat_q_v2_with_tile_n(data, y, dtype, ncols, nrows, total_b, dev, tile_n)
+}
+
+/// Internal variant of [`mul_mat_q_v2`] that takes an explicit `tile_n`.
+/// Used by the public entry (which reads `CANDLE_MMQ_TILE_N`) and by the
+/// regression test (which iterates every supported tile size).
+#[allow(clippy::too_many_arguments)]
+fn mul_mat_q_v2_with_tile_n(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+    tile_n_hint: usize,
+) -> Result<Option<HipStorage>> {
+    // Pick the kernel name + tile size. The fallback (`_`) clamps any
+    // unsupported hint (or 0) to the default TILE_N=32.
+    let (kernel_name, tile_n): (&str, usize) = match dtype {
+        GgmlDType::Q4_0 => match tile_n_hint {
+            8 => ("mul_mat_q4_0_gfx906_v2", 8),
+            16 => ("mul_mat_q4_0_gfx906_v2_tile16", 16),
+            _ => ("mul_mat_q4_0_gfx906_v2_tile32", 32),
+        },
+        GgmlDType::Q4_1 => match tile_n_hint {
+            8 => ("mul_mat_q4_1_gfx906_v2", 8),
+            16 => ("mul_mat_q4_1_gfx906_v2_tile16", 16),
+            64 => ("mul_mat_q4_1_gfx906_v2_tile64", 64),
+            _ => ("mul_mat_q4_1_gfx906_v2_tile32", 32),
+        },
+        GgmlDType::Q8_0 => match tile_n_hint {
+            8 => ("mul_mat_q8_0_gfx906_v2", 8),
+            16 => ("mul_mat_q8_0_gfx906_v2_tile16", 16),
+            _ => ("mul_mat_q8_0_gfx906_v2_tile32", 32),
+        },
         _ => return Ok(None),
     };
 
@@ -475,15 +518,14 @@ fn mul_mat_q_v2(
     //    chunked path's convention.
     let dst = dev.alloc_zeros::<f32>(total_b * nrows)?;
 
-    // 3. Launch. Grid covers `ceil(nrows / 64)` Y-tiles × `ceil(total_b / 8)`
+    // 3. Launch. Grid covers `ceil(nrows / 64)` Y-tiles × `ceil(total_b / tile_n)`
     //    X-tiles (one Wave64 warp per tile). Block is a single 64-thread warp.
     const TILE_M: usize = 64;
-    const TILE_N: usize = 8;
     let func = dev.get_or_load_func(kernel_name, &candle_hip_kernels::QUANTIZED)?;
     let cfg = hipdarc::driver::LaunchConfig {
         grid_dim: (
             ceil_div(nrows, TILE_M) as u32,
-            ceil_div(total_b, TILE_N) as u32,
+            ceil_div(total_b, tile_n) as u32,
             1,
         ),
         block_dim: (WARP_SIZE as u32, 1, 1),
@@ -1430,78 +1472,91 @@ mod test {
         ];
         let dtypes = [GgmlDType::Q4_0, GgmlDType::Q4_1, GgmlDType::Q8_0];
 
+        // Tile sizes to exercise. Q4_1 also covers tile_n=64 because the
+        // template has that instantiation (even though it's slower than
+        // tile_n=32 on qwen35 shapes — the kernel must still be correct).
+        let tile_ns_common: &[usize] = &[8, 16, 32];
+        let tile_ns_q4_1: &[usize] = &[8, 16, 32, 64];
+
         for &dtype in &dtypes {
-            for &(m, n, k) in shapes {
-                // Deterministic weights and inputs. Small magnitudes so
-                // quantization noise stays well below 1.0.
-                let weight_f32: Vec<f32> = (0..n * k)
-                    .map(|i| ((i as f32) * 0.0001).sin() * 0.3)
-                    .collect();
-                let input_f32: Vec<f32> = (0..m * k)
-                    .map(|i| ((i as f32) * 0.0003).cos() * 0.3)
-                    .collect();
+            let tile_ns = if dtype == GgmlDType::Q4_1 {
+                tile_ns_q4_1
+            } else {
+                tile_ns_common
+            };
+            for &tile_n_hint in tile_ns {
+                for &(m, n, k) in shapes {
+                    // Deterministic weights and inputs. Small magnitudes so
+                    // quantization noise stays well below 1.0.
+                    let weight_f32: Vec<f32> = (0..n * k)
+                        .map(|i| ((i as f32) * 0.0001).sin() * 0.3)
+                        .collect();
+                    let input_f32: Vec<f32> = (0..m * k)
+                        .map(|i| ((i as f32) * 0.0003).cos() * 0.3)
+                        .collect();
 
-                let data = make_q_weight(&dev, &weight_f32, n, k, dtype)?;
-                let y_dev = dev.clone_htod(&input_f32)?;
+                    let data = make_q_weight(&dev, &weight_f32, n, k, dtype)?;
+                    let y_dev = dev.clone_htod(&input_f32)?;
 
-                // New single-launch path.
-                let out_v2 = mul_mat_q_v2(
-                    &data,
-                    &y_dev.slice(0..y_dev.len()),
-                    dtype,
-                    /* ncols */ k,
-                    /* nrows */ n,
-                    /* total_b */ m,
-                    &dev,
-                )?
-                .unwrap_or_else(|| panic!("mul_mat_q_v2 should return Some for {dtype:?}"));
+                    // Force a specific tile_n so each variant is exercised
+                    // regardless of CANDLE_MMQ_TILE_N env state.
+                    let out_v2 = mul_mat_q_v2_with_tile_n(
+                        &data,
+                        &y_dev.slice(0..y_dev.len()),
+                        dtype,
+                        /* ncols */ k,
+                        /* nrows */ n,
+                        /* total_b */ m,
+                        &dev,
+                        tile_n_hint,
+                    )?
+                    .unwrap_or_else(|| {
+                        panic!("mul_mat_q_v2 should return Some for {dtype:?}")
+                    });
 
-                // Known-good chunked-vector path (same inputs).
-                let out_chunk = mul_mat_via_q8_1_chunked(
-                    &data,
-                    &y_dev.slice(0..y_dev.len()),
-                    dtype,
-                    k,
-                    n,
-                    m,
-                    &dev,
-                )?;
+                    // Known-good chunked-vector path (same inputs).
+                    let out_chunk = mul_mat_via_q8_1_chunked(
+                        &data,
+                        &y_dev.slice(0..y_dev.len()),
+                        dtype,
+                        k,
+                        n,
+                        m,
+                        &dev,
+                    )?;
 
-                let v2_cpu = dev.clone_dtoh(out_v2.as_hip_slice::<f32>()?)?;
-                let chunk_cpu = dev.clone_dtoh(out_chunk.as_hip_slice::<f32>()?)?;
-                assert_eq!(
-                    v2_cpu.len(),
-                    chunk_cpu.len(),
-                    "length mismatch for {dtype:?} {:?}",
-                    (m, n, k)
-                );
+                    let v2_cpu = dev.clone_dtoh(out_v2.as_hip_slice::<f32>()?)?;
+                    let chunk_cpu = dev.clone_dtoh(out_chunk.as_hip_slice::<f32>()?)?;
+                    assert_eq!(
+                        v2_cpu.len(),
+                        chunk_cpu.len(),
+                        "length mismatch for {dtype:?} tile={tile_n_hint} {:?}",
+                        (m, n, k)
+                    );
 
-                // Both paths quantize Y to Q8_1 the same way and use the same
-                // per-block formulas (the v2 kernels were written to match
-                // `vec_dot_<dtype>_q8_1_impl`). The only drift source is FMA
-                // accumulation rounding — for the chunked path each row sum
-                // is computed across half-warp threads with a shuffle reduce,
-                // while v2 does it sequentially in one thread. Allow 1e-4
-                // absolute + 1e-3 relative.
-                let mut max_abs = 0.0f32;
-                let mut max_rel = 0.0f32;
-                let mut ref_max = 0.0f32;
-                for (a, b) in v2_cpu.iter().zip(chunk_cpu.iter()) {
-                    let diff = (a - b).abs();
-                    if diff > max_abs {
-                        max_abs = diff;
+                    // Both paths quantize Y to Q8_1 the same way and use the same
+                    // per-block formulas. The only drift source is FMA accumulation
+                    // rounding. Allow 1e-4 absolute + 1e-3 relative.
+                    let mut max_abs = 0.0f32;
+                    let mut max_rel = 0.0f32;
+                    let mut ref_max = 0.0f32;
+                    for (a, b) in v2_cpu.iter().zip(chunk_cpu.iter()) {
+                        let diff = (a - b).abs();
+                        if diff > max_abs {
+                            max_abs = diff;
+                        }
+                        ref_max = ref_max.max(b.abs());
+                        if b.abs() > 1e-6 {
+                            max_rel = max_rel.max(diff / b.abs());
+                        }
                     }
-                    ref_max = ref_max.max(b.abs());
-                    if b.abs() > 1e-6 {
-                        max_rel = max_rel.max(diff / b.abs());
-                    }
+                    assert!(
+                        max_abs < 1e-4 + 1e-3 * ref_max,
+                        "mmq_v2 vs chunked mismatch for {dtype:?} tile={tile_n_hint} at {:?}: \
+                         max_abs={max_abs} max_rel={max_rel} ref_max={ref_max}",
+                        (m, n, k)
+                    );
                 }
-                assert!(
-                    max_abs < 1e-4 + 1e-3 * ref_max,
-                    "mmq_v2 vs chunked mismatch for {dtype:?} at {:?}: \
-                     max_abs={max_abs} max_rel={max_rel} ref_max={ref_max}",
-                    (m, n, k)
-                );
             }
         }
         Ok(())

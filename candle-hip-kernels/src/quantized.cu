@@ -4899,6 +4899,20 @@ mul_mat_q4_0_gfx906_v2(
     mul_mat_q4_0_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+extern "C" __global__ void
+mul_mat_q4_0_gfx906_v2_tile16(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_0_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void
+mul_mat_q4_0_gfx906_v2_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_0_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 // =============================================================================
 // Phase 2d — Q4_1 × Q8_1 matrix matmul for gfx906.
 //
@@ -5009,6 +5023,34 @@ mul_mat_q4_1_gfx906_v2(
     mul_mat_q4_1_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Phase 2c exploratory — wider TILE_N variants.
+// Each thread still owns one output row but now accumulates more columns,
+// amortizing the X load across more of the output. Re-uses the same
+// `mul_mat_q4_1_gfx906_impl<TILE_N>` body — only the launcher grid-y
+// changes. See `candle-core/src/quantized/hip.rs::mul_mat_q_v2` for the
+// CANDLE_MMQ_TILE_N env switch that picks the variant at runtime.
+
+extern "C" __global__ void
+mul_mat_q4_1_gfx906_v2_tile16(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_1_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void
+mul_mat_q4_1_gfx906_v2_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_1_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void
+mul_mat_q4_1_gfx906_v2_tile64(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_1_gfx906_impl<64>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 // =============================================================================
 // Phase 2d — Q8_0 × Q8_1 matrix matmul for gfx906.
 //
@@ -5105,4 +5147,18 @@ mul_mat_q8_0_gfx906_v2(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q8_0_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void
+mul_mat_q8_0_gfx906_v2_tile16(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q8_0_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void
+mul_mat_q8_0_gfx906_v2_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q8_0_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
