@@ -5162,3 +5162,204 @@ mul_mat_q8_0_gfx906_v2_tile32(
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q8_0_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
+
+// =============================================================================
+// P5 — Q5_K × Q8_1 matrix matmul for gfx906 (K-quant MMQ).
+//
+// Q5_K stores data in 256-element super-blocks, each containing 8 sub-blocks
+// of 32 elements. Each super-block has:
+//   - dm:       half2 holding (super_d, super_dmin)
+//   - scales[12]: packed 8 sub-scales (6-bit each) and 8 sub-mins (6-bit each)
+//   - qh[32]:   high bit of each 5-bit quant (256 bits total, one per element)
+//   - qs[128]:  low 4 bits of each quant, 2 per byte
+//
+// Element layout (from `dequantize_block_q5_K`):
+//   - Elements are organised into 4 "il" groups of 64 each (il ∈ [0, 3]).
+//   - Each il-group has 2 sub-blocks of 32 (sub = 2*il + {0, 1}).
+//   - The first sub-block of an il-group uses low nibbles of qs[32*il..32*il+31],
+//     the second uses high nibbles of the same 32 bytes.
+//   - qh[j] bit `sub` is the high bit of the element at position
+//     `64*il + (sub%2)*32 + j`, where il = sub/2.
+//
+// Per-block formula (matching `vec_dot_q5_K_q8_1_impl_vmmq` at line 2049):
+//     sumf_d_sub = Σ_j dp4a(v_sub[j], y_q[j])  // signed dot of unsigned
+//                                              // 5-bit × signed int8
+//     sumf_y_sub = Σ_j sum(y_q[j])             // sum of y_q
+//     out += super_d * d8_sub * sumf_d_sub * sub_sc[sub]
+//          − super_dmin * d8_sub * sumf_y_sub * sub_m[sub]
+//
+// where `d8_sub = by->ds.x`, the per-Q8_1-sub-block scale.
+//
+// This kernel follows the Phase 2b/2d pattern: one Wave64 warp per
+// 64 × TILE_N output tile, each thread owns one row. TILE_N is a
+// template parameter; phase-2c-style wider tiles are wired in below.
+// =============================================================================
+
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q5_K_gfx906_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q5_K * x = (const block_q5_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK_K;         // Q5_K super-blocks per row
+    const int blocks_per_col_y = nrows_y / QK8_1;         // Q8_1 blocks per col
+    // Number of Q8_1 sub-blocks per Q5_K super-block: 256 / 32 = 8.
+    constexpr int q8_per_super = QK_K / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        // --- Load X super-block header ---------------------------------
+        float super_d = 0.0f, super_dmin = 0.0f;
+        uint8_t sub_sc[8] = {0};
+        uint8_t sub_m[8]  = {0};
+        int qh_word[8] = {0};  // 32 bytes of qh, loaded once per super-block
+
+        const block_q5_K * bx = nullptr;
+        if (row_valid) {
+            bx = &x[row * blocks_per_row_x + ib];
+            const float2 dmf = __half22float2(bx->dm);
+            super_d    = dmf.x;
+            super_dmin = dmf.y;
+
+            // Unpack 8 sub-scales and 8 sub-mins from the 12-byte
+            // packed `scales`. Matches `get_scale_min_k4` at line 802.
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                get_scale_min_k4(j, bx->scales, sub_sc[j], sub_m[j]);
+            }
+
+            // Load qh (32 bytes) into 8 int32s. qh is used by every
+            // sub-block via a different bit position.
+            const int * qh_ptr = (const int *) bx->qh;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                qh_word[j] = qh_ptr[j];
+            }
+        }
+
+        // --- Per-column accumulators -----------------------------------
+        // We loop columns INSIDE the sub-block loop so that each sub-block's
+        // packed v[] (derived from ql and qh) is constructed once per
+        // sub-block and used for all TILE_N columns — trading a wider
+        // sumf_d/sumf_m accumulator for less redundant ql→v conversion.
+        float sumf_d[TILE_N] = {0.0f};
+        float sumf_m[TILE_N] = {0.0f};
+
+        // --- Iterate 8 sub-blocks --------------------------------------
+        #pragma unroll
+        for (int sub = 0; sub < q8_per_super; ++sub) {
+            // sub ∈ [0, 7]. The 2 sub-blocks of the same il-group share
+            // the same 32 qs bytes (low nibbles for the first, high
+            // nibbles for the second). Rather than caching across the
+            // unrolled loop, re-read from L1 — the second read of the
+            // same cache line is ~free.
+            const int il   = sub >> 1;
+            const int half = sub & 1;
+
+            int v[8] = {0};
+            if (row_valid) {
+                const int * ql_ptr = (const int *) (bx->qs + 32 * il);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int ql_word = ql_ptr[j];
+                    // Low or high nibbles as 4 packed 4-bit values.
+                    const int vl = (half == 0)
+                        ? (ql_word & 0x0F0F0F0F)
+                        : ((ql_word >> 4) & 0x0F0F0F0F);
+                    // High bit `sub` of each qh byte, shifted to bit 4
+                    // (the "+16" contribution of the full 5-bit value).
+                    const int vh = ((qh_word[j] >> sub) << 4) & 0x10101010;
+                    v[j] = vl | vh;
+                }
+            }
+
+            // Sub-block scale and min for THIS sub-block.
+            const float sc_f = (float) sub_sc[sub];
+            const float m_f  = (float) sub_m[sub];
+
+            // Inner column loop.
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int col = tile_n + c;
+                if (col >= ncols_y) {
+                    break;
+                }
+
+                // Y sub-block: Q5_K super-block `ib` maps to Q8_1
+                // blocks `ib*8 .. ib*8+7` in column `col`.
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib * q8_per_super + sub];
+                const float d8 = __half2float(__low2half(by->ds));
+
+                const int * y_packed = (const int *) by->qs;
+
+                int sumi_d = 0;
+                int sumi_y = 0;  // Σ y_q for the min correction.
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int y_j = y_packed[j];
+                    sumi_d = ggml_cuda_dp4a(v[j], y_j, sumi_d);
+                    sumi_y = ggml_cuda_dp4a(0x01010101, y_j, sumi_y);
+                }
+
+                sumf_d[c] += d8 * ((float) sumi_d) * sc_f;
+                sumf_m[c] += d8 * ((float) sumi_y) * m_f;
+            }
+        }
+
+        // Combine sub-block partial sums with the super-block d / dmin
+        // into the per-column running total for THIS super-block.
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            sums[c] += super_d * sumf_d[c] - super_dmin * sumf_m[c];
+        }
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    // Column-major writeback — same convention as the Q4_0/Q4_1/Q8_0 v2
+    // kernels so the Rust launcher stays uniform across dtypes.
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q5_K_gfx906_v2(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q5_K_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void
+mul_mat_q5_K_gfx906_v2_tile16(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q5_K_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void
+mul_mat_q5_K_gfx906_v2_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q5_K_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}

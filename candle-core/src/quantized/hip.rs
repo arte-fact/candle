@@ -480,6 +480,17 @@ fn mul_mat_q_v2_with_tile_n(
             16 => ("mul_mat_q8_0_gfx906_v2_tile16", 16),
             _ => ("mul_mat_q8_0_gfx906_v2_tile32", 32),
         },
+        // P5: K-quant MMQ. Q5_K is the qwen35-9B output head tensor and
+        // sits at ~35% of total GPU time in the chunked-vector fallback.
+        // Each super-block is 256 K-elements with 8 sub-blocks — the
+        // kernel loads one super-block per K iteration, precomputes
+        // 8 sub-scales/mins via get_scale_min_k4, and unrolls the
+        // 8-sub-block dp4a loop.
+        GgmlDType::Q5K => match tile_n_hint {
+            8 => ("mul_mat_q5_K_gfx906_v2", 8),
+            16 => ("mul_mat_q5_K_gfx906_v2_tile16", 16),
+            _ => ("mul_mat_q5_K_gfx906_v2_tile32", 32),
+        },
         _ => return Ok(None),
     };
 
@@ -1395,9 +1406,16 @@ mod test {
         ncols: usize,
         dtype: GgmlDType,
     ) -> Result<PaddedHipSlice> {
-        use crate::quantized::k_quants::{BlockQ4_0, BlockQ4_1, BlockQ8_0};
+        use crate::quantized::k_quants::{BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ8_0, QK_K};
         assert_eq!(weight_f32.len(), nrows * ncols);
-        assert!(ncols % 32 == 0, "block-quant requires ncols % 32 == 0");
+
+        // K-quants need ncols divisible by 256; non-K quants need 32.
+        let is_k_quant = matches!(dtype, GgmlDType::Q5K);
+        let min_div = if is_k_quant { QK_K } else { 32 };
+        assert!(
+            ncols % min_div == 0,
+            "dtype {dtype:?} requires ncols % {min_div} == 0, got {ncols}"
+        );
 
         // Quantize on CPU via the existing block types.
         let (data_bytes_vec, type_size) = match dtype {
@@ -1437,10 +1455,38 @@ mod test {
                 .to_vec();
                 (bytes, GgmlDType::Q8_0.type_size())
             }
+            GgmlDType::Q5K => {
+                // Q5_K super-block = 256 elements → nrows * ncols / QK_K blocks.
+                let n_blocks = nrows * ncols / QK_K;
+                let mut blocks: Vec<BlockQ5K> = vec![
+                    BlockQ5K {
+                        d: half::f16::from_f32(0.0),
+                        dmin: half::f16::from_f32(0.0),
+                        scales: [0u8; 12],
+                        qh: [0u8; 32],
+                        qs: [0u8; 128],
+                    };
+                    n_blocks
+                ];
+                BlockQ5K::from_float(weight_f32, &mut blocks);
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        blocks.as_ptr() as *const u8,
+                        core::mem::size_of_val(blocks.as_slice()),
+                    )
+                }
+                .to_vec();
+                (bytes, GgmlDType::Q5K.type_size())
+            }
             _ => crate::bail!("make_q_weight: unsupported dtype {dtype:?}"),
         };
 
-        let padded_len = data_bytes_vec.len() + MATRIX_ROW_PADDING * type_size / 32;
+        // Reserve MATRIX_ROW_PADDING elements of trailing zeros as a
+        // safety margin for tile-aligned reads. `block_size` is 32 for
+        // Q4_0/Q4_1/Q8_0 and 256 for K-quants like Q5_K.
+        let block_size = dtype.block_size();
+        let pad_blocks = MATRIX_ROW_PADDING.div_ceil(block_size);
+        let padded_len = data_bytes_vec.len() + pad_blocks * type_size;
         let mut inner = dev.alloc_zeros::<u8>(padded_len)?;
         dev.stream().memcpy_htod(&mut inner, &data_bytes_vec).w()?;
         Ok(PaddedHipSlice {
@@ -1459,8 +1505,9 @@ mod test {
         let dev = HipDevice::new(0)?;
 
         // (m, n, k) — cover the regression target m=9, plus a spread of
-        // realistic prefill shapes. K is divisible by 32 for Q4_0/Q4_1/Q8_0.
-        let shapes: &[(usize, usize, usize)] = &[
+        // realistic prefill shapes. K is divisible by 32 for the
+        // non-K quants; K-quants (Q5K) need ncols divisible by 256.
+        let shapes_common: &[(usize, usize, usize)] = &[
             (9, 64, 128),    // boundary
             (9, 1024, 4096), // qwen35-9B projection shape
             (16, 64, 128),
@@ -1470,7 +1517,23 @@ mod test {
             (128, 2048, 2048),
             (512, 1024, 4096), // pp512 prefill
         ];
-        let dtypes = [GgmlDType::Q4_0, GgmlDType::Q4_1, GgmlDType::Q8_0];
+        // K-quant shapes: k must be divisible by QK_K=256. All other
+        // dims can match the common shapes.
+        let shapes_k: &[(usize, usize, usize)] = &[
+            (9, 64, 256),    // boundary, one super-block
+            (9, 1024, 4096), // qwen35-9B projection shape (k=4096=16 super-blocks)
+            (16, 1024, 4096),
+            (17, 128, 512),  // non-aligned m, 2 super-blocks
+            (64, 64, 256),
+            (128, 2048, 2048),
+            (512, 1024, 4096), // pp512 prefill
+        ];
+        let dtypes = [
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q5K,
+        ];
 
         // Tile sizes to exercise. Q4_1 also covers tile_n=64 because the
         // template has that instantiation (even though it's slower than
@@ -1483,6 +1546,11 @@ mod test {
                 tile_ns_q4_1
             } else {
                 tile_ns_common
+            };
+            let shapes: &[(usize, usize, usize)] = if dtype == GgmlDType::Q5K {
+                shapes_k
+            } else {
+                shapes_common
             };
             for &tile_n_hint in tile_ns {
                 for &(m, n, k) in shapes {
