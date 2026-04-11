@@ -224,7 +224,67 @@ impl LayerWeights {
         };
         self.kv_cache = Some((k.clone(), v.clone()));
 
-        let y = if q.device().is_metal() && seq_len == 1 {
+        // P2: HIP flash-attention fast path. Replaces the
+        // `repeat_kv + matmul + mask + softmax + matmul` chain with a single
+        // kernel launch when all preconditions are met.
+        //
+        // **Opt-in via CANDLE_FLASH_ATTN_ENABLE=1**. The v1 kernel is BR=1
+        // (one Q row per Wave64) and the scalar j-loop pattern can't tile
+        // K/V loads across Q rows, so on TinyLlama prefill shapes it runs
+        // ~17× slower per-call than rocBLAS Tensile. The broken-even case
+        // is models where the rocBLAS attention category is much larger
+        // (qwen-moe class), so we keep the plumbing + oracle tests in-tree
+        // for future BR>1 tiling work but default to OFF to preserve the
+        // baseline. See BENCH-P2-FLASH-ATTN-v1-2026-04-11.md.
+        //
+        // When enabled, the kernel does the GQA broadcast internally
+        // (h_kv = h_idx / n_rep), so we pass the un-expanded K/V — no
+        // `repeat_kv` materialisation. The fast path additionally requires
+        // L_q >= 4: for decode (L_q=1) the grid collapses to `n_head`
+        // blocks which under-utilises gfx906's 60 CUs.
+        #[cfg(feature = "hip")]
+        let flash_attn_out: Option<Tensor> = if std::env::var("CANDLE_FLASH_ATTN_ENABLE").is_err() {
+            None
+        } else if seq_len >= 4
+            && matches!(q.device(), Device::Hip(_))
+            && q.dtype() == DType::F32
+            && q.is_contiguous()
+            && k.is_contiguous()
+            && v.is_contiguous()
+            && (self.head_dim == 64 || self.head_dim == 128)
+        {
+            // Build an additive f32 mask from the u8 causal mask. The
+            // original mask is (seq_len, kv_len) u8 with 1 = block, 0 = attend.
+            // Flash-attn expects f32 with -inf for blocked, 0 for allowed,
+            // broadcast-compatible with (B, 1, L_q, L_k).
+            let mask_additive = match mask {
+                None => Ok::<Option<Tensor>, candle::Error>(None),
+                Some(m) => {
+                    let mdims = m.dims();
+                    let zero = Tensor::zeros(mdims, DType::F32, q.device())?;
+                    let neg = self.neg_inf.broadcast_as(mdims)?;
+                    let add = m.where_cond(&neg, &zero)?;
+                    let (a, b) = (mdims[0], mdims[1]);
+                    Some(add.reshape((1, 1, a, b))?.contiguous()).transpose()
+                }
+            }?;
+            let scale = 1.0 / (self.head_dim as f64).sqrt();
+            Some(candle::hip_backend::flash_attn_fused(
+                &q,
+                &k,
+                &v,
+                mask_additive.as_ref(),
+                scale,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "hip"))]
+        let flash_attn_out: Option<Tensor> = None;
+
+        let y = if let Some(out) = flash_attn_out {
+            out
+        } else if q.device().is_metal() && seq_len == 1 {
             // SDPA will do MQA for us
             candle_nn::ops::sdpa(
                 &q,

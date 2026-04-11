@@ -70,6 +70,25 @@ fn gqa_attention(
     debug_assert_eq!(n_head % n_kv_head, 0, "n_head must be divisible by n_kv_head");
     let n_rep = n_head / n_kv_head;
 
+    // P2: HIP flash-attention fast path. Replaces the
+    // `matmul + softmax + matmul` chain with a single kernel launch
+    // when all inputs are HIP / f32 / contiguous and the head dim is
+    // one of the supported instantiations ({64, 128}). Falls through
+    // to the rocBLAS path for non-HIP, non-f32, or unsupported shapes.
+    #[cfg(feature = "hip")]
+    {
+        if matches!(q.device(), candle::Device::Hip(_))
+            && q.dtype() == candle::DType::F32
+            && q.is_contiguous()
+            && k.is_contiguous()
+            && v.is_contiguous()
+            && mask.map(|m| m.is_contiguous() && m.dtype() == candle::DType::F32).unwrap_or(true)
+            && (head_dim == 64 || head_dim == 128)
+        {
+            return candle::hip_backend::flash_attn_fused(q, k, v, mask, attn_scale);
+        }
+    }
+
     // Zero-copy reshape: Q (B, n_head, L, D) → (B, n_kv_head, n_rep*L, D).
     // When `n_rep == 1` this is a no-op rename; otherwise it groups the
     // n_rep Q sub-heads that share each KV head into one batch matrix row.
@@ -738,5 +757,118 @@ mod tests {
             unflat.is_contiguous(),
             "matmul-output reshape back to (B, n_head, L, D) should be zero-copy"
         );
+    }
+
+    /// P2 regression: the new HIP flash-attention kernel must match
+    /// the CPU `gqa_attention_oracle` output within numerical
+    /// tolerance across a spread of shapes (prefill-like large L,
+    /// decode-like L=1, with and without mask, n_rep in {1, 4, 8}).
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_flash_attn_matches_cpu_oracle_d64() {
+        let dev_hip = match Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let dev_cpu = Device::Cpu;
+        // (B, n_head, n_kv_head, L_q, L_k, D, use_mask)
+        let cases: &[(usize, usize, usize, usize, usize, usize, bool)] = &[
+            (1, 8, 8, 4, 4, 64, false),    // small no-GQA
+            (1, 8, 8, 4, 4, 64, true),     // small with mask
+            (1, 32, 8, 16, 16, 64, true),  // GQA n_rep=4
+            (1, 32, 4, 12, 12, 64, true),  // GQA n_rep=8
+            (1, 32, 32, 1, 16, 64, false), // decode-like L_q=1 over T=16
+            (2, 8, 4, 8, 8, 64, true),     // batch=2, n_rep=2
+            (1, 8, 8, 1, 1149, 64, false), // long decode
+        ];
+
+        for &(b_sz, n_head, n_kv_head, l_q, l_k, d, use_mask) in cases {
+            let qkv_len_q = b_sz * n_head * l_q * d;
+            let qkv_len_kv = b_sz * n_kv_head * l_k * d;
+            let q_vals: Vec<f32> = (0..qkv_len_q)
+                .map(|i| ((i as f32) * 0.00037).sin() * 0.1)
+                .collect();
+            let k_vals: Vec<f32> = (0..qkv_len_kv)
+                .map(|i| ((i as f32) * 0.00053).cos() * 0.1)
+                .collect();
+            let v_vals: Vec<f32> = (0..qkv_len_kv)
+                .map(|i| ((i as f32) * 0.00041).sin() * 0.1)
+                .collect();
+
+            let q_cpu = Tensor::from_slice(&q_vals, (b_sz, n_head, l_q, d), &dev_cpu).unwrap();
+            let k_cpu = Tensor::from_slice(&k_vals, (b_sz, n_kv_head, l_k, d), &dev_cpu).unwrap();
+            let v_cpu = Tensor::from_slice(&v_vals, (b_sz, n_kv_head, l_k, d), &dev_cpu).unwrap();
+
+            let q_hip = Tensor::from_slice(&q_vals, (b_sz, n_head, l_q, d), &dev_hip).unwrap();
+            let k_hip = Tensor::from_slice(&k_vals, (b_sz, n_kv_head, l_k, d), &dev_hip).unwrap();
+            let v_hip = Tensor::from_slice(&v_vals, (b_sz, n_kv_head, l_k, d), &dev_hip).unwrap();
+
+            let mask_cpu_hip = if use_mask {
+                // Simple causal mask on last-L_q rows of a L_q × L_k
+                // matrix. Equivalent shape: (1, 1, L_q, L_k).
+                let mut mv = vec![0.0f32; l_q * l_k];
+                for qi in 0..l_q {
+                    for ki in 0..l_k {
+                        // Causal: allow positions [0, qi + (L_k - L_q)]
+                        let past = l_k - l_q;
+                        if ki > qi + past {
+                            mv[qi * l_k + ki] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                Some((
+                    Tensor::from_slice(&mv, (1, 1, l_q, l_k), &dev_cpu).unwrap(),
+                    Tensor::from_slice(&mv, (1, 1, l_q, l_k), &dev_hip).unwrap(),
+                ))
+            } else {
+                None
+            };
+
+            let scale = 1.0 / (d as f64).sqrt();
+
+            // CPU oracle
+            let mask_cpu = mask_cpu_hip.as_ref().map(|(c, _)| c);
+            let out_cpu = gqa_attention_oracle(&q_cpu, &k_cpu, &v_cpu, mask_cpu, scale).unwrap();
+
+            // HIP flash-attention
+            let mask_hip = mask_cpu_hip.as_ref().map(|(_, h)| h);
+            let out_hip = candle::hip_backend::flash_attn_fused(
+                &q_hip, &k_hip, &v_hip, mask_hip, scale,
+            )
+            .unwrap();
+
+            let out_cpu_vals: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+            let out_hip_vals: Vec<f32> = out_hip
+                .to_device(&dev_cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(
+                out_cpu_vals.len(),
+                out_hip_vals.len(),
+                "length mismatch for case {:?}",
+                (b_sz, n_head, n_kv_head, l_q, l_k, d, use_mask)
+            );
+
+            let max_abs = out_cpu_vals
+                .iter()
+                .zip(out_hip_vals.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // Online softmax accumulates in a different order than the
+            // full `softmax(Q@K^T) @ V` oracle. Small FMA drift is
+            // expected, especially for long L_k. 1e-4 absolute is
+            // defensive; TinyLlama outputs tend to match much tighter.
+            assert!(
+                max_abs < 1e-4,
+                "flash_attn HIP vs CPU oracle drift on {:?}: max_abs={max_abs}",
+                (b_sz, n_head, n_kv_head, l_q, l_k, d, use_mask)
+            );
+        }
     }
 }
