@@ -300,14 +300,20 @@ fn mul_mat_vec_via_q8_1(
     if b_size == 0 || b_size > 8 {
         crate::bail!("only bsize between 1 and 8 are supported, got {b_size}")
     }
-    // Start by quantizing y
+    // Start by quantizing y. The quantize_q8_1 kernel covers the full
+    // `(kx_padded/QK8_1, b_size)` grid and writes every Q8_1 block in the
+    // buffer (the tail col reads past `ncols` are gated to 0 inside the
+    // kernel, see quantize_q8_1.cu:3433). So we can skip the zero fill.
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let y_size_in_bytes =
         b_size * ncols_padded * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
-    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    // SAFETY: the quantize_q8_1 kernel launched on the next line fully
+    // overwrites every block of this buffer (see the safety note above).
+    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
     quantize_q8_1(y, &mut y_q8_1, ncols, b_size, dev)?;
 
-    let dst = dev.alloc_zeros::<f32>(nrows * b_size)?;
+    // SAFETY: launch_mul_mat_vec_q8_1_chunk fully overwrites its output.
+    let dst = unsafe { dev.alloc::<f32>(nrows * b_size)? };
     let dst_view = dst.slice(0..dst.len());
     launch_mul_mat_vec_q8_1_chunk(
         data,
@@ -583,12 +589,28 @@ fn mul_mat_q_v2_with_tile_n(
     let q8_1_block_size = GgmlDType::Q8_1.block_size();
     let bytes_per_row = ncols_padded / q8_1_block_size * q8_1_type_size;
     let y_size_in_bytes = total_b_padded * bytes_per_row;
-    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    // The v2f kernel reads rows `total_b..total_b_padded` as zero-padded
+    // OOB so that path still needs `alloc_zeros`. When `total_b` is already
+    // tile-aligned (common when `total_b == 1` is padded up or when the
+    // prefill length happens to be a tile multiple), only the quantizer
+    // writes matter.
+    // SAFETY (true branch): quantize_q8_1 fully writes this buffer when
+    // total_b == total_b_padded. False branch keeps the zero-fill for
+    // the v2f OOB row requirement.
+    let mut y_q8_1 = if total_b == total_b_padded {
+        unsafe { dev.alloc::<u8>(y_size_in_bytes)? }
+    } else {
+        dev.alloc_zeros::<u8>(y_size_in_bytes)?
+    };
     quantize_q8_1(y, &mut y_q8_1, ncols, total_b, dev)?;
 
     // 2. Allocate output buffer — row-major `(total_b, nrows)`, matching the
-    //    chunked path's convention.
-    let dst = dev.alloc_zeros::<f32>(total_b * nrows)?;
+    //    chunked path's convention. The MMQ kernel fully overwrites each
+    //    valid `(row, col)`; no zero-fill needed.
+    // SAFETY: the mul_mat_q_v2f kernel launched below writes every valid
+    // dst element (`col < ncols_y == total_b`) and the buffer size equals
+    // that valid range.
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
 
     // 3. Launch. Grid covers `ceil(nrows / 64)` Y-tiles × `ceil(total_b / tile_n)`
     //    X-tiles (one Wave64 warp per tile). Block is a single 64-thread warp.
@@ -667,16 +689,23 @@ fn mul_mat_via_q8_1_chunked(
     //    operates row-by-row so the cost is the same whether we call it
     //    once with total_b rows or N times with chunks of 8 — and the
     //    single call is fewer kernel launches.
+    //
+    //    No padding beyond `total_b` here (unlike the MMQ v2f path), so
+    //    quantize_q8_1 writes every block and we can skip the zero fill.
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let q8_1_block_size = GgmlDType::Q8_1.block_size();
     let q8_1_type_size = GgmlDType::Q8_1.type_size();
     let bytes_per_row = ncols_padded / q8_1_block_size * q8_1_type_size;
     let y_size_in_bytes = total_b * bytes_per_row;
-    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    // SAFETY: quantize_q8_1 fully overwrites all `total_b * bytes_per_row`
+    // bytes (no padding beyond total_b in this path).
+    let mut y_q8_1 = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
     quantize_q8_1(y, &mut y_q8_1, ncols, total_b, dev)?;
 
-    // 2. Pre-allocate the full output buffer.
-    let dst = dev.alloc_zeros::<f32>(total_b * nrows)?;
+    // 2. Pre-allocate the full output buffer. The vec kernels fully
+    //    overwrite each `(chunk, row)` slot; no zero-fill needed.
+    // SAFETY: the chunk loop below writes every (row, col) of dst.
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
 
     // 3. Loop chunks of up to 8 rows. Each iteration launches one vector
     //    kernel against a slice of the quantized input and writes into a
@@ -813,9 +842,12 @@ fn indexed_moe_forward_f16_f32(
     let topk = idx_shape.dims()[1];
     assert!(batch == idx_shape.dims()[0], "batch dim not match!");
 
-    // Output buffer: [batch, topk, n]
+    // Output buffer: [batch, topk, n]. The kernel grid is `(n, batch, topk)`
+    // with every block writing one row of `n` elements — full coverage,
+    // no zero-fill needed.
+    // SAFETY: the indexed_moe_forward_f16_f32 kernel fully writes `out`.
     let outsize = batch * topk * n;
-    let out = dev.alloc_zeros::<f32>(outsize)?;
+    let out = unsafe { dev.alloc::<f32>(outsize)? };
 
     let func =
         dev.get_or_load_func("indexed_moe_forward_f16_f32", &candle_hip_kernels::QUANTIZED)?;
@@ -879,14 +911,18 @@ fn indexed_moe_forward_fused_q8_1_input(
     let num_blocks_per_row = k_padded / q8_1_block_size;
     let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
     let y_size_in_bytes = total_rows * dst_row_size_bytes;
-    let mut input_quant = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    // quantize_q8_1 writes every block (tail cols past `k` land on 0 via
+    // the in-kernel gate), so we can skip the zero fill.
+    // SAFETY: quantize_q8_1 fully writes input_quant on the next line.
+    let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
 
     let input_view = input.slice(0..input.len());
     quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
 
-    // output buffer
+    // Output buffer [batch, topk, n]: fully written by the kernel.
+    // SAFETY: indexed_moe_forward_*_q8_1 writes every element of `out`.
     let outsize = batch * topk * n;
-    let out = dev.alloc_zeros::<f32>(outsize)?;
+    let out = unsafe { dev.alloc::<f32>(outsize)? };
 
     let kernel_name = match w_dtype {
         GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
