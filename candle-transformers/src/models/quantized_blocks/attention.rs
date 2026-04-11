@@ -70,19 +70,62 @@ pub(crate) fn gqa_attention(
     debug_assert_eq!(n_head % n_kv_head, 0, "n_head must be divisible by n_kv_head");
     let n_rep = n_head / n_kv_head;
 
-    // P2: HIP flash-attention fast path — OPT-IN via CANDLE_FLASH_ATTN_ENABLE.
-    // The v1 BR=1 kernel is ~17× slower per-call than rocBLAS on our
-    // shapes; infrastructure stays in tree for future BR≥4 work. See
-    // `BENCH-P2-FLASH-ATTN-v1-2026-04-11.md` for the postmortem.
+    // P2/Q3: HIP flash-attention — BOTH variants are OPT-IN and default
+    // OFF. Benchmarking on gfx906 consistently shows that rocBLAS's
+    // Tensile matrix-tile kernels beat our scalar f32 flash-attn
+    // designs for every head-dim we can compile today. The v1 BR=1
+    // postmortem is in BENCH-P2-FLASH-ATTN-v1-2026-04-11.md; v2 (BR=4,
+    // LDS-tiled, D in {64, 128, 256}) is the follow-up from Q3 and
+    // surfaces the same story — correctness passes, performance loses
+    // because each j iteration has a 6-shuffle warp reduce plus two
+    // __expf calls that we can't amortise the way a GEMM kernel does.
+    //
+    // Enabled via `CANDLE_FLASH_ATTN_V2_ENABLE` for experimentation,
+    // or `CANDLE_FLASH_ATTN_V1_ENABLE` for the BR=1 variant.
     #[cfg(feature = "hip")]
     {
-        if std::env::var("CANDLE_FLASH_ATTN_ENABLE").is_ok()
+        if std::env::var("CANDLE_FLASH_ATTN_V2_ENABLE").is_ok()
+            && seq_len >= 4
+            && matches!(head_dim, 64 | 128 | 256)
+            && matches!(q.device(), candle::Device::Hip(_))
+            && q.dtype() == candle::DType::F32
+            && mask
+                .map(|m| m.dtype() == candle::DType::F32)
+                .unwrap_or(true)
+        {
+            // Force all four tensors contiguous — KvCache narrow
+            // views are strided when the cache buffer is over-
+            // allocated.
+            let q_c = if q.is_contiguous() { q.clone() } else { q.contiguous()? };
+            let k_c = if k.is_contiguous() { k.clone() } else { k.contiguous()? };
+            let v_c = if v.is_contiguous() { v.clone() } else { v.contiguous()? };
+            let mask_c = match mask {
+                None => None,
+                Some(m) => Some(if m.is_contiguous() {
+                    m.clone()
+                } else {
+                    m.contiguous()?
+                }),
+            };
+            if let Ok(o) = candle::hip_backend::flash_attn_v2_fused(
+                &q_c,
+                &k_c,
+                &v_c,
+                mask_c.as_ref(),
+                attn_scale,
+            ) {
+                return Ok(o);
+            }
+        }
+        if std::env::var("CANDLE_FLASH_ATTN_V1_ENABLE").is_ok()
             && matches!(q.device(), candle::Device::Hip(_))
             && q.dtype() == candle::DType::F32
             && q.is_contiguous()
             && k.is_contiguous()
             && v.is_contiguous()
-            && mask.map(|m| m.is_contiguous() && m.dtype() == candle::DType::F32).unwrap_or(true)
+            && mask
+                .map(|m| m.is_contiguous() && m.dtype() == candle::DType::F32)
+                .unwrap_or(true)
             && (head_dim == 64 || head_dim == 128)
         {
             return candle::hip_backend::flash_attn_fused(q, k, v, mask, attn_scale);
@@ -1116,6 +1159,121 @@ mod tests {
             assert!(
                 max_abs < 1e-5,
                 "rms_norm_post_residual drift on (b={b}, s={s}, h={h}): max_abs={max_abs}"
+            );
+        }
+    }
+
+    /// Q3 regression: flash-attention v2 (BR=4, LDS-tiled) must match
+    /// the CPU `gqa_attention_oracle` output across shapes that cover
+    /// every head dim instantiation (64, 128, 256) and every mask
+    /// broadcast kind. Also covers L_q just above the FLASH_V2_MIN_L_Q
+    /// gate to exercise the block-boundary `q_in_range` path.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_flash_attn_v2_matches_cpu_oracle() {
+        let dev_hip = match Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let dev_cpu = Device::Cpu;
+        // (B, n_head, n_kv_head, L_q, L_k, D, use_mask)
+        let cases: &[(usize, usize, usize, usize, usize, usize, bool)] = &[
+            // D=64 — TinyLlama-like
+            (1, 8, 8, 4, 4, 64, false),
+            (1, 32, 4, 8, 8, 64, true),
+            (1, 8, 8, 16, 32, 64, true),
+            // BR boundary: L_q=5, 6, 7, 8 (not all multiples of BR=4)
+            (1, 8, 8, 5, 16, 64, true),
+            (1, 8, 8, 7, 32, 64, true),
+            // D=128 — qwen-class
+            (1, 16, 4, 8, 16, 128, true),
+            (1, 32, 8, 16, 64, 128, true),
+            // D=256 — gemma4
+            (1, 8, 4, 8, 16, 256, true),
+            (1, 8, 4, 16, 32, 256, true),
+            (1, 8, 4, 32, 64, 256, false),
+            // batch=2
+            (2, 8, 4, 8, 8, 64, true),
+        ];
+
+        for &(b_sz, n_head, n_kv_head, l_q, l_k, d, use_mask) in cases {
+            let qkv_len_q = b_sz * n_head * l_q * d;
+            let qkv_len_kv = b_sz * n_kv_head * l_k * d;
+            let q_vals: Vec<f32> = (0..qkv_len_q)
+                .map(|i| ((i as f32) * 0.00037).sin() * 0.1)
+                .collect();
+            let k_vals: Vec<f32> = (0..qkv_len_kv)
+                .map(|i| ((i as f32) * 0.00053).cos() * 0.1)
+                .collect();
+            let v_vals: Vec<f32> = (0..qkv_len_kv)
+                .map(|i| ((i as f32) * 0.00041).sin() * 0.1)
+                .collect();
+
+            let q_cpu = Tensor::from_slice(&q_vals, (b_sz, n_head, l_q, d), &dev_cpu).unwrap();
+            let k_cpu = Tensor::from_slice(&k_vals, (b_sz, n_kv_head, l_k, d), &dev_cpu).unwrap();
+            let v_cpu = Tensor::from_slice(&v_vals, (b_sz, n_kv_head, l_k, d), &dev_cpu).unwrap();
+
+            let q_hip = Tensor::from_slice(&q_vals, (b_sz, n_head, l_q, d), &dev_hip).unwrap();
+            let k_hip = Tensor::from_slice(&k_vals, (b_sz, n_kv_head, l_k, d), &dev_hip).unwrap();
+            let v_hip = Tensor::from_slice(&v_vals, (b_sz, n_kv_head, l_k, d), &dev_hip).unwrap();
+
+            let mask_cpu_hip = if use_mask {
+                let mut mv = vec![0.0f32; l_q * l_k];
+                for qi in 0..l_q {
+                    for ki in 0..l_k {
+                        let past = l_k - l_q;
+                        if ki > qi + past {
+                            mv[qi * l_k + ki] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                Some((
+                    Tensor::from_slice(&mv, (1, 1, l_q, l_k), &dev_cpu).unwrap(),
+                    Tensor::from_slice(&mv, (1, 1, l_q, l_k), &dev_hip).unwrap(),
+                ))
+            } else {
+                None
+            };
+
+            let scale = 1.0 / (d as f64).sqrt();
+
+            let mask_cpu = mask_cpu_hip.as_ref().map(|(c, _)| c);
+            let out_cpu = gqa_attention_oracle(&q_cpu, &k_cpu, &v_cpu, mask_cpu, scale).unwrap();
+
+            let mask_hip = mask_cpu_hip.as_ref().map(|(_, h)| h);
+            let out_hip = candle::hip_backend::flash_attn_v2_fused(
+                &q_hip, &k_hip, &v_hip, mask_hip, scale,
+            )
+            .unwrap();
+
+            let out_cpu_vals: Vec<f32> =
+                out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+            let out_hip_vals: Vec<f32> = out_hip
+                .to_device(&dev_cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(
+                out_cpu_vals.len(),
+                out_hip_vals.len(),
+                "length mismatch for case {:?}",
+                (b_sz, n_head, n_kv_head, l_q, l_k, d, use_mask)
+            );
+
+            let max_abs = out_cpu_vals
+                .iter()
+                .zip(out_hip_vals.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 2e-4,
+                "flash_attn_v2 vs CPU oracle drift on {:?}: max_abs={max_abs}",
+                (b_sz, n_head, n_kv_head, l_q, l_k, d, use_mask)
             );
         }
     }
