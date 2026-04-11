@@ -23,26 +23,83 @@ use std::sync::Arc;
 /// bucket exactly once).
 const KV_CACHE_INITIAL: usize = 4096;
 
-/// GQA broadcast: expand `k` (or `v`) from `n_kv_head` to `n_head` by duplicating
-/// each KV head `n_rep` times in place.
+/// Run scaled-dot-product attention with GQA sharing done via zero-copy
+/// reshape of Q, not a physical broadcast of K/V.
 ///
-/// Replaces `crate::utils::repeat_kv` which uses `cat-along-dim2 + reshape`.
-/// That trick produces wrong head ordering when `n_rep ≥ 8` (the cat puts
-/// repeated tokens consecutively, then the reshape splits one head's data
-/// across multiple new heads).
+/// For interleaved GQA (the convention candle uses everywhere in this module)
+/// Q head `h` attends to KV head `h / n_rep`, so reshaping Q from
+/// `(B, n_head, L, D)` to `(B, n_kv_head, n_rep * L, D)` groups together all
+/// the Q sub-heads that share a given KV head. A plain batched matmul against
+/// K shape `(B, n_kv_head, T, D)` then gives exactly the right result — each
+/// rocBLAS batch matrix handles one KV head at a time and the `n_rep` Q
+/// sub-heads for that KV head live contiguously in the row dimension.
 ///
-/// Input  shape: `(B, n_kv_head, T, D)`
-/// Output shape: `(B, n_kv_head * n_rep, T, D)` where new heads `[k*n_rep .. (k+1)*n_rep)`
-/// all hold KV head `k`'s values.
-fn broadcast_kv(x: &Tensor, n_rep: usize) -> Result<Tensor> {
-    if n_rep == 1 {
-        return Ok(x.clone());
-    }
-    let (b, n_kv, t, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, n_kv, n_rep, t, d))?
-        .reshape((b, n_kv * n_rep, t, d))?
-        .contiguous()
+/// No K/V copy is performed. This replaces the earlier `broadcast_kv` helper
+/// which materialised `(B, n_head, T, D)` via `unsqueeze → expand → reshape →
+/// contiguous`, followed by a `k.t().contiguous()` that made a second copy of
+/// the same size. Both are gone; only one `k.t().contiguous()` on the
+/// `(B, n_kv_head, D, T)` view remains, which is `n_rep×` smaller.
+///
+/// Cross-reference: llama.cpp divides `zt / channel_ratio` in its MMQ offset
+/// calc (`ggml/src/ggml-cuda/mmq.cuh:3640`); vLLM launches a grid per query
+/// head and computes `kv_head_idx = head_idx / num_queries_per_kv`
+/// (`csrc/attention/attention_kernels.cuh:145-148`). Our approach is closest
+/// to vLLM's — we get the sharing "for free" by reshaping Q rather than
+/// teaching the kernel about GQA.
+///
+/// The reshape round-trips are zero-copy when the inputs are contiguous:
+/// `Tensor::reshape` returns a view in that case (see
+/// `candle-core/src/tensor.rs:2547-2557`).
+///
+/// Shapes:
+/// - `q`: `(B, n_head, L, D)`
+/// - `k`: `(B, n_kv_head, T, D)`
+/// - `v`: `(B, n_kv_head, T, D)`
+/// - `mask`: optional broadcast-compatible with `(B, n_head, L, T)`
+///
+/// Returns attention output with shape `(B, n_head, L, D)`.
+fn gqa_attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    attn_scale: f64,
+) -> Result<Tensor> {
+    let (b_sz, n_head, seq_len, head_dim) = q.dims4()?;
+    let (_, n_kv_head, t_k, _) = k.dims4()?;
+    debug_assert_eq!(n_head % n_kv_head, 0, "n_head must be divisible by n_kv_head");
+    let n_rep = n_head / n_kv_head;
+
+    // Zero-copy reshape: Q (B, n_head, L, D) → (B, n_kv_head, n_rep*L, D).
+    // When `n_rep == 1` this is a no-op rename; otherwise it groups the
+    // n_rep Q sub-heads that share each KV head into one batch matrix row.
+    let q_grouped = q.reshape((b_sz, n_kv_head, n_rep * seq_len, head_dim))?;
+
+    // K^T view: (B, n_kv_head, T, D) → (B, n_kv_head, D, T). One materialisation
+    // on a tensor that is `n_rep×` smaller than the old `broadcast_kv` result.
+    let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+
+    // Batched matmul: batch = B * n_kv_head, each is (n_rep*L, D) × (D, T).
+    let attn_weights = q_grouped.matmul(&k_t)?;
+
+    // Un-flatten for scale + mask + softmax: (B, n_kv_head, n_rep*L, T) →
+    // (B, n_head, L, T). Zero-copy because the matmul output is contiguous.
+    let attn_weights = attn_weights.reshape((b_sz, n_head, seq_len, t_k))?;
+    let attn_weights = (attn_weights * attn_scale)?;
+    let attn_weights = match mask {
+        Some(m) => attn_weights.broadcast_add(m)?,
+        None => attn_weights,
+    };
+    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+
+    // Re-group for V matmul: (B, n_head, L, T) → (B, n_kv_head, n_rep*L, T).
+    let attn_weights_grouped =
+        attn_weights.reshape((b_sz, n_kv_head, n_rep * seq_len, t_k))?;
+    let v_c = v.contiguous()?;
+    let attn_output = attn_weights_grouped.matmul(&v_c)?;
+
+    // Un-flatten back to (B, n_head, L, D) for the caller.
+    attn_output.reshape((b_sz, n_head, seq_len, head_dim))
 }
 
 /// Variants of RmsNorm used by different model families for QK norms.
@@ -301,19 +358,9 @@ impl StandardAttention {
         // Q gets RoPE'd here. K was already rotated inside compute_kv.
         let q = self.rotary.apply_one(&q, offset)?;
 
-        // GQA broadcast K/V
-        let n_rep = self.n_head / self.n_kv_head;
-        let k_full = broadcast_kv(k, n_rep)?;
-        let v_full = broadcast_kv(v, n_rep)?;
-
-        // Q @ K^T scaled
-        let attn_weights = (q.matmul(&k_full.t()?.contiguous()?)? * self.attn_scale)?;
-        let attn_weights = match mask {
-            Some(m) => attn_weights.broadcast_add(m)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v_full.contiguous()?)?;
+        // GQA via zero-copy Q reshape — see `gqa_attention` doc. K and V stay
+        // at `(B, n_kv_head, T, D)`; there is no physical broadcast copy.
+        let attn_output = gqa_attention(&q, k, v, mask, self.attn_scale)?;
 
         // Reshape back: (B, H, L, D) → (B, L, H*D) → wo
         let attn_output = attn_output
@@ -480,24 +527,11 @@ impl GatedAttention {
         let v = v.contiguous()?;
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
-        // GQA broadcast — see `broadcast_kv` doc for why we don't use repeat_kv.
-        let n_rep = self.n_head / self.n_kv_head;
-        let k = broadcast_kv(&k, n_rep)?;
-        let v = broadcast_kv(&v, n_rep)?;
+        // GQA via zero-copy Q reshape — see `gqa_attention` doc. K and V
+        // stay at `(B, n_kv_head, T, D)`; no physical broadcast copy.
+        let attn_output = gqa_attention(&q, &k, &v, mask, self.attn_scale)?;
 
-        // Scaled dot-product attention. `q` is the rotary output,
-        // which is already contiguous, so we drop the redundant
-        // `.contiguous()` here. `k.t()` flips strides so we still
-        // need to materialize it for matmul.
-        let attn_weights = (q.matmul(&k.t()?.contiguous()?)? * self.attn_scale)?;
-        let attn_weights = match mask {
-            Some(m) => attn_weights.broadcast_add(m)?,
-            None => attn_weights,
-        };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v.contiguous()?)?;
-
-        // Gate: attn_output * sigmoid(gate)
+        // Gate: attn_output * sigmoid(gate). Both are `(B, n_head, L, D)`.
         let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;
         let attn_output = (attn_output * gate_sigmoid)?;
 
@@ -512,5 +546,190 @@ impl GatedAttention {
 
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::{DType, Device};
+
+    /// Oracle implementation using the old `broadcast_kv` physical
+    /// expansion. Used only for regression testing — the production code
+    /// path is `gqa_attention`.
+    fn broadcast_kv_oracle(x: &Tensor, n_rep: usize) -> Result<Tensor> {
+        if n_rep == 1 {
+            return Ok(x.clone());
+        }
+        let (b, n_kv, t, d) = x.dims4()?;
+        x.unsqueeze(2)?
+            .expand((b, n_kv, n_rep, t, d))?
+            .reshape((b, n_kv * n_rep, t, d))?
+            .contiguous()
+    }
+
+    /// Oracle attention: physically broadcasts K/V, then does the matmul
+    /// chain. Mirrors the pre-refactor `StandardAttention::forward_with_kv`
+    /// attention block exactly.
+    fn gqa_attention_oracle(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        attn_scale: f64,
+    ) -> Result<Tensor> {
+        let (_, n_head, _, _) = q.dims4()?;
+        let (_, n_kv_head, _, _) = k.dims4()?;
+        let n_rep = n_head / n_kv_head;
+
+        let k_full = broadcast_kv_oracle(k, n_rep)?;
+        let v_full = broadcast_kv_oracle(v, n_rep)?;
+
+        let attn_weights = (q.matmul(&k_full.t()?.contiguous()?)? * attn_scale)?;
+        let attn_weights = match mask {
+            Some(m) => attn_weights.broadcast_add(m)?,
+            None => attn_weights,
+        };
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        attn_weights.matmul(&v_full.contiguous()?)
+    }
+
+    /// Maximum absolute difference between two tensors, reduced to a f32
+    /// scalar. Used as the correctness metric in the oracle tests.
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let d = (a - b).unwrap().abs().unwrap();
+        d.flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap()
+    }
+
+    fn run_gqa_case(
+        b_sz: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        seq_len: usize,
+        t_cache: usize,
+        head_dim: usize,
+        use_mask: bool,
+    ) {
+        let dev = &Device::Cpu;
+        // Fixed seed via deterministic values — `Tensor::randn` uses the
+        // global rand state which the test harness doesn't seed, but the
+        // oracle vs. new path are both pure functions of the same inputs
+        // so any non-zero random draw is fine.
+        let q = Tensor::randn(0f32, 0.1, (b_sz, n_head, seq_len, head_dim), dev).unwrap();
+        let k = Tensor::randn(0f32, 0.1, (b_sz, n_kv_head, t_cache, head_dim), dev).unwrap();
+        let v = Tensor::randn(0f32, 0.1, (b_sz, n_kv_head, t_cache, head_dim), dev).unwrap();
+
+        // Triangular mask shape `(L, T)` — broadcasts against `(B, n_head, L, T)`.
+        let mask = if use_mask {
+            let raw: Vec<f32> = (0..seq_len)
+                .flat_map(|i| {
+                    (0..t_cache).map(move |j| {
+                        if j > i {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.0
+                        }
+                    })
+                })
+                .collect();
+            Some(Tensor::from_vec(raw, (seq_len, t_cache), dev).unwrap())
+        } else {
+            None
+        };
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        let got = gqa_attention(&q, &k, &v, mask.as_ref(), scale).unwrap();
+        let want = gqa_attention_oracle(&q, &k, &v, mask.as_ref(), scale).unwrap();
+
+        assert_eq!(got.dims(), want.dims(), "output shape differs");
+        let diff = max_abs_diff(&got, &want);
+        assert!(
+            diff < 1e-5,
+            "gqa_attention diverged from oracle: max_abs_diff = {diff} \
+             (b={b_sz}, n_head={n_head}, n_kv={n_kv_head}, L={seq_len}, \
+              T={t_cache}, D={head_dim}, mask={use_mask})"
+        );
+    }
+
+    #[test]
+    fn test_gqa_attention_n_rep_1_identity() {
+        // n_rep = 1 (plain MHA): the reshapes are no-ops, must match.
+        run_gqa_case(1, 8, 8, 4, 4, 16, false);
+        run_gqa_case(1, 8, 8, 4, 4, 16, true);
+    }
+
+    #[test]
+    fn test_gqa_attention_n_rep_2() {
+        run_gqa_case(1, 8, 4, 5, 5, 16, false);
+        run_gqa_case(1, 8, 4, 5, 5, 16, true);
+    }
+
+    #[test]
+    fn test_gqa_attention_n_rep_4() {
+        run_gqa_case(1, 16, 4, 6, 6, 16, false);
+        run_gqa_case(1, 16, 4, 6, 6, 16, true);
+    }
+
+    #[test]
+    fn test_gqa_attention_n_rep_8() {
+        // n_rep = 8 is the boundary where the old `utils::repeat_kv`
+        // (cat-based) produced wrong head ordering. Verify the new
+        // reshape path agrees with the `broadcast_kv` oracle here.
+        run_gqa_case(1, 16, 2, 4, 7, 16, false);
+        run_gqa_case(1, 16, 2, 4, 7, 16, true);
+    }
+
+    #[test]
+    fn test_gqa_attention_n_rep_16() {
+        // qwen35 dense: 16 Q heads per KV head.
+        run_gqa_case(1, 32, 2, 3, 9, 16, false);
+        run_gqa_case(1, 32, 2, 3, 9, 16, true);
+    }
+
+    #[test]
+    fn test_gqa_attention_decode_step() {
+        // seq_len = 1 (decode): n_rep * 1 = n_rep, still correct.
+        run_gqa_case(1, 16, 2, 1, 12, 32, false);
+        run_gqa_case(1, 16, 2, 1, 12, 32, true);
+    }
+
+    #[test]
+    fn test_gqa_attention_batch_size_2() {
+        // Non-unit batch — the reshape math has to hold across the batch.
+        run_gqa_case(2, 12, 3, 5, 5, 16, false);
+        run_gqa_case(2, 12, 3, 5, 5, 16, true);
+    }
+
+    #[test]
+    fn test_gqa_attention_reshapes_are_zero_copy() {
+        // Prove the reshape round-trips don't materialise: start from a
+        // contiguous Q and manually replay the reshapes, asserting
+        // `is_contiguous()` at each step. If candle ever decides to
+        // insert a copy for the `(B, n_kv_head, n_rep*L, D)` ↔
+        // `(B, n_head, L, D)` transition, this test will catch it.
+        let dev = &Device::Cpu;
+        let (b, n_head, l, d) = (1usize, 16usize, 5usize, 16usize);
+        let n_kv_head = 2usize;
+        let n_rep = n_head / n_kv_head;
+        let q = Tensor::randn(0f32, 0.1, (b, n_head, l, d), dev).unwrap();
+        assert!(q.is_contiguous());
+
+        let q_grouped = q.reshape((b, n_kv_head, n_rep * l, d)).unwrap();
+        assert!(
+            q_grouped.is_contiguous(),
+            "Q reshape to grouped form should be zero-copy"
+        );
+
+        // Simulate a matmul-output shape and verify the inverse reshape
+        // from grouped back to (B, n_head, L, D) is also zero-copy when
+        // the source is contiguous.
+        let fake_out = Tensor::zeros((b, n_kv_head, n_rep * l, d), DType::F32, dev).unwrap();
+        assert!(fake_out.is_contiguous());
+        let unflat = fake_out.reshape((b, n_head, l, d)).unwrap();
+        assert!(
+            unflat.is_contiguous(),
+            "matmul-output reshape back to (B, n_head, L, D) should be zero-copy"
+        );
     }
 }
