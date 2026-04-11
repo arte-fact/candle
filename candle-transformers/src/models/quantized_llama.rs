@@ -300,15 +300,55 @@ impl LayerWeights {
             let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
             let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
 
-            let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
-            let att = match mask {
-                None => att,
-                Some(mask) => {
-                    let mask = mask.broadcast_as(att.shape())?;
-                    masked_fill(&att, &mask, &self.neg_inf)?
+            // Q0c: fuse scale + mask_add + softmax into one kernel on HIP.
+            // The TinyLlama mask is u8 (0 = attend, 1 = block); convert to
+            // f32 additive here (-inf where blocked) and reshape to
+            // (1, 1, seq_len, kv_len) so the fused kernel can consume it.
+            #[cfg(feature = "hip")]
+            let fused = matches!(q.device(), Device::Hip(_))
+                && q.dtype() == DType::F32
+                && q.is_contiguous()
+                && k.is_contiguous();
+            #[cfg(not(feature = "hip"))]
+            let fused = false;
+
+            let att = if fused {
+                #[cfg(feature = "hip")]
+                {
+                    // Build raw attention scores without the in-loop divide —
+                    // we fold `1/sqrt(d)` into the fused kernel's `scale`.
+                    let att_raw = q.matmul(&k.t()?)?;
+                    let scale = 1.0 / (self.head_dim as f64).sqrt();
+                    let mask_additive = match mask {
+                        None => Ok::<Option<Tensor>, candle::Error>(None),
+                        Some(m) => {
+                            let mdims = m.dims();
+                            let zero = Tensor::zeros(mdims, DType::F32, q.device())?;
+                            let neg = self.neg_inf.broadcast_as(mdims)?;
+                            let add = m.where_cond(&neg, &zero)?;
+                            let (a, b) = (mdims[0], mdims[1]);
+                            Some(add.reshape((1, 1, a, b))?.contiguous()).transpose()
+                        }
+                    }?;
+                    candle::hip_backend::masked_softmax_scale_fused(
+                        &att_raw,
+                        mask_additive.as_ref(),
+                        scale,
+                    )?
                 }
+                #[cfg(not(feature = "hip"))]
+                unreachable!()
+            } else {
+                let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
+                let att = match mask {
+                    None => att,
+                    Some(mask) => {
+                        let mask = mask.broadcast_as(att.shape())?;
+                        masked_fill(&att, &mask, &self.neg_inf)?
+                    }
+                };
+                candle_nn::ops::softmax_last_dim(&att)?
             };
-            let att = candle_nn::ops::softmax_last_dim(&att)?;
             // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?
         };

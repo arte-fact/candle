@@ -18,7 +18,9 @@ mod utils;
 pub use device::{HipDevice, DeviceId};
 pub use error::{HipError, WrapErr};
 pub use flash_attn::flash_attn_fused;
-pub use fused_pointwise::{l2_norm_fused, silu_mul_split_last_fused, softplus_fused};
+pub use fused_pointwise::{
+    l2_norm_fused, masked_softmax_scale_fused, silu_mul_split_last_fused, softplus_fused,
+};
 pub use gated_delta_net::gated_delta_net_step_fused;
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 

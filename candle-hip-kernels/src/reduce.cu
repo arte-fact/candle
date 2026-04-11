@@ -401,6 +401,97 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
     }
 }
 
+// Fused masked_softmax_scale: replaces the
+//   `attn_weights = attn_weights * scale`
+//   `attn_weights = attn_weights + mask`   (additive f32 mask)
+//   `attn_weights = softmax_last_dim(attn_weights)`
+// chain that sits between QK^T and SV in every attention block.
+// Eliminates 2 of the 3 kernel launches per layer (affine + broadcast_add)
+// and 2 full memory sweeps over the (B, H, L_q, L_k) score tensor.
+//
+// Input `x` shape: (B, H, L_q, L_k), contiguous, row-major. One row of
+// length L_k per (b, h, q).
+//
+// Mask layout: additive f32, broadcast via caller-provided strides:
+//   `mask_b_stride`  = elements to skip from one batch to the next
+//                      (0 for broadcast over B, L_q*L_k otherwise)
+//   `mask_lq_stride` = elements to skip from row q to row q+1
+//                      (0 for broadcast over L_q, L_k otherwise)
+// Pass nullptr for `mask` when there is no mask.
+//
+// Launch:
+//   grid  = (n_rows, 1, 1)              where n_rows = B * H * L_q
+//   block = (1, WARP_SIZE, 1)           one Wave64 warp per row
+//   block_dim.y = 64 so threadIdx.y handles cols {tid, tid+64, ...}
+template <typename T, typename ACC>
+__device__ void masked_softmax_scale(
+        const T * __restrict__ x,
+        const T * __restrict__ mask,
+        T * __restrict__ dst,
+        const int n_cols,
+        const int b_dim,
+        const int h_dim,
+        const int lq_dim,
+        const float scale,
+        const int mask_b_stride,
+        const int mask_lq_stride) {
+    const int row = blockDim.x*blockIdx.x + threadIdx.x;
+    const int block_size = blockDim.y;
+    const int tid = threadIdx.y;
+
+    // Decompose row index back to (b, q) so we can index the broadcast mask.
+    // Layout: row = ((b * H) + h) * L_q + q.
+    const int hq = h_dim * lq_dim;
+    const int b  = row / hq;
+    const int q  = row % lq_dim;
+
+    const T * mask_row = nullptr;
+    if (mask != nullptr) {
+        mask_row = mask
+                 + (long)b * (long)mask_b_stride
+                 + (long)q * (long)mask_lq_stride;
+    }
+
+    // --- Pass 1: compute max(scale * x + mask) across the row. ---
+    T max_val = reduce_init_lowest<T>();
+    for (int col = tid; col < n_cols; col += block_size) {
+        const int i = row*n_cols + col;
+        T s = x[i] * (T)scale;
+        if (mask_row != nullptr) {
+            s = s + mask_row[col];
+        }
+        max_val = maxg(max_val, s);
+    }
+    #pragma unroll
+    for (int m = WARP_SIZE / 2; m > 0; m >>= 1) {
+        max_val = maxg(max_val, __shfl_xor(max_val, m));
+    }
+
+    // --- Pass 2: compute exp(s - max), sum, write to dst. ---
+    ACC tmp = static_cast<ACC>(0);
+    for (int col = tid; col < n_cols; col += block_size) {
+        const int i = row*n_cols + col;
+        T s = x[i] * (T)scale;
+        if (mask_row != nullptr) {
+            s = s + mask_row[col];
+        }
+        const T val = expg(s - max_val);
+        tmp += static_cast<ACC>(val);
+        dst[i] = val;
+    }
+    #pragma unroll
+    for (int m = WARP_SIZE / 2; m > 0; m >>= 1) {
+        tmp += __shfl_xor(tmp, m);
+    }
+
+    // --- Pass 3: normalise. ---
+    const ACC inv_tmp = static_cast<ACC>(1) / tmp;
+    for (int col = tid; col < n_cols; col += block_size) {
+        const int i = row*n_cols + col;
+        dst[i] = static_cast<T>(static_cast<ACC>(dst[i]) * inv_tmp);
+    }
+}
+
 template <typename T>
 __device__ void ropei(const T * src, const T * cos, const T * sin, T * dst, const uint32_t bh, const uint32_t td, const uint32_t stride_b) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -728,6 +819,17 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     softmax<TYPENAME, ACC_TYPENAME>(src, dst, n_cols);                         \
   }                                                                            \
 
+#define MASKED_SOFTMAX_SCALE_OP(TYPENAME, ACC_TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME(                                          \
+      const TYPENAME *src, const TYPENAME *mask, TYPENAME *dst,                \
+      const int n_cols, const int b_dim, const int h_dim, const int lq_dim,   \
+      const float scale,                                                       \
+      const int mask_b_stride, const int mask_lq_stride) {                     \
+    masked_softmax_scale<TYPENAME, ACC_TYPENAME>(                              \
+        src, mask, dst, n_cols, b_dim, h_dim, lq_dim,                          \
+        scale, mask_b_stride, mask_lq_stride);                                 \
+  }                                                                            \
+
 #define RMSNORM_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME(                                          \
       const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
@@ -812,6 +914,7 @@ SUM_OP(double, sum_f64)
 SUM_OP(uint32_t, sum_u32)
 SOFTMAX_OP(float, float, softmax_f32)
 SOFTMAX_OP(double, double, softmax_f64)
+MASKED_SOFTMAX_SCALE_OP(float, float, masked_softmax_scale_f32)
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 RMSNORM_ADD_OP(float, rmsnorm_add_f32)

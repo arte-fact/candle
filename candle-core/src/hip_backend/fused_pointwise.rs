@@ -19,6 +19,7 @@
 //! — each of the 10+ sub-100-ms ops that make up the 913 ms pointwise
 //! category.
 
+use crate::backend::BackendDevice;
 use crate::op::BackpropOp;
 use crate::{DType, Device, Result, Shape, Storage, Tensor};
 use hipdarc::driver::LaunchConfig;
@@ -196,6 +197,183 @@ pub fn silu_mul_split_last_fused(gate_up: &Tensor) -> Result<Tensor> {
     Ok(Tensor::from_storage(
         Storage::Hip(out_storage),
         <Shape as From<Vec<usize>>>::from(out_shape),
+        BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
+/// Fused masked softmax + scale.
+///
+/// Replaces the
+/// ```text
+///   att = att * scale
+///   att = att + mask            // broadcast_add, additive f32 mask
+///   att = softmax_last_dim(att)
+/// ```
+/// chain that appears in every attention forward after QK^T, saving 2
+/// kernel launches and 2 full memory sweeps over the
+/// `(B, H, L_q, L_k)` score tensor. The kernel folds the scale-multiply
+/// and mask-add into pass 1 of a 3-pass online-softmax, so there is a
+/// single store of the final output.
+///
+/// # Shapes
+/// - `att` shape `(B, H, L_q, L_k)`, contiguous, f32.
+/// - `mask` optional f32, broadcast-compatible with `(B, 1, L_q, L_k)`.
+///   Supported: `(1, 1, 1, L_k)`, `(1, 1, L_q, L_k)`, `(B, 1, 1, L_k)`,
+///   `(B, 1, L_q, L_k)`. Must be contiguous when provided.
+///
+/// # Returns
+/// A fresh `(B, H, L_q, L_k)` f32 tensor = softmax(att * scale + mask).
+///
+/// # Errors
+/// Any precondition failure (non-HIP, non-f32, non-contiguous, wrong
+/// mask shape) returns an error so callers can fall through to the
+/// chained tensor-ops path.
+pub fn masked_softmax_scale_fused(
+    att: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor> {
+    let dev = match att.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("masked_softmax_scale_fused: att must be on HIP"),
+    };
+    if att.dtype() != DType::F32 {
+        crate::bail!(
+            "masked_softmax_scale_fused: att must be f32, got {:?}",
+            att.dtype()
+        );
+    }
+    if !att.is_contiguous() {
+        crate::bail!("masked_softmax_scale_fused: att must be contiguous");
+    }
+    let (b_sz, n_head, l_q, l_k) = att.dims4()?;
+
+    if let Some(m) = mask {
+        if !matches!(m.device(), Device::Hip(d) if d.same_device(&dev)) {
+            crate::bail!("masked_softmax_scale_fused: mask not on same HIP device");
+        }
+        if m.dtype() != DType::F32 {
+            crate::bail!(
+                "masked_softmax_scale_fused: mask must be f32, got {:?}",
+                m.dtype()
+            );
+        }
+        if !m.is_contiguous() {
+            crate::bail!("masked_softmax_scale_fused: mask must be contiguous");
+        }
+    }
+
+    // Derive (mask_b_stride, mask_lq_stride) from the mask shape. Mirrors
+    // the pattern used by `flash_attn_fused`.
+    let (mask_b_stride, mask_lq_stride): (i32, i32) = match mask {
+        None => (0, 0),
+        Some(m) => {
+            let mdims = m.dims();
+            let last = *mdims.last().ok_or_else(|| {
+                crate::Error::Msg("masked_softmax_scale_fused: mask has empty shape".into())
+            })?;
+            if last != l_k {
+                crate::bail!(
+                    "masked_softmax_scale_fused: mask last dim {last} != L_k {l_k}"
+                );
+            }
+            let second_last = if mdims.len() >= 2 {
+                mdims[mdims.len() - 2]
+            } else {
+                1
+            };
+            let lq_stride: i32 = if second_last == l_q {
+                l_k as i32
+            } else if second_last == 1 {
+                0
+            } else {
+                crate::bail!(
+                    "masked_softmax_scale_fused: mask second-to-last dim {second_last} not 1 or L_q {l_q}"
+                );
+            };
+            let mask_batch_dim = if mdims.len() >= 4 { mdims[0] } else { 1 };
+            let b_stride: i32 = if mask_batch_dim == b_sz {
+                (second_last * l_k) as i32
+            } else if mask_batch_dim == 1 {
+                0
+            } else {
+                crate::bail!(
+                    "masked_softmax_scale_fused: mask batch dim {mask_batch_dim} not 1 or B {b_sz}"
+                );
+            };
+            (b_stride, lq_stride)
+        }
+    };
+
+    // --- Storage handles --------------------------------------------
+    let (a_st, a_l) = att.storage_and_layout();
+    let a_hip = match &*a_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("masked_softmax_scale_fused: att storage is not HIP"),
+    };
+    let a_slice = a_hip.as_hip_slice::<f32>()?;
+    let a_view = match a_l.contiguous_offsets() {
+        Some((lo, hi)) => a_slice.slice(lo..hi),
+        None => crate::bail!("masked_softmax_scale_fused: att non-contiguous"),
+    };
+
+    let mask_owned = mask.map(|m| m.storage_and_layout());
+    let mask_view_owned = mask_owned.as_ref().map(|(st, l)| {
+        let hip_st = match &**st {
+            Storage::Hip(s) => s,
+            _ => panic!("masked_softmax_scale_fused: mask not HIP (checked above)"),
+        };
+        let slice = hip_st.as_hip_slice::<f32>().expect("as_hip_slice");
+        let (lo, hi) = l.contiguous_offsets().expect("contiguous");
+        slice.slice(lo..hi)
+    });
+
+    let numel = b_sz * n_head * l_q * l_k;
+    // SAFETY: populated by the kernel below.
+    let out = unsafe { dev.alloc::<f32>(numel)? };
+
+    let func = dev.get_or_load_func("masked_softmax_scale_f32", &kernels::REDUCE)?;
+
+    // Match the existing `softmax_f32` launch geometry: one Wave64 warp
+    // per row, with `block_dim.y` providing the WARP_SIZE lanes.
+    let n_rows = (b_sz * n_head * l_q) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows, 1, 1),
+        block_dim: (1, WARP_SIZE, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&a_view);
+    if let Some(mv) = mask_view_owned.as_ref() {
+        builder.arg(mv);
+    } else {
+        builder.arg(&hipdarc::driver::NullDevicePtr::default());
+    }
+    builder.arg(&out);
+    let n_cols_arg = l_k as i32;
+    let b_arg = b_sz as i32;
+    let h_arg = n_head as i32;
+    let lq_arg = l_q as i32;
+    let scale_arg = scale as f32;
+    builder.arg(&n_cols_arg);
+    builder.arg(&b_arg);
+    builder.arg(&h_arg);
+    builder.arg(&lq_arg);
+    builder.arg(&scale_arg);
+    builder.arg(&mask_b_stride);
+    builder.arg(&mask_lq_stride);
+    // SAFETY: ffi — shapes/dtype/contig validated above.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(a_st);
+    drop(mask_owned);
+
+    let out_storage = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        <Shape as From<(usize, usize, usize, usize)>>::from((b_sz, n_head, l_q, l_k)),
         BackpropOp::none(),
         /* is_variable */ false,
     ))

@@ -111,12 +111,46 @@ fn gqa_attention(
     // Un-flatten for scale + mask + softmax: (B, n_kv_head, n_rep*L, T) →
     // (B, n_head, L, T). Zero-copy because the matmul output is contiguous.
     let attn_weights = attn_weights.reshape((b_sz, n_head, seq_len, t_k))?;
-    let attn_weights = (attn_weights * attn_scale)?;
-    let attn_weights = match mask {
-        Some(m) => attn_weights.broadcast_add(m)?,
-        None => attn_weights,
+
+    // Q0c: fuse `scale + mask_add + softmax_last_dim` into a single HIP
+    // launch when preconditions allow. The fused kernel only supports
+    // f32 + contiguous + broadcast-compatible (B|1, 1, L_q|1, L_k) masks.
+    // Everything else falls through to the unfused tensor-op chain.
+    let attn_weights = {
+        #[cfg(feature = "hip")]
+        {
+            let mask_ok = mask
+                .map(|m| {
+                    m.is_contiguous()
+                        && m.dtype() == candle::DType::F32
+                        && matches!(m.device(), candle::Device::Hip(_))
+                })
+                .unwrap_or(true);
+            if matches!(attn_weights.device(), candle::Device::Hip(_))
+                && attn_weights.dtype() == candle::DType::F32
+                && attn_weights.is_contiguous()
+                && mask_ok
+            {
+                candle::hip_backend::masked_softmax_scale_fused(&attn_weights, mask, attn_scale)?
+            } else {
+                let s = (attn_weights * attn_scale)?;
+                let m = match mask {
+                    Some(m) => s.broadcast_add(m)?,
+                    None => s,
+                };
+                candle_nn::ops::softmax_last_dim(&m)?
+            }
+        }
+        #[cfg(not(feature = "hip"))]
+        {
+            let s = (attn_weights * attn_scale)?;
+            let m = match mask {
+                Some(m) => s.broadcast_add(m)?,
+                None => s,
+            };
+            candle_nn::ops::softmax_last_dim(&m)?
+        }
     };
-    let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
 
     // Re-group for V matmul: (B, n_head, L, T) → (B, n_kv_head, n_rep*L, T).
     let attn_weights_grouped =
@@ -868,6 +902,140 @@ mod tests {
                 max_abs < 1e-4,
                 "flash_attn HIP vs CPU oracle drift on {:?}: max_abs={max_abs}",
                 (b_sz, n_head, n_kv_head, l_q, l_k, d, use_mask)
+            );
+        }
+    }
+
+    /// Q0c regression: fused masked_softmax_scale on HIP must match the
+    /// chained `att * scale + mask → softmax_last_dim(att)` reference.
+    /// Covers the three common broadcast shapes for `mask` and the
+    /// "no mask" decode case.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_masked_softmax_scale_matches_chain() {
+        let dev_hip = match Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        // (B, H, L_q, L_k, mask_shape_kind)
+        // mask_shape_kind: 0=None, 1=(1,1,1,Lk), 2=(1,1,Lq,Lk),
+        //                  3=(B,1,1,Lk), 4=(B,1,Lq,Lk)
+        let cases: &[(usize, usize, usize, usize, u8)] = &[
+            (1, 4, 4, 4, 0),
+            (1, 4, 4, 4, 2),
+            (1, 8, 16, 16, 2),
+            (2, 8, 8, 8, 4),
+            (1, 32, 1, 1024, 0),
+            (1, 32, 1, 1024, 1),
+            (1, 32, 1, 1024, 3),
+            (2, 8, 4, 32, 4),
+        ];
+
+        for &(b_sz, n_head, l_q, l_k, mask_kind) in cases {
+            let numel = b_sz * n_head * l_q * l_k;
+            let att_vals: Vec<f32> = (0..numel)
+                .map(|i| ((i as f32) * 0.00073).sin() * 0.5)
+                .collect();
+            let att_hip = Tensor::from_slice(
+                &att_vals,
+                (b_sz, n_head, l_q, l_k),
+                &dev_hip,
+            )
+            .unwrap();
+
+            let mask_hip: Option<Tensor> = match mask_kind {
+                0 => None,
+                1 => {
+                    let mv: Vec<f32> = (0..l_k)
+                        .map(|i| if i > l_k / 2 { f32::NEG_INFINITY } else { 0.0 })
+                        .collect();
+                    Some(Tensor::from_slice(&mv, (1, 1, 1, l_k), &dev_hip).unwrap())
+                }
+                2 => {
+                    let mut mv = vec![0.0f32; l_q * l_k];
+                    for qi in 0..l_q {
+                        for ki in 0..l_k {
+                            if ki > qi + (l_k - l_q) {
+                                mv[qi * l_k + ki] = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                    Some(Tensor::from_slice(&mv, (1, 1, l_q, l_k), &dev_hip).unwrap())
+                }
+                3 => {
+                    let mut mv = vec![0.0f32; b_sz * l_k];
+                    for bi in 0..b_sz {
+                        for ki in 0..l_k {
+                            if ki >= l_k - bi {
+                                mv[bi * l_k + ki] = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                    Some(Tensor::from_slice(&mv, (b_sz, 1, 1, l_k), &dev_hip).unwrap())
+                }
+                4 => {
+                    let mut mv = vec![0.0f32; b_sz * l_q * l_k];
+                    for bi in 0..b_sz {
+                        for qi in 0..l_q {
+                            for ki in 0..l_k {
+                                if ki > qi + (l_k - l_q) {
+                                    mv[(bi * l_q + qi) * l_k + ki] = f32::NEG_INFINITY;
+                                }
+                            }
+                        }
+                    }
+                    Some(Tensor::from_slice(&mv, (b_sz, 1, l_q, l_k), &dev_hip).unwrap())
+                }
+                _ => None,
+            };
+
+            let scale = 1.0 / (l_k as f64).sqrt();
+
+            // Reference: the unfused chain.
+            let ref_out = {
+                let scaled = (&att_hip * scale).unwrap();
+                let masked = match mask_hip.as_ref() {
+                    Some(m) => scaled.broadcast_add(m).unwrap(),
+                    None => scaled,
+                };
+                candle_nn::ops::softmax_last_dim(&masked).unwrap()
+            };
+
+            // Fused.
+            let fused_out = candle::hip_backend::masked_softmax_scale_fused(
+                &att_hip,
+                mask_hip.as_ref(),
+                scale,
+            )
+            .unwrap();
+
+            let ref_vals: Vec<f32> = ref_out
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let fused_vals: Vec<f32> = fused_out
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(ref_vals.len(), fused_vals.len());
+
+            let max_abs = ref_vals
+                .iter()
+                .zip(fused_vals.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 1e-5,
+                "masked_softmax_scale drift on (B={b_sz}, H={n_head}, Lq={l_q}, Lk={l_k}, kind={mask_kind}): max_abs={max_abs}"
             );
         }
     }
