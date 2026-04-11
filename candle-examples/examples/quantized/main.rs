@@ -631,6 +631,21 @@ fn main() -> anyhow::Result<()> {
             LogitsProcessor::from_sampling(args.seed, sampling)
         };
 
+        // Q2: warmup pass to trigger rocBLAS Tensile JIT and the
+        // candle module loading for every shape the real run will hit.
+        // Mirrors `llama-bench`'s default warmup (which is why its
+        // `--no-warmup` runs show huge variance). Without this, the
+        // reported "prompt processed t/s" includes hundreds of ms of
+        // one-shot JIT cost on the first Cijk call, tanking the ratio
+        // vs turbo.
+        {
+            let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0)?;
+            // One decode step to JIT the (batch, 1, k, T) shape too.
+            let input1 = Tensor::new(&prompt_tokens[..1], &device)?.unsqueeze(0)?;
+            let _ = model.forward(&input1, prompt_tokens.len())?;
+            device.synchronize()?;
+        }
         let start_prompt_processing = std::time::Instant::now();
         let mut next_token = if !args.split_prompt {
             let input = Tensor::new(prompt_tokens.as_slice(), &device)?.unsqueeze(0)?;

@@ -238,6 +238,21 @@ fn main() -> anyhow::Result<()> {
         LogitsProcessor::from_sampling(args.seed, sampling)
     };
 
+    // Q2: warmup pass to force rocBLAS Tensile JIT + module loading
+    // out of the timed window. Mirrors `llama-bench`'s default warmup.
+    // Skip for recurrent/split-prompt models where the warmup would
+    // double the prompt-processing cost for no benefit (GDN state is
+    // built up per token and JIT cost is smaller relative to that
+    // recurrent work).
+    if !(args.split_prompt || model.is_recurrent()) {
+        let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
+        let _ = model.forward(&input, 0)?;
+        let input1 = Tensor::new(&tokens[..1], &device)?.unsqueeze(0)?;
+        let _ = model.forward(&input1, tokens.len())?;
+        model.clear_kv_cache();
+        device.synchronize()?;
+    }
+
     // Prompt processing — for GDN models, split_prompt processes one token at a time
     // to properly build up the recurrent state
     let start_gen = std::time::Instant::now();

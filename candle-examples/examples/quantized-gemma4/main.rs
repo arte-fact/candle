@@ -165,6 +165,16 @@ fn main() -> anyhow::Result<()> {
         LogitsProcessor::from_sampling(args.seed, sampling)
     };
 
+    // Q2: warmup pass to force rocBLAS Tensile JIT out of the timed
+    // window. Mirrors `llama-bench`'s default warmup.
+    {
+        let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
+        let _ = model.forward(&input, 0)?;
+        let input1 = Tensor::new(&tokens[..1], &device)?.unsqueeze(0)?;
+        let _ = model.forward(&input1, tokens.len())?;
+        model.clear_kv_cache();
+        device.synchronize()?;
+    }
     let start_gen = std::time::Instant::now();
     let input = Tensor::new(tokens, &device)?.unsqueeze(0)?;
     let logits = model.forward(&input, 0)?;
