@@ -652,9 +652,24 @@ impl DeltaNetLayer {
     }
 }
 
-/// Softplus activation: log(1 + exp(x))
+/// Softplus activation: log(1 + exp(x)).
+///
+/// On HIP with contiguous f32 inputs, lowers to a single fused kernel
+/// launch via `candle::hip_backend::softplus_fused`. On every other
+/// backend (or non-contiguous HIP input) it falls back to the
+/// numerically-stable 6-op tensor chain below. Both paths compute
+/// `max(x, 0) + log1p(exp(-|x|))` which is exact and overflow-safe.
 fn softplus(x: &Tensor) -> Result<Tensor> {
-    // For numerical stability: softplus(x) = max(x, 0) + log(1 + exp(-|x|))
+    #[cfg(feature = "hip")]
+    {
+        if matches!(x.device(), candle::Device::Hip(_))
+            && x.dtype() == candle::DType::F32
+            && x.is_contiguous()
+        {
+            return candle::hip_backend::softplus_fused(x);
+        }
+    }
+    // Fallback: the pre-Phase-4 tensor-op chain.
     let abs_x = x.abs()?;
     let max_x = x.maximum(&x.zeros_like()?)?;
     let stable = (abs_x.neg()?.exp()? + 1.0)?.log()?;
@@ -857,6 +872,54 @@ mod tests {
         assert!((vals[3] - 10.0).abs() < 1e-3);
         // softplus(-10) ≈ 0 (for large negative x)
         assert!(vals[4] < 1e-3);
+    }
+
+    /// P4 regression: HIP fused softplus kernel must match the CPU
+    /// tensor-op chain (`max(x,0) + log1p(exp(-|x|))`) within FMA
+    /// rounding on every element.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_softplus_matches_cpu() {
+        let dev_hip = match candle::Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let dev_cpu = candle::Device::Cpu;
+        // Wide range: includes the underflow and overflow regimes so
+        // the numerical-stability rewrite is exercised end-to-end.
+        let xs: Vec<f32> = (-200..200)
+            .map(|i| (i as f32) * 0.5)
+            .collect();
+        let x_cpu = Tensor::from_slice(&xs, xs.len(), &dev_cpu).unwrap();
+        let x_hip = Tensor::from_slice(&xs, xs.len(), &dev_hip).unwrap();
+        let out_cpu: Vec<f32> = softplus(&x_cpu).unwrap().to_vec1().unwrap();
+        let out_hip: Vec<f32> = softplus(&x_hip)
+            .unwrap()
+            .to_device(&dev_cpu)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(out_cpu.len(), out_hip.len());
+        let max_abs = out_cpu
+            .iter()
+            .zip(out_hip.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // Tolerance: 1e-5 absolute + 1e-5 relative. The log1p(exp)
+        // formulation is identical between the CPU chain and the
+        // HIP kernel, so drift should be zero to FMA rounding.
+        let max_rel = out_cpu
+            .iter()
+            .zip(out_hip.iter())
+            .map(|(a, b)| if b.abs() > 1e-6 { (a - b).abs() / b.abs() } else { 0.0 })
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-5 || max_rel < 1e-5,
+            "softplus HIP vs CPU drift: max_abs={max_abs}, max_rel={max_rel}"
+        );
     }
 
     #[test]

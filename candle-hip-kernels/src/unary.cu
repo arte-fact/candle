@@ -262,3 +262,89 @@ SILU_MUL_OP(float,         silu_mul_f32)
 SILU_MUL_OP(double,        silu_mul_f64)
 SILU_MUL_OP(__half,        silu_mul_f16)
 SILU_MUL_OP(hip_bfloat16,  silu_mul_bf16)
+
+// ---------------------------------------------------------------------------
+// Fused softplus: out[i] = log(1 + exp(x[i])), numerically stable form
+//     softplus(x) = max(x, 0) + log1p(exp(-|x|))
+// ---------------------------------------------------------------------------
+//
+// Replaces the 6-op tensor chain in
+// `candle-transformers/src/models/quantized_blocks/delta_net.rs::softplus`
+// (abs, zeros_like, maximum, neg, exp, +1, log, +) with a single fused
+// pointwise kernel. Called per GDN layer in every decode step, so
+// fusion saves ~8 launches per call + the 6 intermediate buffers.
+//
+// The numerically-stable form is important: for large positive x,
+// `exp(x)` overflows in fp32 at ~88.7, so the direct `log(1 + exp(x))`
+// is only usable for x ≲ 16. The `max(x, 0) + log1p(exp(-|x|))`
+// rewrite is exact (both forms are analytically equal) and holds
+// across the full fp32 range.
+
+#define SOFTPLUS_OP(TYPENAME, FN_NAME, EXP_FN, LOG1P_FN)                       \
+extern "C" __global__ void FN_NAME(                                            \
+    const size_t numel,                                                        \
+    const TYPENAME *__restrict__ in,                                           \
+    TYPENAME *__restrict__ out                                                 \
+) {                                                                            \
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;               \
+         i < numel;                                                            \
+         i += blockDim.x * gridDim.x) {                                        \
+        const TYPENAME x = in[i];                                              \
+        const TYPENAME ax = fabsf(x);                                          \
+        const TYPENAME mx = (x > (TYPENAME)0) ? x : (TYPENAME)0;               \
+        out[i] = mx + LOG1P_FN(EXP_FN(-ax));                                   \
+    }                                                                          \
+}
+
+SOFTPLUS_OP(float, softplus_f32, expf, log1pf)
+
+// ---------------------------------------------------------------------------
+// Fused L2 normalisation along the last dimension:
+//     out[row, i] = x[row, i] / sqrt(Σ_i x[row, i]² + eps)
+// ---------------------------------------------------------------------------
+//
+// Replaces the 5-op tensor chain in
+// `candle-transformers/src/models/quantized_blocks/norms.rs::l2_norm`
+// (sqr, sum_keepdim, +eps, sqrt, broadcast_div) with a single fused
+// kernel. Used by GDN for Q/K head normalisation — called per layer
+// per forward step.
+//
+// Block = 64 threads (one Wave64). Grid = one block per row.
+// Each block reduces its row's sum-of-squares via warp shuffle, then
+// broadcasts the inverse norm to all lanes. Supports arbitrary row
+// length (multi-pass loop if row_len > 64).
+
+#define L2_NORM_OP(TYPENAME, FN_NAME, SQRT_FN)                                 \
+extern "C" __global__ void FN_NAME(                                            \
+    const size_t row_len,                                                      \
+    const TYPENAME eps,                                                        \
+    const TYPENAME *__restrict__ in,                                           \
+    TYPENAME *__restrict__ out                                                 \
+) {                                                                            \
+    const int row = blockIdx.x;                                                \
+    const int lane = threadIdx.x;                                              \
+    const TYPENAME *row_in  = in  + (size_t)row * row_len;                     \
+    TYPENAME       *row_out = out + (size_t)row * row_len;                     \
+                                                                               \
+    /* Pass 1: compute Σ x² across the row. */                                 \
+    TYPENAME partial = (TYPENAME)0;                                            \
+    for (size_t i = lane; i < row_len; i += blockDim.x) {                      \
+        const TYPENAME v = row_in[i];                                          \
+        partial += v * v;                                                      \
+    }                                                                          \
+    /* Warp reduce to lane 0, then broadcast back via shfl.                    \
+     * gfx906 __shfl_xor works across the full 64-lane wavefront. */           \
+    _Pragma("unroll")                                                          \
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {                     \
+        partial += __shfl_xor(partial, mask);                                  \
+    }                                                                          \
+    const TYPENAME inv_norm = (TYPENAME)1 / SQRT_FN(partial + eps);            \
+                                                                               \
+    /* Pass 2: scale-and-store. inv_norm is identical across all lanes         \
+     * after the full-warp reduction, so every lane has the same value. */    \
+    for (size_t i = lane; i < row_len; i += blockDim.x) {                      \
+        row_out[i] = row_in[i] * inv_norm;                                     \
+    }                                                                          \
+}
+
+L2_NORM_OP(float, l2_norm_f32, sqrtf)

@@ -98,7 +98,23 @@ pub fn v_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
 
 /// L2 normalization along the last dimension.
 /// Used by delta net for Q/K normalization.
+///
+/// On HIP with contiguous f32 inputs, lowers to a single fused kernel
+/// launch via `candle::hip_backend::l2_norm_fused`. Otherwise falls
+/// back to the 5-op tensor chain (sqr + sum_keepdim + add_eps + sqrt
+/// + broadcast_div). Both paths are mathematically identical.
 pub fn l2_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
+    #[cfg(feature = "hip")]
+    {
+        if matches!(x.device(), candle::Device::Hip(_))
+            && x.dtype() == DType::F32
+            && x.is_contiguous()
+            && x.rank() >= 1
+        {
+            return candle::hip_backend::l2_norm_fused(x, eps);
+        }
+    }
+    // Fallback: the pre-Phase-4 tensor-op chain.
     let x_sq = x.sqr()?;
     let sum_sq = x_sq.sum_keepdim(D::Minus1)?;
     let norm = (sum_sq + eps)?.sqrt()?;
@@ -196,5 +212,55 @@ mod tests {
         assert!((vals[0] - 1.0).abs() < 1e-4);
         assert!(vals[1].abs() < 1e-4);
         assert!(vals[2].abs() < 1e-4);
+    }
+
+    /// P4 regression: HIP fused l2_norm kernel must match the CPU
+    /// tensor-op chain `x / sqrt(Σ x² + eps)` within FMA rounding on
+    /// every element. Covers multiple shapes: small (D=32), the
+    /// qwen35 head_k_dim (D=128), and an odd non-multiple of 64
+    /// (D=96) to exercise the kernel's strided-loop fallback.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_l2_norm_matches_cpu() {
+        let dev_hip = match Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let dev_cpu = Device::Cpu;
+
+        for (n_rows, d) in [(8usize, 32usize), (16, 128), (32, 96), (64, 256)] {
+            // Deterministic small-magnitude rows.
+            let vals: Vec<f32> = (0..n_rows * d)
+                .map(|i| ((i as f32) * 0.0001).sin() * 0.3)
+                .collect();
+            let x_cpu = Tensor::from_slice(&vals, (n_rows, d), &dev_cpu).unwrap();
+            let x_hip = Tensor::from_slice(&vals, (n_rows, d), &dev_hip).unwrap();
+            let eps = 1e-6;
+            let out_cpu: Vec<f32> =
+                l2_norm(&x_cpu, eps).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            let out_hip: Vec<f32> = l2_norm(&x_hip, eps)
+                .unwrap()
+                .to_device(&dev_cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(out_cpu.len(), out_hip.len(), "shape ({n_rows},{d})");
+            let max_abs = out_cpu
+                .iter()
+                .zip(out_hip.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // Reduction order differs between CPU (sequential) and HIP
+            // (warp-shuffle butterfly), so allow a little FMA slack.
+            assert!(
+                max_abs < 1e-5,
+                "l2_norm HIP vs CPU drift on ({n_rows},{d}): max_abs={max_abs}"
+            );
+        }
     }
 }
