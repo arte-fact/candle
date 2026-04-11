@@ -58,7 +58,7 @@ const KV_CACHE_INITIAL: usize = 4096;
 /// - `mask`: optional broadcast-compatible with `(B, n_head, L, T)`
 ///
 /// Returns attention output with shape `(B, n_head, L, D)`.
-fn gqa_attention(
+pub(crate) fn gqa_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,
@@ -70,14 +70,14 @@ fn gqa_attention(
     debug_assert_eq!(n_head % n_kv_head, 0, "n_head must be divisible by n_kv_head");
     let n_rep = n_head / n_kv_head;
 
-    // P2: HIP flash-attention fast path. Replaces the
-    // `matmul + softmax + matmul` chain with a single kernel launch
-    // when all inputs are HIP / f32 / contiguous and the head dim is
-    // one of the supported instantiations ({64, 128}). Falls through
-    // to the rocBLAS path for non-HIP, non-f32, or unsupported shapes.
+    // P2: HIP flash-attention fast path — OPT-IN via CANDLE_FLASH_ATTN_ENABLE.
+    // The v1 BR=1 kernel is ~17× slower per-call than rocBLAS on our
+    // shapes; infrastructure stays in tree for future BR≥4 work. See
+    // `BENCH-P2-FLASH-ATTN-v1-2026-04-11.md` for the postmortem.
     #[cfg(feature = "hip")]
     {
-        if matches!(q.device(), candle::Device::Hip(_))
+        if std::env::var("CANDLE_FLASH_ATTN_ENABLE").is_ok()
+            && matches!(q.device(), candle::Device::Hip(_))
             && q.dtype() == candle::DType::F32
             && q.is_contiguous()
             && k.is_contiguous()
