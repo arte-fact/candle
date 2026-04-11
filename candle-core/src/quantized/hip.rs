@@ -405,6 +405,108 @@ fn launch_mul_mat_vec_q8_1_chunk(
     Ok(())
 }
 
+/// Phase 2b/2d MMQ: single-launch quantized × Q8_1 matrix matmul for the
+/// `b*m ≥ 9` prefill path on gfx906.
+///
+/// Replaces `mul_mat_via_q8_1_chunked`'s `ceil(total_b / 8)` vector launches
+/// with one launch of a dtype-specific `mul_mat_<dtype>_gfx906_v2` kernel.
+/// Each kernel owns one output row per thread, 64 threads per Wave64 block,
+/// TILE_N=8 columns per block. Correctness-equivalent to the chunked path
+/// to within Q4_0/Q4_1/Q8_0 × Q8_1 quantization tolerance.
+///
+/// Supported dtypes (Phase 2d): `Q4_0`, `Q4_1`, `Q8_0`. K-quants still fall
+/// through to the chunked path until Phase 2f. The launcher returns `None`
+/// when the dtype isn't supported so the caller can fall back.
+///
+/// Input `y`: f32 `(total_b, ncols)` row-major. Output: f32 `(total_b, nrows)`
+/// row-major — same layout as `mul_mat_via_q8_1_chunked` so call sites don't
+/// need to care which path serviced the request.
+#[allow(clippy::too_many_arguments)]
+fn mul_mat_q_v2(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    // Pick the kernel by dtype. Phase 2d covers Q4_0/Q4_1/Q8_0; everything
+    // else still falls through to the chunked-vector path.
+    let kernel_name = match dtype {
+        GgmlDType::Q4_0 => "mul_mat_q4_0_gfx906_v2",
+        GgmlDType::Q4_1 => "mul_mat_q4_1_gfx906_v2",
+        GgmlDType::Q8_0 => "mul_mat_q8_0_gfx906_v2",
+        _ => return Ok(None),
+    };
+
+    let data_elems = data.len / dtype.type_size() * dtype.block_size();
+    if data_elems < ncols * nrows {
+        crate::bail!(
+            "mul_mat_q_v2: unexpected data size {}, ncols {ncols} nrows {nrows}",
+            data_elems
+        )
+    }
+    if y.len() != ncols * total_b {
+        crate::bail!(
+            "mul_mat_q_v2: unexpected y size {}, ncols {ncols} total_b {total_b}",
+            y.len()
+        )
+    }
+    if total_b == 0 {
+        return Ok(Some(HipStorage::wrap_hip_slice(
+            dev.alloc_zeros::<f32>(0)?,
+            dev.clone(),
+        )));
+    }
+
+    // 1. Quantize all `total_b` input rows to q8_1 in one shot. The layout
+    //    produced by `quantize_q8_1` is column-major blocks: `y_q8_1[col * blocks_per_col_y + ib]`
+    //    which is exactly what the kernel expects.
+    let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+    let q8_1_type_size = GgmlDType::Q8_1.type_size();
+    let q8_1_block_size = GgmlDType::Q8_1.block_size();
+    let bytes_per_row = ncols_padded / q8_1_block_size * q8_1_type_size;
+    let y_size_in_bytes = total_b * bytes_per_row;
+    let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
+    quantize_q8_1(y, &mut y_q8_1, ncols, total_b, dev)?;
+
+    // 2. Allocate output buffer — row-major `(total_b, nrows)`, matching the
+    //    chunked path's convention.
+    let dst = dev.alloc_zeros::<f32>(total_b * nrows)?;
+
+    // 3. Launch. Grid covers `ceil(nrows / 64)` Y-tiles × `ceil(total_b / 8)`
+    //    X-tiles (one Wave64 warp per tile). Block is a single 64-thread warp.
+    const TILE_M: usize = 64;
+    const TILE_N: usize = 8;
+    let func = dev.get_or_load_func(kernel_name, &candle_hip_kernels::QUANTIZED)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(nrows, TILE_M) as u32,
+            ceil_div(total_b, TILE_N) as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(/* vx */ &data.inner);
+    builder.arg(/* vy */ &y_q8_1);
+    builder.arg(/* dst */ &dst);
+    barg!(
+        builder,
+        /* ncols_x */ ncols as i32,
+        /* nrows_x */ nrows as i32,
+        /* ncols_y */ total_b as i32,
+        /* nrows_y */ ncols_padded as i32,
+        /* nrows_dst */ nrows as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
+}
+
 /// Quantized matrix-matrix multiply built by chunking the input into
 /// `b_size <= 8` slices and dispatching the well-tested vector kernel
 /// (`mul_mat_vec_<dtype>_q8_1_cuda<b_size>`) for each chunk.
@@ -1061,13 +1163,14 @@ impl QHipStorage {
             crate::bail!("mismatch on matmul dim {self_shape:?} {:?}", layout.shape())
         }
 
-        // The integer-MMQ matrix kernels (`mul_mat_via_q8_1` → `mul_mat_q*`)
-        // produce wrong results on gfx906 once `b*m >= 9` (catastrophic
-        // divergence, garbages qwen3 multi-token prefill — see task #22).
-        // Until those kernels are fixed/replaced (the upstream `mul_mat_q`
-        // rewrite is much larger), `mul_mat_via_q8_1_chunked` chunks the
-        // call into multiple `mul_mat_vec_*_q8_1_cuda<bsize>` launches,
-        // each ≤ 8 rows wide. The vector path is well-tested and correct.
+        // Phase 2b/2d MMQ dispatch. For Q4_0/Q4_1/Q8_0 with `b*m >= 9` we use
+        // the new single-launch `mul_mat_<dtype>_gfx906_v2` kernels. Smaller
+        // batches still use the chunked-vector path (correct, already fast).
+        // K-quants fall through to the chunked path until Phase 2f.
+        //
+        // The old broken `mul_mat_q*` kernels (task #22) are kept in the HSACO
+        // for now but are not dispatched — when the full stream-K port lands
+        // they'll be deleted.
         let storage = storage.as_hip_slice::<f32>()?;
         let storage = match layout.contiguous_offsets() {
             Some((o1, o2)) => storage.slice(o1..o2),
@@ -1076,15 +1179,40 @@ impl QHipStorage {
             }
             .bt())?,
         };
-        let out = mul_mat_via_q8_1_chunked(
-            &self.data,
-            &storage,
-            self.dtype,
-            /* ncols */ k,
-            /* nrows */ n,
-            /* total_b */ b * m,
-            self.device(),
-        )?;
+        let total_b = b * m;
+        let out = if total_b >= 9 {
+            if let Some(out) = mul_mat_q_v2(
+                &self.data,
+                &storage,
+                self.dtype,
+                /* ncols */ k,
+                /* nrows */ n,
+                total_b,
+                self.device(),
+            )? {
+                out
+            } else {
+                mul_mat_via_q8_1_chunked(
+                    &self.data,
+                    &storage,
+                    self.dtype,
+                    k,
+                    n,
+                    total_b,
+                    self.device(),
+                )?
+            }
+        } else {
+            mul_mat_via_q8_1_chunked(
+                &self.data,
+                &storage,
+                self.dtype,
+                k,
+                n,
+                total_b,
+                self.device(),
+            )?
+        };
 
         let mut out_shape = layout.shape().dims().to_vec();
         out_shape.pop();
@@ -1212,6 +1340,170 @@ mod test {
         )?;
         let vs = hip_storage.as_hip_slice::<f32>()?;
         let _vs = dev.clone_dtoh(vs)?;
+        Ok(())
+    }
+
+    /// Helper: quantize an f32 weight matrix `(nrows × ncols)` to the given
+    /// Q4_0 / Q4_1 / Q8_0 dtype, upload to HIP as a `PaddedHipSlice`, and
+    /// return the wrapper needed by the launcher functions.
+    fn make_q_weight(
+        dev: &HipDevice,
+        weight_f32: &[f32],
+        nrows: usize,
+        ncols: usize,
+        dtype: GgmlDType,
+    ) -> Result<PaddedHipSlice> {
+        use crate::quantized::k_quants::{BlockQ4_0, BlockQ4_1, BlockQ8_0};
+        assert_eq!(weight_f32.len(), nrows * ncols);
+        assert!(ncols % 32 == 0, "block-quant requires ncols % 32 == 0");
+
+        // Quantize on CPU via the existing block types.
+        let (data_bytes_vec, type_size) = match dtype {
+            GgmlDType::Q4_0 => {
+                let mut blocks: Vec<BlockQ4_0> = vec![BlockQ4_0::zeros(); nrows * ncols / 32];
+                BlockQ4_0::from_float(weight_f32, &mut blocks);
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        blocks.as_ptr() as *const u8,
+                        core::mem::size_of_val(blocks.as_slice()),
+                    )
+                }
+                .to_vec();
+                (bytes, GgmlDType::Q4_0.type_size())
+            }
+            GgmlDType::Q4_1 => {
+                let mut blocks: Vec<BlockQ4_1> = vec![BlockQ4_1::zeros(); nrows * ncols / 32];
+                BlockQ4_1::from_float(weight_f32, &mut blocks);
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        blocks.as_ptr() as *const u8,
+                        core::mem::size_of_val(blocks.as_slice()),
+                    )
+                }
+                .to_vec();
+                (bytes, GgmlDType::Q4_1.type_size())
+            }
+            GgmlDType::Q8_0 => {
+                let mut blocks: Vec<BlockQ8_0> = vec![BlockQ8_0::zeros(); nrows * ncols / 32];
+                BlockQ8_0::from_float(weight_f32, &mut blocks);
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        blocks.as_ptr() as *const u8,
+                        core::mem::size_of_val(blocks.as_slice()),
+                    )
+                }
+                .to_vec();
+                (bytes, GgmlDType::Q8_0.type_size())
+            }
+            _ => crate::bail!("make_q_weight: unsupported dtype {dtype:?}"),
+        };
+
+        let padded_len = data_bytes_vec.len() + MATRIX_ROW_PADDING * type_size / 32;
+        let mut inner = dev.alloc_zeros::<u8>(padded_len)?;
+        dev.stream().memcpy_htod(&mut inner, &data_bytes_vec).w()?;
+        Ok(PaddedHipSlice {
+            inner,
+            len: data_bytes_vec.len(),
+        })
+    }
+
+    /// Phase 2b/2d regression test: `mul_mat_q_v2` must agree with the
+    /// chunked-vector path on every (dtype, shape) combination below.
+    /// `m = 9` is the critical boundary — this is where the old
+    /// `mul_mat_q<QK4_0, ...>` kernel produced catastrophic divergence
+    /// (task #22).
+    #[test]
+    fn hip_mmq_v2_matches_chunked() -> Result<()> {
+        let dev = HipDevice::new(0)?;
+
+        // (m, n, k) — cover the regression target m=9, plus a spread of
+        // realistic prefill shapes. K is divisible by 32 for Q4_0/Q4_1/Q8_0.
+        let shapes: &[(usize, usize, usize)] = &[
+            (9, 64, 128),    // boundary
+            (9, 1024, 4096), // qwen35-9B projection shape
+            (16, 64, 128),
+            (16, 1024, 4096),
+            (17, 128, 256),  // non-aligned m
+            (64, 64, 128),
+            (128, 2048, 2048),
+            (512, 1024, 4096), // pp512 prefill
+        ];
+        let dtypes = [GgmlDType::Q4_0, GgmlDType::Q4_1, GgmlDType::Q8_0];
+
+        for &dtype in &dtypes {
+            for &(m, n, k) in shapes {
+                // Deterministic weights and inputs. Small magnitudes so
+                // quantization noise stays well below 1.0.
+                let weight_f32: Vec<f32> = (0..n * k)
+                    .map(|i| ((i as f32) * 0.0001).sin() * 0.3)
+                    .collect();
+                let input_f32: Vec<f32> = (0..m * k)
+                    .map(|i| ((i as f32) * 0.0003).cos() * 0.3)
+                    .collect();
+
+                let data = make_q_weight(&dev, &weight_f32, n, k, dtype)?;
+                let y_dev = dev.clone_htod(&input_f32)?;
+
+                // New single-launch path.
+                let out_v2 = mul_mat_q_v2(
+                    &data,
+                    &y_dev.slice(0..y_dev.len()),
+                    dtype,
+                    /* ncols */ k,
+                    /* nrows */ n,
+                    /* total_b */ m,
+                    &dev,
+                )?
+                .unwrap_or_else(|| panic!("mul_mat_q_v2 should return Some for {dtype:?}"));
+
+                // Known-good chunked-vector path (same inputs).
+                let out_chunk = mul_mat_via_q8_1_chunked(
+                    &data,
+                    &y_dev.slice(0..y_dev.len()),
+                    dtype,
+                    k,
+                    n,
+                    m,
+                    &dev,
+                )?;
+
+                let v2_cpu = dev.clone_dtoh(out_v2.as_hip_slice::<f32>()?)?;
+                let chunk_cpu = dev.clone_dtoh(out_chunk.as_hip_slice::<f32>()?)?;
+                assert_eq!(
+                    v2_cpu.len(),
+                    chunk_cpu.len(),
+                    "length mismatch for {dtype:?} {:?}",
+                    (m, n, k)
+                );
+
+                // Both paths quantize Y to Q8_1 the same way and use the same
+                // per-block formulas (the v2 kernels were written to match
+                // `vec_dot_<dtype>_q8_1_impl`). The only drift source is FMA
+                // accumulation rounding — for the chunked path each row sum
+                // is computed across half-warp threads with a shuffle reduce,
+                // while v2 does it sequentially in one thread. Allow 1e-4
+                // absolute + 1e-3 relative.
+                let mut max_abs = 0.0f32;
+                let mut max_rel = 0.0f32;
+                let mut ref_max = 0.0f32;
+                for (a, b) in v2_cpu.iter().zip(chunk_cpu.iter()) {
+                    let diff = (a - b).abs();
+                    if diff > max_abs {
+                        max_abs = diff;
+                    }
+                    ref_max = ref_max.max(b.abs());
+                    if b.abs() > 1e-6 {
+                        max_rel = max_rel.max(diff / b.abs());
+                    }
+                }
+                assert!(
+                    max_abs < 1e-4 + 1e-3 * ref_max,
+                    "mmq_v2 vs chunked mismatch for {dtype:?} at {:?}: \
+                     max_abs={max_abs} max_rel={max_rel} ref_max={ref_max}",
+                    (m, n, k)
+                );
+            }
+        }
         Ok(())
     }
 }

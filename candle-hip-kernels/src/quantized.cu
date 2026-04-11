@@ -4744,3 +4744,365 @@ extern "C" __global__ void indexed_moe_forward_f16_f32(
         }
     }
 }
+
+// =============================================================================
+// Phase 2b MMQ — clean Q4_0 × Q8_1 matrix matmul for gfx906 Wave64.
+//
+// The old `mul_mat_q<QK4_0, ...>` template at line 315 is numerically broken on
+// gfx906 for `b*m >= 9` (catastrophic divergence; see task #22 and the comment
+// block in `candle-core/src/quantized/hip.rs::dequantize_matmul`). Until the
+// full stream-K MMQ rewrite is in place (Phase 2c/2e), this kernel provides a
+// single-launch path for prefill matmuls that the chunked-vector fallback has
+// been covering with `ceil(L/8)` separate launches.
+//
+// Design:
+//   - One Wave64 warp per M-tile of 64 rows × TILE_N cols.
+//   - Each thread owns one output row (threadIdx.x ∈ [0, 64)) and TILE_N cols.
+//   - Iterates all K blocks in registers; no LDS staging. Y (Q8_1) blocks are
+//     shared within the warp and hit the GCN L1 cache (64 B line) on each
+//     iteration — 64 threads reading the same Y block = 1 cache line read.
+//   - Uses hardware dp4a (`v_dot4_i32_i8`) via `ggml_cuda_dp4a` for the K
+//     reduction, 8 per Q4_0 block (4 low-nibble + 4 high-nibble).
+//   - No stream-K, no fixup kernel. That's Phase 2c.
+//
+// Grid: `(ceil(x_rows/64), ceil(y_cols/TILE_N), 1)`
+// Block: `(64, 1, 1)`
+//
+// Output layout matches the existing broken kernel so the Rust launcher stays
+// drop-in compatible: column-major with `dst[col*nrows_dst + row]`.
+// =============================================================================
+
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;  // 64 rows per tile
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;                // 0..63
+
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_0 * x = (const block_q4_0 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK4_0;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    // Iterate K-dim blocks (32 elements each for both Q4_0 and Q8_1).
+    //
+    // Per-block output formula (matches `vec_dot_q4_0_q8_1_impl` at line 1701):
+    //
+    //     output += d4 * (d8 * sumi_unsigned - 8 * ds.y)
+    //
+    // where
+    //   - `sumi_unsigned = Σ q_4i * q_8i` with Q4 quants kept **unsigned**
+    //     (range [0, 15]) and Q8_1 quants signed int8,
+    //   - `d4 = bx->d` is the Q4_0 block scale,
+    //   - `d8 = by->ds.x` is the Q8_1 block scale,
+    //   - `ds.y` is the Q8_1 "original-float sum" field (set by
+    //     `quantize_q8_1` at line 3455 to `Σ xi` of the unquantised input).
+    //
+    // It's tempting to pre-subtract 8 from the Q4 nibbles and skip the
+    // `ds.y` correction — that's mathematically equivalent **only if**
+    // `ds.y == d8 * Σ q_8i`. But Q8_1's `ds.y` stores the original float
+    // sum, which differs from `d8 * Σ q_8i` by the Q8_1 rounding error.
+    // Pre-subtracting would match a CPU int-only reference but diverges
+    // from every other Q4_0 path in this file (chunked-vector,
+    // dequantize_mul_mat_vec, upstream mmvq) by ~1e-2. So we match the
+    // in-tree convention instead.
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        int x_lo[4] = {0, 0, 0, 0};
+        int x_hi[4] = {0, 0, 0, 0};
+        float scale_x = 0.0f;
+
+        if (row_valid) {
+            const block_q4_0 * bx = &x[row * blocks_per_row_x + ib];
+            scale_x = __half2float(bx->d);
+
+            // `block_q4_0` is `{ half d; uint8_t qs[16]; }` → 18 bytes exactly.
+            // Every other block's qs starts at a 2-byte-aligned address, so a
+            // raw `(const int*)bx->qs` cast may fault. Use the codebase's
+            // `get_int_from_uint8` helper which does two 2-byte loads and
+            // assembles the int32, identical to how the upstream mmvq kernels
+            // access Q4_0 quants (see line 2170 in this file).
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = get_int_from_uint8(bx->qs, j);
+                // Keep the nibbles **unsigned** — the "-8" bias is corrected
+                // analytically via `ds.y` below. Elements 0..15 are in the
+                // low nibble of qs[0..16]; elements 16..31 are in the high
+                // nibble of the same bytes.
+                x_lo[j] = p & 0x0F0F0F0F;
+                x_hi[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            if (col >= ncols_y) {
+                break;
+            }
+
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float2 ds8f = __half22float2(by->ds);
+            const float d8 = ds8f.x;
+            const float s8 = ds8f.y;
+
+            // Load 32 int8 quants as 8 int32s. First 4 map to elements [0..16),
+            // second 4 map to elements [16..32), matching x_lo / x_hi.
+            const int * y_packed = (const int *) by->qs;
+
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+            }
+
+            // Per-block contribution with the upstream Q4_0/Q8_1 formula.
+            // vdr = 4 (we consumed the full Q4_0 block = 4 int32s on the X
+            // side), QI4_0 = 4, so the upstream `(8 * vdr / QI4_0)` constant
+            // is exactly 8. Match `vec_dot_q4_0_q8_1_impl` at line 1719.
+            sums[c] += scale_x * (sumi * d8 - 8.0f * s8);
+        }
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    // Column-major writeback: dst[col*nrows_dst + row].
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q4_0_gfx906_v2(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    // TILE_N = 8: each block computes a 64×8 output tile, matching the grid
+    // assumptions in the Rust launcher (`ceil_div(y_cols, 8)` for the Y grid dim).
+    mul_mat_q4_0_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// =============================================================================
+// Phase 2d — Q4_1 × Q8_1 matrix matmul for gfx906.
+//
+// Q4_1 differs from Q4_0 in two ways:
+//   1. Asymmetric quantization: `x_i = q_i * d + m` where `dm = {d, m}` is
+//      stored as `half2`. The nibbles stay unsigned [0, 15].
+//   2. Per-block output formula is:
+//         out += d4*d8*sumi_unsigned + m4*s8
+//      (matches `vec_dot_q4_1_q8_1_impl` at line 1725 for a full-block vdr=4:
+//       `sumi * d4d8 + m4s8 / (QI8_1 / (vdr*QR4_1)) = sumi*d4d8 + m4s8 / 1`.)
+//
+// `block_q4_1` is `{ half2 dm; uint8_t qs[16]; }` → 20 bytes, so `qs` is always
+// 4-byte aligned within each block (dm is 4 bytes); no need for the
+// `get_int_from_uint8` two-half trick.
+// =============================================================================
+
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_1 * x = (const block_q4_1 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK4_1;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        int x_lo[4] = {0, 0, 0, 0};
+        int x_hi[4] = {0, 0, 0, 0};
+        float d4 = 0.0f;
+        float m4 = 0.0f;
+
+        if (row_valid) {
+            const block_q4_1 * bx = &x[row * blocks_per_row_x + ib];
+            const float2 dm4f = __half22float2(bx->dm);
+            d4 = dm4f.x;
+            m4 = dm4f.y;
+
+            // qs is 4-byte aligned (dm is at offset 0, qs at offset 4).
+            const int * q4_packed = (const int *) bx->qs;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q4_packed[j];
+                x_lo[j] = p & 0x0F0F0F0F;
+                x_hi[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            if (col >= ncols_y) {
+                break;
+            }
+
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float2 ds8f = __half22float2(by->ds);
+            const float d8 = ds8f.x;
+            const float s8 = ds8f.y;
+
+            const int * y_packed = (const int *) by->qs;
+
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+            }
+
+            // Per-block contribution: `sumi * d4*d8 + m4*s8`.
+            // Matches `vec_dot_q4_1_q8_1_impl` for vdr=4 (full block), where
+            // the upstream divisor `QI8_1/(vdr*QR4_1) = 8/(4*2) = 1`.
+            sums[c] += sumi * d4 * d8 + m4 * s8;
+        }
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q4_1_gfx906_v2(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_1_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// =============================================================================
+// Phase 2d — Q8_0 × Q8_1 matrix matmul for gfx906.
+//
+// Q8_0 is the simplest: signed int8 quants with a single scale per block.
+//   x_i = q_i * d   (q_i ∈ [-128, 127], already signed)
+//   out += d8_x * d8_y * Σ q_xi * q_yi
+//
+// No bias correction — matches `vec_dot_q8_0_q8_1_impl` at line 1828.
+//
+// `block_q8_0` is `{ half d; int8_t qs[32]; }` → 34 bytes, so qs alternates
+// between 2-byte and 4-byte alignment. Use `get_int_from_int8` via the
+// existing helper to do two 2-byte loads per int32.
+// =============================================================================
+
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q8_0_gfx906_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q8_0 * x = (const block_q8_0 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK8_0;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        int x_q[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        float d8_x = 0.0f;
+
+        if (row_valid) {
+            const block_q8_0 * bx = &x[row * blocks_per_row_x + ib];
+            d8_x = __half2float(bx->d);
+
+            // qs is 2-byte aligned (half d at offset 0, qs at offset 2).
+            // Use the two-half helper to safely assemble int32s.
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                x_q[j] = get_int_from_int8(bx->qs, j);
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            if (col >= ncols_y) {
+                break;
+            }
+
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float d8_y = __half2float(__low2half(by->ds));
+
+            const int * y_packed = (const int *) by->qs;
+
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                sumi = ggml_cuda_dp4a(x_q[j], y_packed[j], sumi);
+            }
+
+            // Per-block: `d8_x * d8_y * sumi`. Matches `vec_dot_q8_0_q8_1_impl`
+            // at line 1828.
+            sums[c] += d8_x * d8_y * (float) sumi;
+        }
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q8_0_gfx906_v2(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q8_0_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
