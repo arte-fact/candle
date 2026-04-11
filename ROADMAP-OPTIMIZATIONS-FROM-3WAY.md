@@ -75,6 +75,29 @@ Each item lists **source repo**, **target candle file**, **which dispatch catego
 
 **Already planned**: Phase 2c/2e of `/home/sandbox/.claude/plans/synchronous-drifting-allen.md`. This is the next chunk of that plan after the working Phase 2b/2d landed.
 
+#### Phase 2d status (2026-04-11): partial win, full port deferred
+
+Phase 2c (widening TILE_N from 8 → 32) landed in commit `6ff79d62` and gave +34 % prefill on its own — a single template parameter change. Phase 2d (LDS staging + multi-warp block) was attempted and produced a **null result** in the row-per-thread framework we've been using (`BENCH-P1-PHASE-2D-NULL-2026-04-11.md`):
+
+- 2-warp row-split block, no LDS: 0 % — block scheduling isn't the bottleneck
+- 2-warp col-split block + X-tile LDS: **−80 %** — `__syncthreads()` overhead, warp 1 idle during load, and LDS adds no reuse because each row is only read by one thread (L1 already handles the cross-block X caching)
+- Explicit `int4` vectorised X load: flat — compiler was already emitting `dwordx4` for the `__restrict__ + unroll` scalar loop
+
+**The real lever is a different work distribution.** Turbo's MMQ has each thread own a small 2-D output sub-tile (e.g. 2 rows × 4 cols), with multiple warps per block collaboratively loading X and Y tiles into LDS. In that layout every thread NEEDS data from multiple rows, so LDS-hosted X is genuinely reused across threads (not just "cached something we'd already load"). Cross-warp sharing of the packed Y tile (`block_q8_1_mmq` format) cuts Y DRAM traffic by a factor of `mmq_x/warp_size` as well.
+
+**To outperform turbo on prefill MMQ, Phase 2d-rewrite needs:**
+1. **Thread output decomposition**: 2-D sub-tile per thread (2×4 or 4×4 outputs), not one row per thread. Each thread accumulates into `sum[sub_rows][sub_cols]`, reads X from multiple rows via LDS, reads Y from multiple cols via LDS.
+2. **Collaborative LDS staging of both X and Y**: all `nwarps × warp_size` threads in the block load fragments of the current K-tile into LDS, sync, compute, sync, repeat.
+3. **New Y format**: port `block_q8_1_mmq` (128 int8 + 4 int32 scales per 4-block row) and add a `quantize_q8_1_mmq` kernel that produces it. Avoids the per-block header scatter in standard `block_q8_1`.
+4. **Double-buffered K iteration**: while compute runs on LDS tile `kb`, load tile `kb+1` into the other LDS half. Hides K-dimension memory latency.
+5. **Vectorised Y loads** via `global_load_dwordx4` inline asm, as in `gfx906/matmul/mmq-prefetch.cuh`. Essential when the Y tile load is on the critical path.
+
+Expected post-rewrite: per-call **2–3 ms** (matching turbo) → prefill **~450 t/s on qwen35-9B** (at parity), and with further Phase 2e tuning (async prefetch, DPP reductions, LDS bank-conflict minimisation) potentially **exceeding turbo** by 10-20 %. This is where the "outperform turbo" headline lives.
+
+**Estimated SLOC for the full rewrite**: ~1000–1500 lines of HIP + ~200 lines Rust launcher + ~150 lines Y-quantize kernel. Matches approximately the scope of turbo's `load_tiles_q4_1` + `vec_dot_q4_1_q8_1_dp4a` + `mul_mat_q_process_tile` + Y-mmq-quantize path, minus stream-K/fixup (which isn't needed for our shape regime — see `BENCH-P1-2026-04-11.md` "TILE_N=32 sweet spot"). 1–2 days of careful work.
+
+**When to do it**: after all the low-hanging wins are gone (P3 copy audit, maybe a Q2_K / Q6_K port for other models). Current candle prefill is 73 % of turbo's; Phase 2d-rewrite is the lever to cross 100 %.
+
 ---
 
 ### P2 — Custom flash-attention-style kernel (replace rocBLAS attention path)
