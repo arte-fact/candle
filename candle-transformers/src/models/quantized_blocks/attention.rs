@@ -75,8 +75,15 @@ fn gqa_attention(
     // n_rep Q sub-heads that share each KV head into one batch matrix row.
     let q_grouped = q.reshape((b_sz, n_kv_head, n_rep * seq_len, head_dim))?;
 
-    // K^T view: (B, n_kv_head, T, D) → (B, n_kv_head, D, T). One materialisation
-    // on a tensor that is `n_rep×` smaller than the old `broadcast_kv` result.
+    // K^T view: (B, n_kv_head, T, D) → (B, n_kv_head, D, T). **One**
+    // materialisation on a tensor that is `n_rep×` smaller than the
+    // old `broadcast_kv` result.
+    //
+    // Empirically on gfx906: dropping the `.contiguous()` and relying
+    // on `gemm_config`'s stride-detected `GemmOp::Trans` path (which
+    // IS supported) regresses prefill by 7 % because rocBLAS/Tensile
+    // picks a different (slower) kernel for the transposed case on
+    // our prefill shapes. Keep the materialisation.
     let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
 
     // Batched matmul: batch = B * n_kv_head, each is (n_rep*L, D) × (D, T).
