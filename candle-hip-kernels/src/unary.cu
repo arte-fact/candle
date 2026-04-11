@@ -264,6 +264,57 @@ SILU_MUL_OP(__half,        silu_mul_f16)
 SILU_MUL_OP(hip_bfloat16,  silu_mul_bf16)
 
 // ---------------------------------------------------------------------------
+// Fused gate/up split + silu_mul:
+//     input shape  (..., 2*N)
+//     output shape (..., N)
+//     out[i, j] = silu(in[i, j]) * in[i, j + N]    for j in [0, N)
+// ---------------------------------------------------------------------------
+//
+// P3: replaces the `narrow(..,0,N).contiguous() + narrow(..,N,N).contiguous()
+// + silu_mul(gate, up)` chain in DenseMlp::forward — 2 `.contiguous()`
+// materialisations plus a fused silu_mul kernel (3 launches total),
+// plus 2 full-size intermediate f32 buffers. This variant reads the
+// already-fused `gate_up` projection output directly from one
+// contiguous buffer, skipping the splits entirely.
+//
+// `numel` is the OUTPUT element count (== input elem count / 2).
+// `stride_row` is the full input last-dim size (= 2*N), and
+// `out_stride_row` is the output last-dim size (= N). Both are
+// required because each logical "row" of the input is twice as long
+// as the corresponding output row.
+//
+// On qwen35-9B dense decode: 40 layers × 128 tokens = 5120 calls per
+// session. Saves 2 × 5120 = 10 240 `ucopy_f32` launches + 2 buffer
+// allocations per call.
+
+#define SILU_MUL_SPLIT_LAST_OP(TYPENAME, FN_NAME)                              \
+extern "C" __global__ void FN_NAME(                                            \
+    const size_t numel,       /* output element count == N * outer */         \
+    const size_t half_row,    /* N — per-row half dim */                      \
+    const TYPENAME *__restrict__ gate_up,                                      \
+    TYPENAME *__restrict__ out                                                 \
+) {                                                                            \
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;               \
+         i < numel;                                                            \
+         i += blockDim.x * gridDim.x) {                                        \
+        /* Map flat output index `i` to (row, col) with col in [0, N).        \
+           The matching input indices are:                                    \
+             gate = in[row * 2N + col]                                         \
+             up   = in[row * 2N + N + col]                                     \
+           where row = i / N and col = i % N. */                              \
+        const size_t row = i / half_row;                                       \
+        const size_t col = i - row * half_row;                                 \
+        const size_t in_gate = row * (half_row * 2) + col;                     \
+        const size_t in_up   = in_gate + half_row;                             \
+        const TYPENAME g = gate_up[in_gate];                                   \
+        const TYPENAME u = gate_up[in_up];                                     \
+        out[i] = silu_fwd(g) * u;                                              \
+    }                                                                          \
+}
+
+SILU_MUL_SPLIT_LAST_OP(float, silu_mul_split_last_f32)
+
+// ---------------------------------------------------------------------------
 // Fused softplus: out[i] = log(1 + exp(x[i])), numerically stable form
 //     softplus(x) = max(x, 0) + log1p(exp(-|x|))
 // ---------------------------------------------------------------------------

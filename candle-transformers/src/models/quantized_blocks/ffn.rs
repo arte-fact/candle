@@ -102,9 +102,25 @@ impl Module for DenseMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Single fused gate+up matmul. Output: (B, L, 2*intermediate)
         let gate_up = self.gate_up.forward(x)?;
-        // Split into gate and up halves along the last dim. The
-        // narrows are non-contiguous views into the same buffer; the
-        // fused silu_mul kernel works against contiguous inputs so we
+
+        // P3: on HIP with SiLU, dispatch to `silu_mul_split_last_fused`
+        // which reads the fused `gate_up` buffer directly — no
+        // `.narrow().contiguous()` materialisations, no intermediate
+        // gate/up f32 tensors. Drops 2 ucopy_f32 launches per FFN
+        // per layer per token (~10k per qwen35-9B decode session).
+        #[cfg(feature = "hip")]
+        if matches!(gate_up.device(), candle::Device::Hip(_))
+            && gate_up.dtype() == candle::DType::F32
+            && gate_up.is_contiguous()
+            && matches!(self.activation, MlpActivation::Silu)
+        {
+            let activated = candle::hip_backend::silu_mul_split_last_fused(&gate_up)?;
+            return self.down.forward(&activated);
+        }
+
+        // Fallback: narrow + contiguous + fused silu_mul. The narrows
+        // are non-contiguous views into the same buffer; the fused
+        // silu_mul kernel works against contiguous inputs so we
         // materialize once via .contiguous().
         let gate = gate_up
             .narrow(D::Minus1, 0, self.intermediate_size)?

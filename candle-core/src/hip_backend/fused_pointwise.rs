@@ -105,6 +105,102 @@ pub fn softplus_fused(x: &Tensor) -> Result<Tensor> {
     ))
 }
 
+/// Fused gate/up split + silu_mul:
+/// `out[..., j] = silu(gate_up[..., j]) * gate_up[..., j + N]` for j in [0, N).
+///
+/// Replaces the
+/// `narrow(..,0,N).contiguous() + narrow(..,N,N).contiguous() + silu_mul`
+/// chain in `DenseMlp::forward` with a single kernel launch that reads
+/// the fused `gate_up` projection output directly from one contiguous
+/// buffer. Saves 2 `.contiguous()` materialisations per FFN per layer
+/// per token — on qwen35-9B decode that's ~10 240 ucopy_f32 launches
+/// eliminated per session.
+///
+/// # Requirements
+/// - `gate_up` must be on a HIP device, contiguous, and f32.
+/// - `gate_up.dims().last()` must be even (the dim gets halved).
+///
+/// # Returns
+/// A fresh f32 tensor with the same shape as `gate_up` except the last
+/// dim is halved.
+pub fn silu_mul_split_last_fused(gate_up: &Tensor) -> Result<Tensor> {
+    let dev = match gate_up.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("silu_mul_split_last_fused: input must be on HIP"),
+    };
+    if gate_up.dtype() != DType::F32 {
+        crate::bail!(
+            "silu_mul_split_last_fused: input must be f32, got {:?}",
+            gate_up.dtype()
+        );
+    }
+    if !gate_up.is_contiguous() {
+        crate::bail!("silu_mul_split_last_fused: input must be contiguous");
+    }
+    let dims = gate_up.dims();
+    let last = *dims
+        .last()
+        .ok_or_else(|| crate::Error::Msg("silu_mul_split_last_fused: empty shape".into()))?;
+    if last % 2 != 0 {
+        crate::bail!(
+            "silu_mul_split_last_fused: last dim must be even, got {last}"
+        );
+    }
+    let half_row = last / 2;
+    let out_numel: usize = dims[..dims.len() - 1].iter().product::<usize>() * half_row;
+    if out_numel == 0 {
+        let mut shape = dims.to_vec();
+        shape[dims.len() - 1] = half_row;
+        return Tensor::zeros(shape, DType::F32, gate_up.device());
+    }
+
+    let (x_st, x_l) = gate_up.storage_and_layout();
+    let x_hip = match &*x_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("silu_mul_split_last_fused: storage is not HIP"),
+    };
+    let x_slice = x_hip.as_hip_slice::<f32>()?;
+    let x_view = match x_l.contiguous_offsets() {
+        Some((lo, hi)) => x_slice.slice(lo..hi),
+        None => crate::bail!("silu_mul_split_last_fused: non-contiguous storage"),
+    };
+
+    // SAFETY: populated by the kernel below.
+    let out = unsafe { dev.alloc::<f32>(out_numel)? };
+
+    let func = dev.get_or_load_func("silu_mul_split_last_f32", &kernels::UNARY)?;
+
+    const BLOCK: u32 = 256;
+    let grid = ((out_numel as u32) + BLOCK - 1) / BLOCK;
+    let cfg = LaunchConfig {
+        grid_dim: (grid.max(1), 1, 1),
+        block_dim: (BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    let numel_arg = out_numel;
+    let half_row_arg = half_row;
+    builder.arg(&numel_arg);
+    builder.arg(&half_row_arg);
+    builder.arg(&x_view);
+    builder.arg(&out);
+    // SAFETY: ffi — shape / dtype / contiguous validated above.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(x_st);
+
+    let mut out_shape: Vec<usize> = dims.to_vec();
+    out_shape[dims.len() - 1] = half_row;
+    let out_storage = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        <Shape as From<Vec<usize>>>::from(out_shape),
+        BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
 /// Fused L2 normalisation along the last axis:
 /// `out[..., i] = x[..., i] / sqrt(Σ_i x[..., i]² + eps)`.
 ///
