@@ -5051,6 +5051,335 @@ mul_mat_q4_1_gfx906_v2_tile64(
     mul_mat_q4_1_gfx906_impl<64>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// ===========================================================================
+// Phase 2d-lane — clamp-row variant of the Q4_1 MMQ kernel.
+//
+// Post-PMC finding (BENCH-PMC-VALU-VMEM-2026-04-11.md): the v2 tile32
+// kernel has ~574 `v_readlane/v_writelane` instructions — 27 % of its
+// total instruction count — which is lane-scratch register spilling
+// and the likely cause of the flat 49 % VALUUtilization.
+//
+// The tile8 variant has ZERO lane moves. Something about the combined
+// register pressure of TILE_N≥16 + the `if (row_valid)` branch in the
+// per-K-block body pushes the compiler into this spill pattern.
+//
+// This variant removes the `if (row_valid)` gate by clamping `row` to
+// `min(row, nrows_x - 1)`. All threads always load X and always compute
+// dp4a; out-of-bounds threads are only masked off at the final writeback.
+// Wasted work per tile is at most 3/64 = 4.7 % (for nrows_x=1149 and
+// tile_m=64). If the hypothesis is right, the lane-move count drops
+// significantly and VALUUtilization rises.
+// ===========================================================================
+
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_clamp(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+
+    const int row_raw = tile_m + tid;
+    // Clamp so every thread always reads valid memory. The OOB lanes
+    // will compute wasted dp4a sums which are discarded at writeback.
+    const int row = row_raw < nrows_x ? row_raw : (nrows_x - 1);
+
+    const block_q4_1 * x = (const block_q4_1 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK4_1;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        // Unconditional X load — no branch. The compiler should be
+        // able to pipeline this with the per-col dp4a chain more
+        // aggressively than the branch-gated version.
+        const block_q4_1 * bx = &x[row * blocks_per_row_x + ib];
+        const float2 dm4f = __half22float2(bx->dm);
+        const float d4 = dm4f.x;
+        const float m4 = dm4f.y;
+
+        const int * q4_packed = (const int *) bx->qs;
+        int x_lo[4], x_hi[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int p = q4_packed[j];
+            x_lo[j] = p & 0x0F0F0F0F;
+            x_hi[j] = (p >> 4) & 0x0F0F0F0F;
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            if (col >= ncols_y) {
+                break;
+            }
+
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float2 ds8f = __half22float2(by->ds);
+            const float d8 = ds8f.x;
+            const float s8 = ds8f.y;
+
+            const int * y_packed = (const int *) by->qs;
+
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+            }
+
+            sums[c] += sumi * d4 * d8 + m4 * s8;
+        }
+    }
+
+    // Writeback with the one remaining OOB gate. Only the actual
+    // in-bounds rows persist.
+    if (row_raw >= nrows_x) {
+        return;
+    }
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row_raw < nrows_dst) {
+            dst[col * nrows_dst + row_raw] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q4_1_gfx906_v2c_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_1_gfx906_impl_clamp<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// ===========================================================================
+// Phase 2d — hoisted col-bounds-check variant of the Q4_1 MMQ kernel.
+//
+// The disassembly of v2_tile32 showed 574 lane-scratch ops (27 % of
+// total) which turned out to be the compiler's implementation of
+// `if (col >= ncols_y) break;` inside the 32-iteration #pragma-unrolled
+// col loop. Because the unroll is compile-time, the compiler can't emit
+// a dynamic break — instead it computes a per-iteration validity
+// bitmask into a VGPR via writelane/readlane and predicates each col's
+// body accordingly. This adds ~18 lane-scratch ops per unrolled col
+// (32 cols × ~18 = 574).
+//
+// This variant hoists the bounds check: interior col tiles where
+// `tile_n + TILE_N <= ncols_y` (wave-uniform) run a NO-CHECK fast path
+// that the compiler can vectorise cleanly. Only boundary tiles run
+// the original per-col-checked slow path.
+//
+// Interior tiles are > 94 % of the total for a 1149 × 1024 matmul
+// (35 of 36 col tiles hit the fast path), so this should drop the
+// dominant lane-move overhead almost completely.
+// ===========================================================================
+
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_v2d(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_1 * x = (const block_q4_1 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK4_1;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    // Wave-uniform branch on whether this col-tile is fully in-bounds.
+    // When true, the per-col `if (col >= ncols_y) break` can be
+    // eliminated entirely, which removes the lane-scratch predicate
+    // pattern the compiler emits for partial unrolled loops.
+    const bool full_tile_n = (tile_n + TILE_N <= ncols_y);
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        int x_lo[4] = {0, 0, 0, 0};
+        int x_hi[4] = {0, 0, 0, 0};
+        float d4 = 0.0f;
+        float m4 = 0.0f;
+
+        if (row_valid) {
+            const block_q4_1 * bx = &x[row * blocks_per_row_x + ib];
+            const float2 dm4f = __half22float2(bx->dm);
+            d4 = dm4f.x;
+            m4 = dm4f.y;
+
+            const int * q4_packed = (const int *) bx->qs;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q4_packed[j];
+                x_lo[j] = p & 0x0F0F0F0F;
+                x_hi[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        if (full_tile_n) {
+            // Fast path: no per-col bounds check.
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int col = tile_n + c;
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+                const float2 ds8f = __half22float2(by->ds);
+                const float d8 = ds8f.x;
+                const float s8 = ds8f.y;
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+                }
+                sums[c] += sumi * d4 * d8 + m4 * s8;
+            }
+        } else {
+            // Boundary path: keep the per-col break. Same body as
+            // the original v2_tile32 kernel.
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int col = tile_n + c;
+                if (col >= ncols_y) {
+                    break;
+                }
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+                const float2 ds8f = __half22float2(by->ds);
+                const float d8 = ds8f.x;
+                const float s8 = ds8f.y;
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+                }
+                sums[c] += sumi * d4 * d8 + m4 * s8;
+            }
+        }
+    }
+
+    if (!row_valid) {
+        return;
+    }
+
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q4_1_gfx906_v2d_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_1_gfx906_impl_v2d<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// Variant with ONLY the fast path — no per-col bounds check at all.
+// Requires the caller to round up total_b to a multiple of TILE_N=32
+// and pad the Y Q8_1 buffer so OOB reads get zeros. Tests and interior
+// tiles hit this path; boundary tiles fall back to v2_tile32.
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_fast(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_1 * x = (const block_q4_1 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK4_1;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        int x_lo[4] = {0, 0, 0, 0};
+        int x_hi[4] = {0, 0, 0, 0};
+        float d4 = 0.0f, m4 = 0.0f;
+
+        if (row_valid) {
+            const block_q4_1 * bx = &x[row * blocks_per_row_x + ib];
+            const float2 dm4f = __half22float2(bx->dm);
+            d4 = dm4f.x;
+            m4 = dm4f.y;
+            const int * q4_packed = (const int *) bx->qs;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q4_packed[j];
+                x_lo[j] = p & 0x0F0F0F0F;
+                x_hi[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        // UNCONDITIONAL col loop — no bounds check. Caller must ensure
+        // ncols_y is a multiple of TILE_N (or tolerate reading past end).
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float2 ds8f = __half22float2(by->ds);
+            const float d8 = ds8f.x;
+            const float s8 = ds8f.y;
+            const int * y_packed = (const int *) by->qs;
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+            }
+            sums[c] += sumi * d4 * d8 + m4 * s8;
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void
+mul_mat_q4_1_gfx906_v2f_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_1_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 // =============================================================================
 // Phase 2d — Q8_0 × Q8_1 matrix matmul for gfx906.
 //

@@ -469,12 +469,38 @@ fn mul_mat_q_v2_with_tile_n(
             16 => ("mul_mat_q4_0_gfx906_v2_tile16", 16),
             _ => ("mul_mat_q4_0_gfx906_v2_tile32", 32),
         },
-        GgmlDType::Q4_1 => match tile_n_hint {
-            8 => ("mul_mat_q4_1_gfx906_v2", 8),
-            16 => ("mul_mat_q4_1_gfx906_v2_tile16", 16),
-            64 => ("mul_mat_q4_1_gfx906_v2_tile64", 64),
-            _ => ("mul_mat_q4_1_gfx906_v2_tile32", 32),
-        },
+        GgmlDType::Q4_1 => {
+            // Phase 2d: `CANDLE_MMQ_VARIANT` picks the Q4_1 TILE_N=32
+            // variant. See BENCH-PMC-VALU-VMEM-2026-04-11.md for the
+            // motivation — the legacy v2 kernel had ~574 lane-scratch
+            // instructions (27 % of total) from the compiler's
+            // implementation of `if (col >= ncols_y) break` inside a
+            // fully-unrolled col loop.
+            //   v2f (default for tile_n=32): fast path only, no per-col
+            //        bounds check. 1425 instructions, ZERO lane moves.
+            //        14.6 % faster prefill than legacy v2 on qwen35-9B.
+            //        The Y quant buffer is padded to
+            //        `ceil(total_b / tile_n) * tile_n` so OOB reads
+            //        land on zeros.
+            //   v2d: hoisted bounds check (full-tile fast path +
+            //        boundary slow path). 3564 instructions — slower in
+            //        practice because both branches are emitted and the
+            //        compiler can't consolidate them.
+            //   v2_legacy: the original per-col-checked kernel, kept
+            //              behind `CANDLE_MMQ_VARIANT=v2_legacy` for
+            //              A/B ablation.
+            let variant = std::env::var("CANDLE_MMQ_VARIANT").ok();
+            let want_legacy = variant.as_deref() == Some("v2_legacy");
+            let want_v2d = variant.as_deref() == Some("v2d");
+            match tile_n_hint {
+                8 => ("mul_mat_q4_1_gfx906_v2", 8),
+                16 => ("mul_mat_q4_1_gfx906_v2_tile16", 16),
+                64 => ("mul_mat_q4_1_gfx906_v2_tile64", 64),
+                _ if want_legacy => ("mul_mat_q4_1_gfx906_v2_tile32", 32),
+                _ if want_v2d => ("mul_mat_q4_1_gfx906_v2d_tile32", 32),
+                _ => ("mul_mat_q4_1_gfx906_v2f_tile32", 32),
+            }
+        }
         GgmlDType::Q8_0 => match tile_n_hint {
             8 => ("mul_mat_q8_0_gfx906_v2", 8),
             16 => ("mul_mat_q8_0_gfx906_v2_tile16", 16),
@@ -517,11 +543,21 @@ fn mul_mat_q_v2_with_tile_n(
     // 1. Quantize all `total_b` input rows to q8_1 in one shot. The layout
     //    produced by `quantize_q8_1` is column-major blocks: `y_q8_1[col * blocks_per_col_y + ib]`
     //    which is exactly what the kernel expects.
+    //
+    // Phase 2d: the v2f fast-path kernel drops the per-col bounds check
+    // inside the inner loop, which eliminates the ~27 % lane-scratch
+    // predicate overhead — but it requires the Y quant buffer to have
+    // enough slots for the full TILE_N column tile past `total_b`. We
+    // pad `y_size_in_bytes` to `ceil(total_b / tile_n) * tile_n` so
+    // OOB col reads land on zeroed memory (alloc_zeros) and contribute
+    // nothing to the dp4a sums. Writebacks are still gated on
+    // `col < ncols_y == total_b` so the OOB cols are never stored.
+    let total_b_padded = total_b.div_ceil(tile_n) * tile_n;
     let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
     let q8_1_type_size = GgmlDType::Q8_1.type_size();
     let q8_1_block_size = GgmlDType::Q8_1.block_size();
     let bytes_per_row = ncols_padded / q8_1_block_size * q8_1_type_size;
-    let y_size_in_bytes = total_b * bytes_per_row;
+    let y_size_in_bytes = total_b_padded * bytes_per_row;
     let mut y_q8_1 = dev.alloc_zeros::<u8>(y_size_in_bytes)?;
     quantize_q8_1(y, &mut y_q8_1, ncols, total_b, dev)?;
 
