@@ -586,7 +586,7 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
     max_x + stable
 }
 
-/// Vectorized delta net autoregressive step (single token).
+/// Vectorized delta net autoregressive step (single token, L=1).
 ///
 /// Reference: llama.cpp delta-net-base.cpp lines 288-370
 ///
@@ -599,6 +599,13 @@ fn softplus(x: &Tensor) -> Result<Tensor> {
 ///
 /// All shapes use candle's row-major (B, H, ..., ...) layout. State is
 /// (B, H, S_v, S_v). q/k/v are (B, H, 1, S_v). gate/beta are (B, H, 1, 1).
+///
+/// On HIP with S_v=128 and contiguous f32 inputs, this lowers to a
+/// single fused kernel launch via `candle::hip_backend::
+/// gated_delta_net_step_fused` — replacing the ~8 tensor-op launches
+/// below with one. The fallback path (CPU, non-128 S_v, non-f32, or
+/// non-contiguous inputs) stays on the tensor-op chain for
+/// correctness.
 fn delta_net_step_vectorized(
     q: &Tensor,         // (B, H, 1, S_v) — must be pre-scaled by 1/sqrt(S_k)
     k: &Tensor,         // (B, H, 1, S_v)
@@ -607,6 +614,23 @@ fn delta_net_step_vectorized(
     beta: &Tensor,      // (B, H, 1, 1)
     state: &mut Tensor, // (B, H, S_v, S_v)
 ) -> Result<Tensor> {
+    // HIP fast path: single fused kernel launch. Falls through to the
+    // tensor-op chain when any precondition fails (non-HIP, non-f32,
+    // unsupported S_v, non-contiguous input). Keeping the fallback
+    // means the CPU-only test path and any future S_v variant still
+    // work unchanged.
+    #[cfg(feature = "hip")]
+    {
+        if matches!(q.device(), candle::Device::Hip(_))
+            && q.dtype() == candle::DType::F32
+            && gated_delta_net_hip_supported(q, k, v, gate, beta, state)
+        {
+            return candle::hip_backend::gated_delta_net_step_fused(
+                q, k, v, gate, beta, state,
+            );
+        }
+    }
+
     // 1. Apply decay: state = state * exp(gate)
     let g_exp = gate.exp()?;
     *state = state.broadcast_mul(&g_exp)?;
@@ -626,6 +650,47 @@ fn delta_net_step_vectorized(
 
     // 6. output = q @ state → (B, H, 1, S_v)
     q.matmul(state)
+}
+
+/// Return `true` if the fused HIP kernel supports these inputs. Phase 1
+/// requires S_v=128 and contiguous f32 inputs. Any miss here routes back
+/// to the tensor-op fallback — the function is intentionally a cheap
+/// pre-flight check so the caller can decide without allocating.
+#[cfg(feature = "hip")]
+fn gated_delta_net_hip_supported(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    gate: &Tensor,
+    beta: &Tensor,
+    state: &Tensor,
+) -> bool {
+    // Shape: q is (B, H, L, S_v). Kernel currently only instantiated at S_v=128.
+    let Ok((_, _, _, s_v)) = q.dims4() else { return false; };
+    if s_v != 128 {
+        return false;
+    }
+    // All inputs contiguous.
+    if !(q.is_contiguous()
+        && k.is_contiguous()
+        && v.is_contiguous()
+        && gate.is_contiguous()
+        && beta.is_contiguous()
+        && state.is_contiguous())
+    {
+        return false;
+    }
+    // All f32.
+    let f32_ok = q.dtype() == candle::DType::F32
+        && k.dtype() == candle::DType::F32
+        && v.dtype() == candle::DType::F32
+        && gate.dtype() == candle::DType::F32
+        && beta.dtype() == candle::DType::F32
+        && state.dtype() == candle::DType::F32;
+    if !f32_ok {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -917,5 +982,228 @@ mod tests {
         state.reset().unwrap();
         let sum: f32 = state.conv_states[0].abs().unwrap().sum_all().unwrap().to_scalar().unwrap();
         assert_eq!(sum, 0.0);
+    }
+
+    // --- HIP fused delta-net step tests ----------------------------
+    //
+    // These tests are behind `cfg(feature = "hip")` so the regular
+    // `cargo test` (CPU only) build doesn't link HIP. On the ROCm
+    // machine, run them with:
+    //     cargo test -p candle-transformers --features hip \
+    //         quantized_blocks::delta_net::tests::hip_
+    //
+    // Both tests are TDD oracles: build identical inputs on CPU and
+    // HIP, run the CPU tensor-op `delta_net_step_vectorized` on CPU
+    // and the fused kernel path on HIP, compare element-wise within
+    // FMA rounding.
+
+    /// Minimal shape: B=1, H=2, L=1, S_v=128 (the Phase 1 instantiation).
+    /// Runs one recurrent step on both devices and checks both the
+    /// returned attention output and the updated state agree.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_gated_delta_net_step_matches_cpu_s128_single_step() {
+        let dev_hip = match candle::Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let dev_cpu = candle::Device::Cpu;
+        let b = 1usize;
+        let h = 2usize;
+        let l = 1usize;
+        let s_v = 128usize;
+
+        // Deterministic inputs — small magnitude so the recurrence
+        // stays in a numerically stable range.
+        let qkv_len = b * h * l * s_v;
+        let gb_len = b * h * l;
+        let state_len = b * h * s_v * s_v;
+        let q_vals: Vec<f32> =
+            (0..qkv_len).map(|i| ((i as f32) * 0.00037).sin() * 0.1).collect();
+        let k_vals: Vec<f32> =
+            (0..qkv_len).map(|i| ((i as f32) * 0.00053).cos() * 0.1).collect();
+        let v_vals: Vec<f32> =
+            (0..qkv_len).map(|i| ((i as f32) * 0.00041).sin() * 0.1).collect();
+        let gate_vals: Vec<f32> =
+            (0..gb_len).map(|i| -0.05 - (i as f32) * 0.01).collect();
+        let beta_vals: Vec<f32> =
+            (0..gb_len).map(|i| 0.7 + (i as f32) * 0.01).collect();
+        // Non-trivial starting state so the decay path is exercised.
+        let state_vals: Vec<f32> = (0..state_len)
+            .map(|i| ((i as f32) * 0.00013).cos() * 0.01)
+            .collect();
+
+        let q_cpu = Tensor::from_slice(&q_vals, (b, h, l, s_v), &dev_cpu).unwrap();
+        let k_cpu = Tensor::from_slice(&k_vals, (b, h, l, s_v), &dev_cpu).unwrap();
+        let v_cpu = Tensor::from_slice(&v_vals, (b, h, l, s_v), &dev_cpu).unwrap();
+        let gate_cpu = Tensor::from_slice(&gate_vals, (b, h, l, 1), &dev_cpu).unwrap();
+        let beta_cpu = Tensor::from_slice(&beta_vals, (b, h, l, 1), &dev_cpu).unwrap();
+        let mut state_cpu =
+            Tensor::from_slice(&state_vals, (b, h, s_v, s_v), &dev_cpu).unwrap();
+
+        let q_hip = Tensor::from_slice(&q_vals, (b, h, l, s_v), &dev_hip).unwrap();
+        let k_hip = Tensor::from_slice(&k_vals, (b, h, l, s_v), &dev_hip).unwrap();
+        let v_hip = Tensor::from_slice(&v_vals, (b, h, l, s_v), &dev_hip).unwrap();
+        let gate_hip = Tensor::from_slice(&gate_vals, (b, h, l, 1), &dev_hip).unwrap();
+        let beta_hip = Tensor::from_slice(&beta_vals, (b, h, l, 1), &dev_hip).unwrap();
+        let mut state_hip =
+            Tensor::from_slice(&state_vals, (b, h, s_v, s_v), &dev_hip).unwrap();
+
+        // CPU reference: the tensor-op chain (fallback path).
+        let out_cpu = delta_net_step_vectorized(
+            &q_cpu, &k_cpu, &v_cpu, &gate_cpu, &beta_cpu, &mut state_cpu,
+        )
+        .unwrap();
+
+        // HIP: takes the fused kernel fast path.
+        let out_hip = delta_net_step_vectorized(
+            &q_hip, &k_hip, &v_hip, &gate_hip, &beta_hip, &mut state_hip,
+        )
+        .unwrap();
+
+        let out_cpu_vals: Vec<f32> = out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+        let out_hip_vals: Vec<f32> =
+            out_hip.to_device(&dev_cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(out_cpu_vals.len(), out_hip_vals.len());
+
+        let max_abs = out_cpu_vals
+            .iter()
+            .zip(out_hip_vals.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // Same math, different reduction order (warp shfl vs rocBLAS
+        // dot) so we expect FMA-level drift. S_v=128 accumulates 128
+        // products per lane-shard pair; 1e-5 absolute is generous.
+        assert!(
+            max_abs < 1e-4,
+            "attn output drift too large: max_abs={max_abs}"
+        );
+
+        let st_cpu_vals: Vec<f32> = state_cpu.flatten_all().unwrap().to_vec1().unwrap();
+        let st_hip_vals: Vec<f32> = state_hip
+            .to_device(&dev_cpu)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(st_cpu_vals.len(), st_hip_vals.len());
+
+        let max_abs_state = st_cpu_vals
+            .iter()
+            .zip(st_hip_vals.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_state < 1e-4,
+            "state drift too large: max_abs={max_abs_state}"
+        );
+    }
+
+    /// Multi-step correctness: run N sequential recurrent steps with
+    /// distinct per-step inputs. Each step's output depends on the
+    /// previous step's state update, so any drift compounds. If the
+    /// kernel is correct, the two devices stay in lock-step (within
+    /// FMA rounding) across all steps.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_gated_delta_net_step_matches_cpu_s128_multi_step() {
+        let dev_hip = match candle::Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        let dev_cpu = candle::Device::Cpu;
+        let b = 1usize;
+        let h = 4usize;
+        let s_v = 128usize;
+        let n_steps = 5usize;
+
+        let mut state_cpu = Tensor::zeros((b, h, s_v, s_v), candle::DType::F32, &dev_cpu).unwrap();
+        let mut state_hip = Tensor::zeros((b, h, s_v, s_v), candle::DType::F32, &dev_hip).unwrap();
+
+        for t in 0..n_steps {
+            // Distinct inputs per step — sin/cos of a shifted index.
+            let offset = (t as f32) * 0.1;
+            let q_vals: Vec<f32> = (0..b * h * s_v)
+                .map(|i| ((i as f32) * 0.00037 + offset).sin() * 0.1)
+                .collect();
+            let k_vals: Vec<f32> = (0..b * h * s_v)
+                .map(|i| ((i as f32) * 0.00053 + offset).cos() * 0.1)
+                .collect();
+            let v_vals: Vec<f32> = (0..b * h * s_v)
+                .map(|i| ((i as f32) * 0.00041 + offset).sin() * 0.1)
+                .collect();
+            let gate_vals: Vec<f32> =
+                (0..b * h).map(|i| -0.05 - (i as f32 + offset) * 0.01).collect();
+            let beta_vals: Vec<f32> =
+                (0..b * h).map(|i| 0.7 + (i as f32 + offset) * 0.01).collect();
+
+            let q_cpu = Tensor::from_slice(&q_vals, (b, h, 1, s_v), &dev_cpu).unwrap();
+            let k_cpu = Tensor::from_slice(&k_vals, (b, h, 1, s_v), &dev_cpu).unwrap();
+            let v_cpu = Tensor::from_slice(&v_vals, (b, h, 1, s_v), &dev_cpu).unwrap();
+            let gate_cpu = Tensor::from_slice(&gate_vals, (b, h, 1, 1), &dev_cpu).unwrap();
+            let beta_cpu = Tensor::from_slice(&beta_vals, (b, h, 1, 1), &dev_cpu).unwrap();
+
+            let q_hip = Tensor::from_slice(&q_vals, (b, h, 1, s_v), &dev_hip).unwrap();
+            let k_hip = Tensor::from_slice(&k_vals, (b, h, 1, s_v), &dev_hip).unwrap();
+            let v_hip = Tensor::from_slice(&v_vals, (b, h, 1, s_v), &dev_hip).unwrap();
+            let gate_hip = Tensor::from_slice(&gate_vals, (b, h, 1, 1), &dev_hip).unwrap();
+            let beta_hip = Tensor::from_slice(&beta_vals, (b, h, 1, 1), &dev_hip).unwrap();
+
+            let out_cpu = delta_net_step_vectorized(
+                &q_cpu, &k_cpu, &v_cpu, &gate_cpu, &beta_cpu, &mut state_cpu,
+            )
+            .unwrap();
+            let out_hip = delta_net_step_vectorized(
+                &q_hip, &k_hip, &v_hip, &gate_hip, &beta_hip, &mut state_hip,
+            )
+            .unwrap();
+
+            let out_cpu_vals: Vec<f32> =
+                out_cpu.flatten_all().unwrap().to_vec1().unwrap();
+            let out_hip_vals: Vec<f32> = out_hip
+                .to_device(&dev_cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let max_abs = out_cpu_vals
+                .iter()
+                .zip(out_hip_vals.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            // Drift compounds across steps; allow a looser bound than
+            // the single-step test.
+            assert!(
+                max_abs < 5e-4,
+                "step {t}: attn output drift too large: max_abs={max_abs}"
+            );
+
+            let st_cpu_vals: Vec<f32> =
+                state_cpu.flatten_all().unwrap().to_vec1().unwrap();
+            let st_hip_vals: Vec<f32> = state_hip
+                .to_device(&dev_cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let max_abs_state = st_cpu_vals
+                .iter()
+                .zip(st_hip_vals.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs_state < 5e-4,
+                "step {t}: state drift too large: max_abs={max_abs_state}"
+            );
+        }
     }
 }
