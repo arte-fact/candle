@@ -357,6 +357,65 @@ __device__ void rmsnorm_add(
     }
 }
 
+// Post-norm residual fusion: computes `dst = rmsnorm(x, alpha, eps) + residual`.
+//
+// Gemma4's block layout puts a norm AFTER the sublayer output and THEN
+// adds the residual back in — i.e. `rmsnorm(attn_out, w) + residual`,
+// which is the opposite composition from `rmsnorm_add` above
+// (`rmsnorm(h + delta, w)`). Two add/norm kernel launches per block
+// × 48 blocks × 64 forward calls = ~6 k dispatches saved on gemma4.
+//
+// Launch geometry matches the existing `rmsnorm` kernel: one row per
+// warp via `blockIdx.x * blockDim.y + threadIdx.y`, strided-loop over
+// columns on `threadIdx.x`.
+template <typename T>
+__device__ void rmsnorm_post_residual(
+    const T * __restrict__ x,
+    const T * __restrict__ residual,
+    T * __restrict__ dst,
+    const T * __restrict__ alpha,
+    const int ncols,
+    const int block_size,
+    const float eps
+) {
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f;
+
+    // Pass 1: accumulate sum of squares of x.
+    for (int col = tid; col < ncols; col += block_size) {
+        const int i = row * ncols + col;
+        const float xi = static_cast<float>(x[i]);
+        tmp += xi * xi;
+    }
+
+    tmp = warp_reduce_sum(tmp);
+    if (block_size > WARP_SIZE) {
+        __shared__ float s_sum[BLOCK_SIZE / WARP_SIZE];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        if (lane_id == 0) {
+            s_sum[warp_id] = tmp;
+        }
+        __syncthreads();
+        int num_warps = block_size / WARP_SIZE;
+        tmp = (lane_id < num_warps) ? s_sum[lane_id] : 0.0f;
+        tmp = warp_reduce_sum(tmp);
+    }
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // Pass 2: normed = x * scale * alpha, then add residual.
+    for (int col = tid; col < ncols; col += block_size) {
+        const int i = row * ncols + col;
+        const float a = static_cast<float>(alpha[col]);
+        const float n = static_cast<float>(x[i]) * scale * a;
+        dst[i] = static_cast<T>(n + static_cast<float>(residual[i]));
+    }
+}
+
 // Softmax implementation adapted from ggml.
 // https://github.com/ggerganov/llama.cpp/blob/d59bd97065cd7ded6c4ecab54b1d5e0b1b11e318/ggml-cuda.cu#L4159
 template <typename T, typename ACC>
@@ -847,6 +906,15 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
                           n_cols, block_size, eps);                            \
   }                                                                            \
 
+#define RMSNORM_POST_RESIDUAL_OP(TYPENAME, FN_NAME) \
+  extern "C" __global__ void FN_NAME(                                          \
+      const TYPENAME *x, const TYPENAME *residual,                             \
+      TYPENAME *dst, const TYPENAME *alpha,                                    \
+      const int n_cols, const int block_size, const float eps) {               \
+    rmsnorm_post_residual<TYPENAME>(x, residual, dst, alpha,                   \
+                                    n_cols, block_size, eps);                  \
+  }                                                                            \
+
 #define LAYERNORM_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME(                                          \
       const TYPENAME *src, TYPENAME *dst, const TYPENAME *alpha,               \
@@ -919,6 +987,7 @@ RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 RMSNORM_ADD_OP(float, rmsnorm_add_f32)
 RMSNORM_ADD_OP(double, rmsnorm_add_f64)
+RMSNORM_POST_RESIDUAL_OP(float, rmsnorm_post_residual_f32)
 LAYERNORM_OP(float, layernorm_f32)
 LAYERNORM_OP(double, layernorm_f64)
 ROPE_OP(float, rope_f32, rope_i_f32, rope_thd_f32)

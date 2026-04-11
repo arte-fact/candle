@@ -586,15 +586,20 @@ impl ModelWeights {
                 attention_mask.as_ref(),
                 index_pos,
             )?;
-            let x = self.layers[il].post_attention_norm.forward(&attn)?;
-            let x = (x + &residual)?;
+            // Fused post-attn norm + residual add (Q0a). On HIP this is
+            // one launch; falls back to rms_norm + add otherwise.
+            let x = self.layers[il]
+                .post_attention_norm
+                .forward_post_residual(&attn, &residual)?;
 
             // -------- FFN block --------
-            let residual = &x;
+            let residual = x.clone();
             let x = self.layers[il].ffn_norm.forward(&x)?;
             let x = self.layers[il].mlp.forward(&x)?;
-            let x = self.layers[il].post_ffn_norm.forward(&x)?;
-            let mut x = (x + residual)?;
+            // Fused post-ffn norm + residual add (Q0a).
+            let mut x = self.layers[il]
+                .post_ffn_norm
+                .forward_post_residual(&x, &residual)?;
 
             // -------- per-layer embedding injection (E4B) --------
             if let (Some(ref ple), Some(ref ipl)) =

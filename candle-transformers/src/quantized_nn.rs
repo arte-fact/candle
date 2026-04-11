@@ -139,6 +139,44 @@ impl RmsNorm {
         let _enter = self.span.enter();
         candle_nn::ops::fused_residual_rms_norm(h, delta, &self.weight, self.eps as f32)
     }
+
+    /// Fused: compute `rms_norm(x, weight) + residual` in one HIP launch.
+    ///
+    /// This is the **post-norm residual** pattern used by Gemma4 (and
+    /// similar post-norm blocks) where the sublayer output is normalised
+    /// first and then added to the residual stream. Different composition
+    /// from `forward_residual` — that one pre-adds then norms.
+    ///
+    /// Falls back to the chained `rms_norm + add` ops on non-HIP backends
+    /// or when the inputs are not HIP / f32 / contiguous.
+    pub fn forward_post_residual(
+        &self,
+        x: &Tensor,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        #[cfg(feature = "hip")]
+        {
+            if matches!(x.device(), candle::Device::Hip(_))
+                && x.dtype() == candle::DType::F32
+                && residual.dtype() == candle::DType::F32
+                && x.is_contiguous()
+                && residual.is_contiguous()
+                && self.weight.is_contiguous()
+                && x.shape() == residual.shape()
+            {
+                return candle::hip_backend::rms_norm_post_residual_fused(
+                    x,
+                    residual,
+                    &self.weight,
+                    self.eps as f32,
+                );
+            }
+        }
+        // Fallback: unfused chain.
+        let normed = candle_nn::ops::rms_norm(x, &self.weight, self.eps as f32)?;
+        normed + residual
+    }
 }
 
 impl Module for RmsNorm {

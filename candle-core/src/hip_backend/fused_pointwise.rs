@@ -379,6 +379,129 @@ pub fn masked_softmax_scale_fused(
     ))
 }
 
+/// Fused post-norm residual: `dst = rms_norm(x, weight, eps) + residual`.
+///
+/// Replaces the `post_norm.forward(&attn)? + residual?` pattern used in
+/// Gemma4 and other post-norm transformer blocks with a single kernel
+/// launch. The gemma4 forward has two of these per layer (post-attn
+/// residual, post-ffn residual) × 48 layers × 64 forwards ≈ 6,144
+/// kernel launches folded into half as many.
+///
+/// Mirrors the geometry of the existing `rms_norm` and
+/// `fused_residual_rms_norm` launchers in `candle-nn/src/ops.rs`:
+/// one row per warp, `blockDim = (64, 1, 1)` or `(1024, 1, 1)` when
+/// hidden dim ≥ 1024.
+///
+/// # Requirements
+/// - `x`, `residual`, `weight` on the same HIP device, contiguous, f32
+/// - `x.shape() == residual.shape()` and the last dim equals
+///   `weight.dims1()`
+///
+/// # Returns
+/// A fresh tensor with the same shape as `x`.
+pub fn rms_norm_post_residual_fused(
+    x: &Tensor,
+    residual: &Tensor,
+    weight: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    let dev = match x.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("rms_norm_post_residual_fused: x must be on HIP"),
+    };
+    if !matches!(residual.device(), Device::Hip(d) if d.same_device(&dev))
+        || !matches!(weight.device(), Device::Hip(d) if d.same_device(&dev))
+    {
+        crate::bail!("rms_norm_post_residual_fused: inputs must share a HIP device");
+    }
+    if x.dtype() != DType::F32 || residual.dtype() != DType::F32 || weight.dtype() != DType::F32 {
+        crate::bail!("rms_norm_post_residual_fused: all inputs must be f32");
+    }
+    if x.shape() != residual.shape() {
+        crate::bail!(
+            "rms_norm_post_residual_fused: x {:?} vs residual {:?} shape mismatch",
+            x.shape(),
+            residual.shape()
+        );
+    }
+    if !x.is_contiguous() || !residual.is_contiguous() || !weight.is_contiguous() {
+        crate::bail!("rms_norm_post_residual_fused: all inputs must be contiguous");
+    }
+    let hidden = *x.dims().last().unwrap_or(&0);
+    let weight_dim = weight.dims1()?;
+    if hidden != weight_dim {
+        crate::bail!(
+            "rms_norm_post_residual_fused: hidden {hidden} != weight {weight_dim}"
+        );
+    }
+
+    let el = x.elem_count();
+    let n_rows = el / hidden;
+    if el == 0 {
+        return x.clone().contiguous();
+    }
+
+    let (x_st, x_l) = x.storage_and_layout();
+    let (r_st, r_l) = residual.storage_and_layout();
+    let (w_st, w_l) = weight.storage_and_layout();
+
+    macro_rules! slice_of {
+        ($st:expr, $l:expr, $label:literal) => {{
+            let hip_st = match &*$st {
+                Storage::Hip(s) => s,
+                _ => crate::bail!("rms_norm_post_residual_fused: {} not HIP", $label),
+            };
+            let slice = hip_st.as_hip_slice::<f32>()?;
+            match $l.contiguous_offsets() {
+                Some((lo, hi)) => slice.slice(lo..hi),
+                None => crate::bail!("rms_norm_post_residual_fused: {} non-contiguous", $label),
+            }
+        }};
+    }
+
+    let x_view = slice_of!(x_st, x_l, "x");
+    let r_view = slice_of!(r_st, r_l, "residual");
+    let w_view = slice_of!(w_st, w_l, "weight");
+
+    // SAFETY: populated by the kernel below.
+    let out = unsafe { dev.alloc::<f32>(el)? };
+
+    let func = dev.get_or_load_func("rmsnorm_post_residual_f32", &kernels::REDUCE)?;
+
+    // Match the standalone `rms_norm` launch geometry.
+    let block_size: u32 = if hidden >= 1024 { 1024 } else { 64 };
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(&x_view);
+    builder.arg(&r_view);
+    builder.arg(&out);
+    builder.arg(&w_view);
+    let n_cols_i32 = hidden as i32;
+    let block_size_i32 = block_size as i32;
+    builder.arg(&n_cols_i32);
+    builder.arg(&block_size_i32);
+    builder.arg(&eps);
+    // SAFETY: ffi — shapes/dtype/contig validated above.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(x_st);
+    drop(r_st);
+    drop(w_st);
+
+    let out_storage = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        x.shape().clone(),
+        BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
 /// Fused L2 normalisation along the last axis:
 /// `out[..., i] = x[..., i] / sqrt(Σ_i x[..., i]² + eps)`.
 ///

@@ -1039,4 +1039,84 @@ mod tests {
             );
         }
     }
+
+    /// Q0a regression: fused post-norm residual on HIP must match the
+    /// chained `rms_norm(x, weight) + residual` reference across a
+    /// spread of shapes / hidden dims.
+    #[cfg(feature = "hip")]
+    #[test]
+    fn hip_rms_norm_post_residual_matches_chain() {
+        let dev_hip = match Device::new_hip(0) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("skipping: HIP device 0 unavailable: {e}");
+                return;
+            }
+        };
+        // (batch, seq_len, hidden)
+        let cases: &[(usize, usize, usize)] = &[
+            (1, 1, 64),      // decode-like tiny
+            (1, 1, 2048),    // decode, block_size=1024 path
+            (1, 1, 1536),    // decode, block_size=1024 path
+            (2, 16, 256),    // small batch prefill
+            (1, 1024, 512),  // long prefill, hidden<1024 path
+            (1, 1024, 2048), // long prefill, hidden>=1024 path
+        ];
+
+        for &(b, s, h) in cases {
+            let el = b * s * h;
+            let x_vals: Vec<f32> = (0..el)
+                .map(|i| ((i as f32) * 0.00091).sin() * 0.3)
+                .collect();
+            let r_vals: Vec<f32> = (0..el)
+                .map(|i| ((i as f32) * 0.00057).cos() * 0.4)
+                .collect();
+            let w_vals: Vec<f32> = (0..h)
+                .map(|i| 1.0 + ((i as f32) * 0.01).sin() * 0.1)
+                .collect();
+            let eps: f32 = 1e-6;
+
+            let x_hip = Tensor::from_slice(&x_vals, (b, s, h), &dev_hip).unwrap();
+            let r_hip = Tensor::from_slice(&r_vals, (b, s, h), &dev_hip).unwrap();
+            let w_hip = Tensor::from_slice(&w_vals, h, &dev_hip).unwrap();
+
+            // Reference.
+            let ref_out = {
+                let normed = candle_nn::ops::rms_norm(&x_hip, &w_hip, eps).unwrap();
+                (&normed + &r_hip).unwrap()
+            };
+
+            // Fused.
+            let fused_out = candle::hip_backend::rms_norm_post_residual_fused(
+                &x_hip, &r_hip, &w_hip, eps,
+            )
+            .unwrap();
+
+            let ref_vals: Vec<f32> = ref_out
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let fused_vals: Vec<f32> = fused_out
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(ref_vals.len(), fused_vals.len());
+
+            let max_abs = ref_vals
+                .iter()
+                .zip(fused_vals.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 1e-5,
+                "rms_norm_post_residual drift on (b={b}, s={s}, h={h}): max_abs={max_abs}"
+            );
+        }
+    }
 }
