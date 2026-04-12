@@ -21,6 +21,7 @@
 //! GGUF arch string: `gemma4`.
 
 use crate::models::quantized_blocks::*;
+use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
 use candle::quantized::{gguf_file, GgufBlob};
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
@@ -62,6 +63,41 @@ struct PerLayerEmbeddings {
 // LayerWeights
 // ---------------------------------------------------------------------------
 
+/// Optional MoE branch present in gemma4-A4B (26B) but absent in
+/// gemma4-E4B (4B dense). When present, the FFN block is dual:
+///   out = post_norm_1(dense_mlp(norm_1(attn_out)))
+///       + post_norm_2(moe_ffn(norm_2(attn_out), router(attn_out)))
+/// Both branches read from `attn_out` (attention residual), NOT from
+/// each other. The router uses a custom logit computation:
+///   logits = gate_inp @ (rms_norm(attn_out) / sqrt(n_embd) * gate_inp_s)
+struct MoeBranch {
+    /// Router weight matrix [n_experts, hidden_dim].
+    gate_inp: QMatMul,
+    /// Router input scale: learned per-element scale applied to the
+    /// rms-normed input before the router matmul.
+    gate_inp_s: Tensor,
+    /// Fused expert gate+up [n_experts, 2*expert_ffn_dim, hidden_dim].
+    gate_up_exps: std::sync::Arc<candle::quantized::QTensor>,
+    /// Expert down [n_experts, hidden_dim, expert_ffn_dim].
+    down_exps: std::sync::Arc<candle::quantized::QTensor>,
+    /// Optional per-expert down projection scale (ffn_down_exps.scale).
+    /// Applied element-wise to the down projection output before
+    /// combining across topk experts.
+    down_exps_scale: Option<Tensor>,
+    /// Expert FFN intermediate size (per expert).
+    expert_intermediate: usize,
+    /// Number of experts used per token.
+    num_experts_used: usize,
+    /// Pre-MoE norm (pre_ffw_norm_2).
+    pre_norm: RmsNorm,
+    /// Post-MoE norm (post_ffw_norm_2).
+    post_norm: RmsNorm,
+    /// Embedding length for the 1/sqrt(n_embd) router scale.
+    n_embd: usize,
+    /// RMS norm epsilon (reused for the inline router rms_norm).
+    eps: f32,
+}
+
 struct LayerWeights {
     attn: StandardAttention,
     attn_norm: RmsNorm,
@@ -69,6 +105,8 @@ struct LayerWeights {
     ffn_norm: RmsNorm,
     post_ffn_norm: RmsNorm,
     mlp: DenseMlp,
+    /// Optional MoE expert branch for A4B-class models.
+    moe: Option<MoeBranch>,
     /// Optional sliding-window mask radius (None = global attention).
     sliding_window_size: Option<usize>,
     /// True if this layer computes its own K/V (the first
@@ -367,6 +405,53 @@ impl ModelWeights {
                     MlpActivation::Gelu,
                 )?;
 
+                // Detect MoE layer: present if ffn_gate_inp.weight exists.
+                let moe = if lgg.has_tensor(&format!("{block_prefix}.ffn_gate_inp.weight")) {
+                    let gate_inp = lgg.qmatmul(&format!("{block_prefix}.ffn_gate_inp.weight"))?;
+                    let gate_inp_s = lgg
+                        .try_dequantize(&format!("{block_prefix}.ffn_gate_inp.scale"))
+                        .ok_or_else(|| {
+                            candle::Error::Msg(format!(
+                                "MoE layer {block_prefix} has gate_inp but no gate_inp.scale"
+                            ))
+                        })?;
+                    let gate_up_exps = std::sync::Arc::new(
+                        lgg.tensor(&format!("{block_prefix}.ffn_gate_up_exps.weight"))?,
+                    );
+                    let down_exps = std::sync::Arc::new(
+                        lgg.tensor(&format!("{block_prefix}.ffn_down_exps.weight"))?,
+                    );
+                    // Expert FFN intermediate: infer from gate_up_exps shape
+                    // [n_experts, 2*intermediate, hidden] → intermediate = dim[1]/2
+                    let expert_intermediate = gate_up_exps.shape().dims()[1] / 2;
+                    let num_experts_used = cfg.expert_used_count.unwrap_or(8);
+                    let pre_norm = lgg.rms_norm(
+                        &format!("{block_prefix}.pre_ffw_norm_2.weight"),
+                        rms_norm_eps,
+                    )?;
+                    let post_norm = lgg.rms_norm(
+                        &format!("{block_prefix}.post_ffw_norm_2.weight"),
+                        rms_norm_eps,
+                    )?;
+                    let down_exps_scale =
+                        lgg.try_dequantize(&format!("{block_prefix}.ffn_down_exps.scale"));
+                    Some(MoeBranch {
+                        gate_inp,
+                        gate_inp_s,
+                        gate_up_exps,
+                        down_exps,
+                        down_exps_scale,
+                        expert_intermediate,
+                        num_experts_used,
+                        pre_norm,
+                        post_norm,
+                        n_embd: embedding_length,
+                        eps: rms_norm_eps as f32,
+                    })
+                } else {
+                    None
+                };
+
                 let layer_output_scale =
                     lgg.try_dequantize(&format!("{block_prefix}.layer_output_scale.weight"));
 
@@ -396,6 +481,7 @@ impl ModelWeights {
                     ffn_norm,
                     post_ffn_norm,
                     mlp,
+                    moe,
                     sliding_window_size: if is_sliding { Some(sliding_window_size) } else { None },
                     has_kv,
                     kv_source_idx,
@@ -600,13 +686,134 @@ impl ModelWeights {
                 .forward_post_residual(&attn, &residual)?;
 
             // -------- FFN block --------
-            let residual = x.clone();
-            let x = self.layers[il].ffn_norm.forward(&x)?;
-            let x = self.layers[il].mlp.forward(&x)?;
-            // Fused post-ffn norm + residual add (Q0a).
-            let mut x = self.layers[il]
-                .post_ffn_norm
-                .forward_post_residual(&x, &residual)?;
+            let skip_moe = std::env::var("CANDLE_GEMMA4_SKIP_MOE").is_ok();
+            let mut x = if !skip_moe && self.layers[il].moe.is_some() {
+                let moe_branch = self.layers[il].moe.as_ref().unwrap();
+                // Dual dense+MoE: both branches read from `x` (the
+                // attention residual output, a.k.a. attn_out in turbo).
+                let attn_out = x;
+
+                // Branch 1: Dense MLP
+                let dense_in = self.layers[il].ffn_norm.forward(&attn_out)?;
+                let dense_out = self.layers[il].mlp.forward(&dense_in)?;
+                let dense_normed = self.layers[il].post_ffn_norm.forward(&dense_out)?;
+
+                // Branch 2: MoE experts
+                let moe_in = moe_branch.pre_norm.forward(&attn_out)?;
+
+                // Custom router logits:
+                //   tmp = rms_norm(attn_out) / sqrt(n_embd) * gate_inp_s
+                //   logits = gate_inp @ tmp
+                let router_input = {
+                    let normed = crate::models::quantized_blocks::norms::v_norm(
+                        &attn_out,
+                        moe_branch.eps as f64,
+                    )?;
+                    let scaled = (normed * (1.0 / (moe_branch.n_embd as f64).sqrt()))?;
+                    scaled.broadcast_mul(&moe_branch.gate_inp_s)?
+                };
+                let router_logits = moe_branch.gate_inp.forward(&router_input)?;
+                let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+
+                // TopK selection (route through CPU for argsort).
+                let device = routing_weights.device().clone();
+                let (b_sz_ff, seq_len_ff, _hidden) = moe_in.dims3()?;
+                let flat_tokens = b_sz_ff * seq_len_ff;
+                let n_experts = routing_weights.dim(candle::D::Minus1)?;
+                let rw_flat = routing_weights.reshape((flat_tokens, n_experts))?;
+                let topk_ids = {
+                    let rw_cpu = rw_flat.to_device(&candle::Device::Cpu)?;
+                    let ids = rw_cpu
+                        .arg_sort_last_dim(false)?
+                        .narrow(candle::D::Minus1, 0, moe_branch.num_experts_used)?
+                        .contiguous()?;
+                    ids.to_device(&device)?
+                };
+                let topk_weights = rw_flat.gather(&topk_ids, candle::D::Minus1)?;
+                let topk_weights = (&topk_weights
+                    / topk_weights
+                        .sum_keepdim(candle::D::Minus1)?
+                        .broadcast_as(topk_weights.shape())?)?;
+
+                // Expert computation via fused gate_up_exps
+                let hidden = moe_in.dim(candle::D::Minus1)?;
+                let moe_in_flat = moe_in.reshape((flat_tokens, hidden))?;
+                let x_3d = moe_in_flat.unsqueeze(1)?.contiguous()?;
+                if il == 0 && std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
+                    eprintln!("[MoE L{il}] attn_out={:?} moe_in={:?} x_3d={:?} topk_ids={:?} gate_up_exps={:?} down_exps={:?} expert_intermediate={}",
+                        attn_out.shape(), moe_in.shape(), x_3d.shape(), topk_ids.shape(),
+                        moe_branch.gate_up_exps.shape(), moe_branch.down_exps.shape(),
+                        moe_branch.expert_intermediate);
+                    // Print first token's routing
+                    let ids_cpu: Vec<u32> = topk_ids.to_device(&candle::Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+                    let wts_cpu: Vec<f32> = topk_weights.to_device(&candle::Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+                    eprintln!("[MoE L{il}] token0 expert_ids={:?} weights={:.4?}", &ids_cpu[..8.min(ids_cpu.len())], &wts_cpu[..8.min(wts_cpu.len())]);
+                    eprintln!("[MoE L{il}] gate_inp_s={:?}", moe_branch.gate_inp_s.shape());
+                    let rl_cpu: Vec<f32> = router_logits.narrow(0, 0, 1).unwrap().to_device(&candle::Device::Cpu).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+                    let top5: Vec<(usize, f32)> = {
+                        let mut indexed: Vec<_> = rl_cpu.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                        indexed[..5].to_vec()
+                    };
+                    eprintln!("[MoE L{il}] router_logits top5={:?}", top5);
+                }
+                let gate_up = moe_branch
+                    .gate_up_exps
+                    .indexed_moe_forward(&x_3d, &topk_ids)?;
+                let gate = gate_up
+                    .narrow(candle::D::Minus1, 0, moe_branch.expert_intermediate)?
+                    .contiguous()?;
+                let up = gate_up
+                    .narrow(
+                        candle::D::Minus1,
+                        moe_branch.expert_intermediate,
+                        moe_branch.expert_intermediate,
+                    )?
+                    .contiguous()?;
+                let activated = gate.gelu()?.broadcast_mul(&up)?;
+                let mut moe_out = moe_branch
+                    .down_exps
+                    .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?;
+                // Apply per-expert down scale if present (ffn_down_exps.scale).
+                // Shape: [n_experts]; gather the scales for the selected
+                // topk experts and broadcast over the hidden dim.
+                if let Some(ref scale) = moe_branch.down_exps_scale {
+                    // scale: [n_experts=128], topk_ids: [tokens, topk=8]
+                    // Gather: [tokens, topk] per-expert scales
+                    let expert_scales = scale
+                        .index_select(&topk_ids.flatten_all()?, 0)?
+                        .reshape(topk_ids.shape())?;
+                    // Broadcast to [tokens, topk, 1] for hidden-dim multiply
+                    let expert_scales = expert_scales.unsqueeze(candle::D::Minus1)?;
+                    moe_out = moe_out.broadcast_mul(&expert_scales)?;
+                }
+
+                // Weight + sum across topk
+                let topk_weights = topk_weights.unsqueeze(candle::D::Minus1)?;
+                let weighted = moe_out.broadcast_mul(&topk_weights)?;
+                let moe_summed = weighted.sum(1)?; // sum across topk dim
+                let moe_summed = moe_summed.reshape((b_sz_ff, seq_len_ff, hidden))?;
+                let moe_normed = moe_branch.post_norm.forward(&moe_summed)?;
+
+                // Combine branches + residual
+                if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
+                    let d_abs = dense_normed.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
+                    let m_abs = moe_normed.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
+                    let a_abs = attn_out.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
+                    let combined_abs = ((&attn_out + &dense_normed).unwrap() + &moe_normed).unwrap().abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
+                    eprintln!("[L{il}] attn={a_abs:.3} dense={d_abs:.3} moe={m_abs:.3} combined={combined_abs:.3}");
+                }
+                ((&attn_out + &dense_normed)? + &moe_normed)?
+            } else {
+                // Dense-only path (E4B and similar).
+                let residual = x.clone();
+                let ffn_in = self.layers[il].ffn_norm.forward(&x)?;
+                let ffn_out = self.layers[il].mlp.forward(&ffn_in)?;
+                // Fused post-ffn norm + residual add (Q0a).
+                self.layers[il]
+                    .post_ffn_norm
+                    .forward_post_residual(&ffn_out, &residual)?
+            };
 
             // -------- per-layer embedding injection (E4B) --------
             if let (Some(ref ple), Some(ref ipl)) =
