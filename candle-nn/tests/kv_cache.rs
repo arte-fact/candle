@@ -7,6 +7,68 @@ extern crate accelerate_src;
 use candle::{Device, Result, Tensor};
 
 #[test]
+fn kv_cache_k_transposed_shape() -> Result<()> {
+    // Attack C: KvCache storing K in (..., D, T) layout. Incoming K is
+    // canonical (B, n_kv, T_new, D); `append` auto-transposes.
+    let b = 1;
+    let n_kv = 2;
+    let d = 4;
+    let mut cache = candle_nn::kv_cache::KvCache::new_k_transposed(/*dim_v*/ 2, 16);
+    assert!(cache.k_is_transposed());
+
+    // First append: 3 new tokens. K and V in (B, n_kv, 3, D).
+    let k_new: Vec<f32> = (0..(b * n_kv * 3 * d)).map(|i| i as f32).collect();
+    let v_new: Vec<f32> = k_new.iter().map(|x| *x + 100.0).collect();
+    let k_t = Tensor::from_slice(&k_new, (b, n_kv, 3, d), &Device::Cpu)?;
+    let v_t = Tensor::from_slice(&v_new, (b, n_kv, 3, d), &Device::Cpu)?;
+    let (k_out, v_out) = cache.append(&k_t, &v_t)?;
+    // K returned from cache is in storage layout: (B, n_kv, D, T_current=3).
+    assert_eq!(k_out.dims(), &[b, n_kv, d, 3]);
+    // V stays canonical.
+    assert_eq!(v_out.dims(), &[b, n_kv, 3, d]);
+
+    // Verify K content: the original k[b, h, t, d] element should now
+    // live at k_out[b, h, d, t].
+    let k_orig: Vec<f32> = k_t.flatten_all()?.to_vec1()?;
+    let k_got: Vec<f32> = k_out.flatten_all()?.to_vec1()?;
+    for h in 0..n_kv {
+        for t in 0..3 {
+            for di in 0..d {
+                let orig_idx = ((h * 3) + t) * d + di;
+                let got_idx = ((h * d) + di) * 3 + t;
+                assert_eq!(
+                    k_orig[orig_idx], k_got[got_idx],
+                    "h={h} t={t} d={di}"
+                );
+            }
+        }
+    }
+
+    // Second append: 1 more token, simulating decode.
+    let k_next: Vec<f32> = (0..(b * n_kv * 1 * d)).map(|i| 1000.0 + i as f32).collect();
+    let v_next: Vec<f32> = k_next.iter().map(|x| *x + 100.0).collect();
+    let k_t2 = Tensor::from_slice(&k_next, (b, n_kv, 1, d), &Device::Cpu)?;
+    let v_t2 = Tensor::from_slice(&v_next, (b, n_kv, 1, d), &Device::Cpu)?;
+    let (k_out2, v_out2) = cache.append(&k_t2, &v_t2)?;
+    assert_eq!(k_out2.dims(), &[b, n_kv, d, 4]);
+    assert_eq!(v_out2.dims(), &[b, n_kv, 4, d]);
+
+    // Verify the new token lands in the last column of K.
+    let k_got2: Vec<f32> = k_out2.flatten_all()?.to_vec1()?;
+    for h in 0..n_kv {
+        for di in 0..d {
+            let orig_idx = h * d + di;
+            let got_idx = ((h * d) + di) * 4 + 3;
+            assert_eq!(
+                k_next[orig_idx], k_got2[got_idx],
+                "tail token h={h} d={di}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn kv_cache() -> Result<()> {
     let mut cache = candle_nn::kv_cache::Cache::new(0, 16);
     for _ in [0, 1] {

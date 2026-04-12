@@ -132,24 +132,88 @@ pub(crate) fn gqa_attention(
         }
     }
 
-    // Zero-copy reshape: Q (B, n_head, L, D) → (B, n_kv_head, n_rep*L, D).
-    // When `n_rep == 1` this is a no-op rename; otherwise it groups the
-    // n_rep Q sub-heads that share each KV head into one batch matrix row.
-    let q_grouped = q.reshape((b_sz, n_kv_head, n_rep * seq_len, head_dim))?;
-
-    // K^T view: (B, n_kv_head, T, D) → (B, n_kv_head, D, T). **One**
-    // materialisation on a tensor that is `n_rep×` smaller than the
-    // old `broadcast_kv` result.
+    // Materialise k as (B, n_kv_head, D, T) for the Q·K^T matmul. This
+    // is the big "hot" transpose that used to show up per call; Attack C
+    // (`gqa_attention_k_transposed` below) skips this entirely when the
+    // caller already has K in the transposed layout (e.g. via a
+    // pre-transposed KvCache).
     //
     // Empirically on gfx906: dropping the `.contiguous()` and relying
     // on `gemm_config`'s stride-detected `GemmOp::Trans` path (which
     // IS supported) regresses prefill by 7 % because rocBLAS/Tensile
     // picks a different (slower) kernel for the transposed case on
-    // our prefill shapes. Keep the materialisation.
+    // our prefill shapes. Keep the materialisation on the fallback
+    // path.
     let k_t = k.transpose(D::Minus2, D::Minus1)?.contiguous()?;
+    gqa_attention_inner(q, &k_t, v, mask, attn_scale, b_sz, n_head, n_kv_head, n_rep, seq_len, t_k, head_dim)
+}
+
+/// Attack C entry point: `gqa_attention` with K **already transposed**
+/// to `(B, n_kv_head, D, T)`. Skips the internal
+/// `k.transpose().contiguous()` materialisation, which dominates decode
+/// when the cache grows (O(T) copy per step → O(T²) per generation).
+///
+/// Caller invariant: `k` is `(B, n_kv_head, D, T)` and contiguous. V is
+/// the usual `(B, n_kv_head, T, D)` layout. `mask` same rules as in
+/// [`gqa_attention`].
+pub(crate) fn gqa_attention_k_transposed(
+    q: &Tensor,
+    k_t: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    attn_scale: f64,
+) -> Result<Tensor> {
+    let (b_sz, n_head, seq_len, head_dim) = q.dims4()?;
+    let (kb, kkv, kd, t_k) = k_t.dims4()?;
+    if (kb, kkv, kd) != (b_sz, q.dim(1)? / (q.dim(1)? / kkv), head_dim) {
+        candle::bail!(
+            "gqa_attention_k_transposed: k_t shape {:?} incompatible with q {:?}",
+            k_t.dims(),
+            q.dims()
+        );
+    }
+    let n_kv_head = kkv;
+    debug_assert_eq!(n_head % n_kv_head, 0, "n_head must be divisible by n_kv_head");
+    let n_rep = n_head / n_kv_head;
+    // k_t is assumed already contiguous; if not, materialise (this is a
+    // one-time transition cost that rocBLAS batched gemm needs).
+    let k_t_owned;
+    let k_t_ref: &Tensor = if k_t.is_contiguous() {
+        k_t
+    } else {
+        k_t_owned = k_t.contiguous()?;
+        &k_t_owned
+    };
+    gqa_attention_inner(
+        q, k_t_ref, v, mask, attn_scale, b_sz, n_head, n_kv_head, n_rep, seq_len, t_k, head_dim,
+    )
+}
+
+/// Shared inner computation used by both `gqa_attention` and
+/// `gqa_attention_k_transposed`. Assumes `k_t` is the already-transposed
+/// K tensor of shape `(B, n_kv_head, D, T)`.
+#[allow(clippy::too_many_arguments)]
+fn gqa_attention_inner(
+    q: &Tensor,
+    k_t: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    attn_scale: f64,
+    b_sz: usize,
+    n_head: usize,
+    n_kv_head: usize,
+    n_rep: usize,
+    seq_len: usize,
+    t_k: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
+    // Zero-copy reshape: Q (B, n_head, L, D) → (B, n_kv_head, n_rep*L, D).
+    // When `n_rep == 1` this is a no-op rename; otherwise it groups the
+    // n_rep Q sub-heads that share each KV head into one batch matrix row.
+    let q_grouped = q.reshape((b_sz, n_kv_head, n_rep * seq_len, head_dim))?;
 
     // Batched matmul: batch = B * n_kv_head, each is (n_rep*L, D) × (D, T).
-    let attn_weights = q_grouped.matmul(&k_t)?;
+    let attn_weights = q_grouped.matmul(k_t)?;
 
     // Un-flatten for scale + mask + softmax: (B, n_kv_head, n_rep*L, T) →
     // (B, n_head, L, T). Zero-copy because the matmul output is contiguous.
@@ -449,6 +513,34 @@ impl StandardAttention {
         mask: Option<&Tensor>,
         offset: usize,
     ) -> Result<Tensor> {
+        let q = self.prepare_q(x, offset)?;
+        let (b_sz, seq_len, _) = x.dims3()?;
+        // GQA via zero-copy Q reshape — see `gqa_attention` doc. K and V stay
+        // at `(B, n_kv_head, T, D)`; there is no physical broadcast copy.
+        let attn_output = gqa_attention(&q, k, v, mask, self.attn_scale)?;
+        self.finish_attn(attn_output, b_sz, seq_len)
+    }
+
+    /// Attack C variant: run the attention block with a **pre-transposed K**
+    /// (`(B, n_kv_head, D, T)`) so the internal `k.transpose().contiguous()`
+    /// materialisation is skipped. Caller must supply K in that layout —
+    /// typically from a `KvCache::new_k_transposed` cache.
+    pub fn forward_with_kv_transposed(
+        &self,
+        x: &Tensor,
+        k_t: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+    ) -> Result<Tensor> {
+        let q = self.prepare_q(x, offset)?;
+        let (b_sz, seq_len, _) = x.dims3()?;
+        let attn_output = gqa_attention_k_transposed(&q, k_t, v, mask, self.attn_scale)?;
+        self.finish_attn(attn_output, b_sz, seq_len)
+    }
+
+    /// Shared prefix for `forward_with_kv*`: project + reshape + Q-norm + RoPE.
+    fn prepare_q(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let mut q = self.wq.forward(x)?;
         q = q
@@ -459,13 +551,11 @@ impl StandardAttention {
             q = qn.forward(&q)?;
         }
         // Q gets RoPE'd here. K was already rotated inside compute_kv.
-        let q = self.rotary.apply_one(&q, offset)?;
+        self.rotary.apply_one(&q, offset)
+    }
 
-        // GQA via zero-copy Q reshape — see `gqa_attention` doc. K and V stay
-        // at `(B, n_kv_head, T, D)`; there is no physical broadcast copy.
-        let attn_output = gqa_attention(&q, k, v, mask, self.attn_scale)?;
-
-        // Reshape back: (B, H, L, D) → (B, L, H*D) → wo
+    /// Shared suffix for `forward_with_kv*`: reshape back + wo.
+    fn finish_attn(&self, attn_output: Tensor, b_sz: usize, seq_len: usize) -> Result<Tensor> {
         let attn_output = attn_output
             .transpose(1, 2)?
             .contiguous()?
@@ -559,9 +649,10 @@ impl GatedAttention {
         let q_norm = gg.rms_norm(&format!("{prefix}.attn_q_norm.weight"), cfg.rms_norm_eps)?;
         let k_norm = gg.rms_norm(&format!("{prefix}.attn_k_norm.weight"), cfg.rms_norm_eps)?;
 
-        // dim=2 because the cached K/V are stored as
-        // (B, n_kv_head, seq, head_dim).
-        let kv_cache = KvCache::new(2, KV_CACHE_INITIAL);
+        // Attack C: K is stored pre-transposed (B, n_kv_head, D, T) so
+        // attention can skip the per-call `k.t().contiguous()`. V stays
+        // in the canonical `(B, n_kv_head, T, head_dim)` layout (dim=2).
+        let kv_cache = KvCache::new_k_transposed(2, KV_CACHE_INITIAL);
 
         Ok(Self {
             wqkv,
@@ -626,13 +717,14 @@ impl GatedAttention {
         // sources. `Tensor::contiguous` is a no-op when the tensor
         // is already contiguous, so we can call it unconditionally
         // without wasting work on the common case.
+        //
+        // With Attack C, `kv_cache` is `new_k_transposed` so the
+        // returned K is already `(B, n_kv_head, D, T)` and we pass it
+        // straight into `gqa_attention_k_transposed`.
         let k = k.contiguous()?;
         let v = v.contiguous()?;
-        let (k, v) = self.kv_cache.append(&k, &v)?;
-
-        // GQA via zero-copy Q reshape — see `gqa_attention` doc. K and V
-        // stay at `(B, n_kv_head, T, D)`; no physical broadcast copy.
-        let attn_output = gqa_attention(&q, &k, &v, mask, self.attn_scale)?;
+        let (k_t, v) = self.kv_cache.append(&k, &v)?;
+        let attn_output = gqa_attention_k_transposed(&q, &k_t, &v, mask, self.attn_scale)?;
 
         // Gate: attn_output * sigmoid(gate). Both are `(B, n_head, L, D)`.
         let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;
@@ -753,6 +845,75 @@ mod tests {
              (b={b_sz}, n_head={n_head}, n_kv={n_kv_head}, L={seq_len}, \
               T={t_cache}, D={head_dim}, mask={use_mask})"
         );
+    }
+
+    /// Attack C regression: `gqa_attention_k_transposed(q, k_t, v, ...)`
+    /// must produce bit-identical output to `gqa_attention(q, k, v, ...)`
+    /// when `k_t = k.transpose(-2, -1).contiguous()`. Covers several GQA
+    /// ratios and both masked / unmasked paths.
+    fn run_gqa_k_transposed_case(
+        b_sz: usize,
+        n_head: usize,
+        n_kv_head: usize,
+        seq_len: usize,
+        t_cache: usize,
+        head_dim: usize,
+        use_mask: bool,
+    ) {
+        let dev = &Device::Cpu;
+        let q = Tensor::randn(0f32, 0.1, (b_sz, n_head, seq_len, head_dim), dev).unwrap();
+        let k = Tensor::randn(0f32, 0.1, (b_sz, n_kv_head, t_cache, head_dim), dev).unwrap();
+        let v = Tensor::randn(0f32, 0.1, (b_sz, n_kv_head, t_cache, head_dim), dev).unwrap();
+
+        let mask = if use_mask {
+            let raw: Vec<f32> = (0..seq_len)
+                .flat_map(|i| {
+                    (0..t_cache).map(move |j| {
+                        if j > i + (t_cache - seq_len) {
+                            f32::NEG_INFINITY
+                        } else {
+                            0.0
+                        }
+                    })
+                })
+                .collect();
+            Some(Tensor::from_vec(raw, (seq_len, t_cache), dev).unwrap())
+        } else {
+            None
+        };
+
+        let scale = 1.0 / (head_dim as f64).sqrt();
+
+        // Reference: normal gqa_attention with canonical K layout.
+        let reference = gqa_attention(&q, &k, &v, mask.as_ref(), scale).unwrap();
+
+        // Attack C path: pre-transpose K to (B, n_kv_head, D, T) and use
+        // the `*_k_transposed` entry point, which skips the internal
+        // k.t().contiguous() materialisation.
+        let k_t = k.transpose(2, 3).unwrap().contiguous().unwrap();
+        let got = gqa_attention_k_transposed(&q, &k_t, &v, mask.as_ref(), scale).unwrap();
+
+        assert_eq!(got.dims(), reference.dims());
+        let diff = max_abs_diff(&got, &reference);
+        assert!(
+            diff < 1e-5,
+            "gqa_attention_k_transposed diverged from gqa_attention: \
+             max_abs_diff = {diff} (b={b_sz}, n_head={n_head}, n_kv={n_kv_head}, \
+             L={seq_len}, T={t_cache}, D={head_dim}, mask={use_mask})"
+        );
+    }
+
+    #[test]
+    fn test_gqa_attention_k_transposed_matches_reference() {
+        // n_rep = 1 / 2 / 4 / 8, with and without mask, various shapes.
+        run_gqa_k_transposed_case(1, 8, 8, 4, 4, 16, false);
+        run_gqa_k_transposed_case(1, 8, 8, 4, 4, 16, true);
+        run_gqa_k_transposed_case(1, 8, 4, 5, 5, 16, true);
+        run_gqa_k_transposed_case(1, 16, 4, 6, 6, 16, true);
+        run_gqa_k_transposed_case(1, 16, 2, 4, 7, 16, true);
+        run_gqa_k_transposed_case(1, 32, 2, 3, 9, 16, true);
+        // Decode-like rectangular mask: L_q=1, T > 1 with KV prefix.
+        run_gqa_k_transposed_case(1, 8, 4, 1, 16, 16, true);
     }
 
     #[test]

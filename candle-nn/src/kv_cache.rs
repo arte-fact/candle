@@ -83,13 +83,54 @@ impl Cache {
 pub struct KvCache {
     k: Cache,
     v: Cache,
+    /// When true, K is stored with its **seq** axis on the last dim
+    /// (i.e. `(..., D, T)` instead of `(..., T, D)`). Appends auto-
+    /// transpose the incoming K before writing. Used by attention
+    /// fast paths (Attack C) that want to skip an in-kernel
+    /// `k.transpose().contiguous()` materialisation per call.
+    ///
+    /// V stays in the canonical `(..., T, D)` layout.
+    k_is_transposed: bool,
 }
 
 impl KvCache {
     pub fn new(dim: usize, max_seq_len: usize) -> Self {
         let k = Cache::new(dim, max_seq_len);
         let v = Cache::new(dim, max_seq_len);
-        Self { k, v }
+        Self {
+            k,
+            v,
+            k_is_transposed: false,
+        }
+    }
+
+    /// Create a KvCache that stores K in the `(..., D, T)` transposed
+    /// layout while V remains `(..., T, D)`. `dim_v` is the seq dim
+    /// for V (e.g. `2` for `(B, n_kv_head, T, D)`); K's seq dim is
+    /// `dim_v + 1`.
+    ///
+    /// `append` takes K in its canonical `(..., T_new, D)` shape and
+    /// automatically transposes it before writing — callers don't need
+    /// to change how they produce K. `k()` then returns the stored
+    /// transposed view `(..., D, T_current)` directly.
+    ///
+    /// Savings: the per-call transpose-and-contiguous of the full
+    /// growing K cache (O(T) per decode step → O(T²) per generation)
+    /// collapses to a per-step transpose of only the new row
+    /// (`seq_new × D`, i.e. `1 × D` for decode).
+    pub fn new_k_transposed(dim_v: usize, max_seq_len: usize) -> Self {
+        let k = Cache::new(dim_v + 1, max_seq_len);
+        let v = Cache::new(dim_v, max_seq_len);
+        Self {
+            k,
+            v,
+            k_is_transposed: true,
+        }
+    }
+
+    /// Whether K is stored in the transposed `(..., D, T)` layout.
+    pub fn k_is_transposed(&self) -> bool {
+        self.k_is_transposed
     }
 
     pub fn k_cache(&self) -> &Cache {
@@ -117,27 +158,49 @@ impl KvCache {
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        self.k.append(k)?;
+        if self.k_is_transposed {
+            // Swap last two axes of the incoming K so it matches the
+            // (..., D, T_new) storage layout. For (B, n_kv_h, T_new, D)
+            // that swaps dims 2 and 3 → (B, n_kv_h, D, T_new).
+            let rank = k.rank();
+            if rank < 2 {
+                candle::bail!("KvCache::append: k must have rank >= 2 (transposed mode)")
+            }
+            let k_t = k.transpose(rank - 2, rank - 1)?.contiguous()?;
+            self.k.append(&k_t)?;
+        } else {
+            self.k.append(k)?;
+        }
         self.v.append(v)?;
         let out_k = self.k.current_data()?;
         let out_v = self.v.current_data()?;
-        let k = match out_k {
+        let out_k = match out_k {
             None => {
+                // Empty cache — return a 0-length tensor with the
+                // storage-layout shape so callers still get a usable
+                // dim signature.
                 let mut shape = k.dims().to_vec();
-                shape[self.k.dim] = 0;
+                if self.k_is_transposed {
+                    // Storage layout is (..., D, T). Swap last two.
+                    let rank = shape.len();
+                    shape.swap(rank - 2, rank - 1);
+                    shape[self.k.dim] = 0;
+                } else {
+                    shape[self.k.dim] = 0;
+                }
                 Tensor::zeros(shape, k.dtype(), k.device())?
             }
             Some(k) => k,
         };
-        let v = match out_v {
+        let out_v = match out_v {
             None => {
                 let mut shape = v.dims().to_vec();
-                shape[self.k.dim] = 0;
+                shape[self.v.dim] = 0;
                 Tensor::zeros(shape, v.dtype(), v.device())?
             }
             Some(v) => v,
         };
-        Ok((k, v))
+        Ok((out_k, out_v))
     }
 
     pub fn current_seq_len(&self) -> usize {

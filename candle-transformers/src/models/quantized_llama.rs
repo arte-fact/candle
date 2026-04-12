@@ -210,96 +210,43 @@ impl LayerWeights {
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
 
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
+        // Attack C: store K **already transposed** to (B, n_kv_h, D, T)
+        // so the decode-time growth only pays for the new row
+        // `(D, seq_len_new)` each step instead of re-transposing the
+        // full cache `(D, T)` per step inside `gqa_attention`.
+        //
+        // V stays in the canonical `(B, n_kv_h, T, D)` layout. Cat for
+        // K happens on the last dim (the seq dim of the transposed
+        // form), for V on dim=2.
+        let k_t_new = k.transpose(2, 3)?.contiguous()?;
+        let (k_t, v) = match &self.kv_cache {
+            None => (k_t_new, v),
+            Some((k_t_cache, v_cache)) => {
                 if index_pos == 0 {
-                    (k, v)
+                    (k_t_new, v)
                 } else {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?;
+                    let k_t = Tensor::cat(&[k_t_cache, &k_t_new], 3)?;
                     let v = Tensor::cat(&[v_cache, &v], 2)?;
-                    (k, v)
+                    (k_t, v)
                 }
             }
         };
-        self.kv_cache = Some((k.clone(), v.clone()));
+        self.kv_cache = Some((k_t.clone(), v.clone()));
 
-        // P2: HIP flash-attention fast path. Replaces the
-        // `repeat_kv + matmul + mask + softmax + matmul` chain with a single
-        // kernel launch when all preconditions are met.
+        // Attack C: HIP fast path using `gqa_attention_k_transposed`
+        // with the pre-transposed K from our kv_cache. K is already in
+        // `(B, n_kv_h, D, T)` layout so the inner matmul is a direct
+        // `(B, n_kv_h, n_rep*L, D) × (B, n_kv_h, D, T)` with no
+        // transpose materialisation per call. Internally still uses
+        // Q0c's fused `masked_softmax_scale`.
         //
-        // **Opt-in via CANDLE_FLASH_ATTN_ENABLE=1**. The v1 kernel is BR=1
-        // (one Q row per Wave64) and the scalar j-loop pattern can't tile
-        // K/V loads across Q rows, so on TinyLlama prefill shapes it runs
-        // ~17× slower per-call than rocBLAS Tensile. The broken-even case
-        // is models where the rocBLAS attention category is much larger
-        // (qwen-moe class), so we keep the plumbing + oracle tests in-tree
-        // for future BR>1 tiling work but default to OFF to preserve the
-        // baseline. See BENCH-P2-FLASH-ATTN-v1-2026-04-11.md.
-        //
-        // When enabled, the kernel does the GQA broadcast internally
-        // (h_kv = h_idx / n_rep), so we pass the un-expanded K/V — no
-        // `repeat_kv` materialisation. The fast path additionally requires
-        // L_q >= 4: for decode (L_q=1) the grid collapses to `n_head`
-        // blocks which under-utilises gfx906's 60 CUs.
-        #[cfg(feature = "hip")]
-        let flash_attn_out: Option<Tensor> = if std::env::var("CANDLE_FLASH_ATTN_ENABLE").is_err() {
-            None
-        } else if seq_len >= 4
-            && matches!(q.device(), Device::Hip(_))
-            && q.dtype() == DType::F32
-            && q.is_contiguous()
-            && k.is_contiguous()
-            && v.is_contiguous()
-            && (self.head_dim == 64 || self.head_dim == 128)
-        {
-            // Build an additive f32 mask from the u8 causal mask. The
-            // original mask is (seq_len, kv_len) u8 with 1 = block, 0 = attend.
-            // Flash-attn expects f32 with -inf for blocked, 0 for allowed,
-            // broadcast-compatible with (B, 1, L_q, L_k).
-            let mask_additive = match mask {
-                None => Ok::<Option<Tensor>, candle::Error>(None),
-                Some(m) => {
-                    let mdims = m.dims();
-                    let zero = Tensor::zeros(mdims, DType::F32, q.device())?;
-                    let neg = self.neg_inf.broadcast_as(mdims)?;
-                    let add = m.where_cond(&neg, &zero)?;
-                    let (a, b) = (mdims[0], mdims[1]);
-                    Some(add.reshape((1, 1, a, b))?.contiguous()).transpose()
-                }
-            }?;
-            let scale = 1.0 / (self.head_dim as f64).sqrt();
-            Some(candle::hip_backend::flash_attn_fused(
-                &q,
-                &k,
-                &v,
-                mask_additive.as_ref(),
-                scale,
-            )?)
-        } else {
-            None
-        };
-        #[cfg(not(feature = "hip"))]
-        let flash_attn_out: Option<Tensor> = None;
-
-        // Q1: HIP fast path uses the zero-copy GQA reshape from
-        // `quantized_blocks::attention::gqa_attention`. It reshapes the
-        // Q heads into `n_rep * L` rows against the un-expanded K/V,
-        // so we skip the two `repeat_kv` materialisations (each of
-        // which was calling `Tensor::cat` n_rep times per layer per
-        // forward → ~22 k copy2d_f32 dispatches on TinyLlama decode).
-        // `gqa_attention` internally uses Q0c's fused
-        // `masked_softmax_scale` when the preconditions allow.
-        //
-        // The mask for this path must be an additive f32 tensor
-        // broadcast-compatible with `(B, 1, L_q, L_k)`. The upstream
-        // mask is a u8 `(L_q, L_k)` with 1 = block, 0 = attend; convert
-        // via `where_cond` and reshape once per forward.
+        // Mask conversion is the same as Q1: u8 causal mask →
+        // additive f32 → reshaped to (1, 1, seq_len, kv_len).
         #[cfg(feature = "hip")]
         let hip_fast_out: Option<Tensor> = if matches!(q.device(), Device::Hip(_))
             && q.dtype() == DType::F32
             && q.is_contiguous()
-            && k.is_contiguous()
+            && k_t.is_contiguous()
             && v.is_contiguous()
         {
             let mask_additive: Option<Tensor> = match mask {
@@ -314,9 +261,9 @@ impl LayerWeights {
                 }
             };
             let scale = 1.0 / (self.head_dim as f64).sqrt();
-            let out = crate::models::quantized_blocks::attention::gqa_attention(
+            let out = crate::models::quantized_blocks::attention::gqa_attention_k_transposed(
                 &q,
-                &k,
+                &k_t,
                 &v,
                 mask_additive.as_ref(),
                 scale,
@@ -328,15 +275,15 @@ impl LayerWeights {
         #[cfg(not(feature = "hip"))]
         let hip_fast_out: Option<Tensor> = None;
 
-        let y = if let Some(out) = flash_attn_out {
-            out
-        } else if let Some(out) = hip_fast_out {
+        let y = if let Some(out) = hip_fast_out {
             out
         } else if q.device().is_metal() && seq_len == 1 {
-            // SDPA will do MQA for us
+            // SDPA will do MQA for us. Metal/CPU path still uses the
+            // normal (B, n_kv_h, T, D) layout; reconstruct from k_t.
+            let k_normal = k_t.transpose(2, 3)?.contiguous()?;
             candle_nn::ops::sdpa(
                 &q,
-                &k,
+                &k_normal,
                 &v,
                 None,
                 false,
@@ -344,8 +291,10 @@ impl LayerWeights {
                 1.,
             )?
         } else {
-            // Support for MQA, useful for 70B models and mistral.
-            let k = crate::utils::repeat_kv(k, self.n_head / self.n_kv_head)?;
+            // Non-HIP fallback: reconstruct normal-layout K, then use
+            // the original repeat_kv + rocBLAS chain.
+            let k_normal = k_t.transpose(2, 3)?.contiguous()?;
+            let k = crate::utils::repeat_kv(k_normal, self.n_head / self.n_kv_head)?;
             let v = crate::utils::repeat_kv(v, self.n_head / self.n_kv_head)?;
 
             let att = (q.matmul(&k.t()?)? / (self.head_dim as f64).sqrt())?;
@@ -357,7 +306,6 @@ impl LayerWeights {
                 }
             };
             let att = candle_nn::ops::softmax_last_dim(&att)?;
-            // Convert to contiguous as matmul doesn't support strided vs for now.
             att.matmul(&v.contiguous()?)?
         };
 

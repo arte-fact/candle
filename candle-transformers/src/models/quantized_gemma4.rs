@@ -541,10 +541,14 @@ impl ModelWeights {
                     }
                     let cache = self.kv_caches[il]
                         .get_or_insert_with(|| {
-                            // dim=2 = sequence dim of (B, n_kv_head, T, head_dim).
-                            // 4096 covers the typical chat context;
-                            // KvCache grows automatically beyond.
-                            candle_nn::kv_cache::KvCache::new(2, 4096)
+                            // Attack C: K is stored pre-transposed
+                            // (B, n_kv_head, D, T) so attention can skip
+                            // the per-call `k.t().contiguous()` materialise.
+                            // `dim_v=2` = sequence dim of V's
+                            // `(B, n_kv_head, T, head_dim)`. K lives at
+                            // dim_v+1 = 3. 4096 covers the typical chat
+                            // context; KvCache grows automatically beyond.
+                            candle_nn::kv_cache::KvCache::new_k_transposed(2, 4096)
                         });
                     // KvCache::append needs contiguous sources.
                     let k_new = if k_new.is_contiguous() { k_new } else { k_new.contiguous()? };
@@ -579,7 +583,10 @@ impl ModelWeights {
                 (k, v)
             };
 
-            let attn = self.layers[il].attn.forward_with_kv(
+            // Attack C: K is pre-transposed in the cache, so use the
+            // `*_transposed` variant which skips the internal
+            // `k.t().contiguous()` materialisation inside attention.
+            let attn = self.layers[il].attn.forward_with_kv_transposed(
                 &x_norm,
                 &k_use,
                 &v_use,
