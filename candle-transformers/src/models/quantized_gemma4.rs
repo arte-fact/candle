@@ -373,6 +373,14 @@ impl ModelWeights {
                 layer_cfg.head_dim = layer_head_dim;
                 layer_cfg.head_count_kv = PerLayer::Uniform(head_count_kv_per_layer[il]);
 
+                // Gemma4 attention: the Q weights have `1/sqrt(query_pre_attn_scalar)`
+                // baked in, so inference scale is 1.0. This is true for both
+                // E4B (256) and 26B-A4B (assumed same convention).
+                //
+                // TODO: the 26B-A4B model's GGUF doesn't have
+                // `query_pre_attn_scalar` metadata — turbo reads it from
+                // `n_embd_head_k`. Need to verify the correct scale for
+                // the 26B variant. The `Some(1.0)` works for E4B.
                 let attn_opts = StandardAttentionOpts {
                     use_v_norm: true,
                     use_gemma_norms: false,
@@ -395,7 +403,7 @@ impl ModelWeights {
                 )?;
                 let ffn_norm =
                     lgg.rms_norm(&format!("{block_prefix}.ffn_norm.weight"), rms_norm_eps)?;
-                let post_ffn_norm = lgg
+                let mut post_ffn_norm = lgg
                     .rms_norm(&format!("{block_prefix}.post_ffw_norm.weight"), rms_norm_eps)?;
 
                 // Gemma4 FFN uses GeGLU.
@@ -435,6 +443,16 @@ impl ModelWeights {
                     )?;
                     let down_exps_scale =
                         lgg.try_dequantize(&format!("{block_prefix}.ffn_down_exps.scale"));
+                    // Override the dense post-norm: when MoE is active,
+                    // turbo uses `post_ffw_norm_1` (not `post_ffw_norm`)
+                    // for the dense branch. These are different learned
+                    // weights.
+                    if let Ok(pn1) = lgg.rms_norm(
+                        &format!("{block_prefix}.post_ffw_norm_1.weight"),
+                        rms_norm_eps,
+                    ) {
+                        post_ffn_norm = pn1;
+                    }
                     Some(MoeBranch {
                         gate_inp,
                         gate_inp_s,
@@ -794,6 +812,18 @@ impl ModelWeights {
                 let moe_summed = weighted.sum(1)?; // sum across topk dim
                 let moe_summed = moe_summed.reshape((b_sz_ff, seq_len_ff, hidden))?;
                 let moe_normed = moe_branch.post_norm.forward(&moe_summed)?;
+
+                // Debug: zero out outputs for isolation
+                let moe_normed = if std::env::var("CANDLE_GEMMA4_ZERO_MOE").is_ok() {
+                    Tensor::zeros_like(&moe_normed)?
+                } else {
+                    moe_normed
+                };
+                let dense_normed = if std::env::var("CANDLE_GEMMA4_ZERO_DENSE").is_ok() {
+                    Tensor::zeros_like(&dense_normed)?
+                } else {
+                    dense_normed
+                };
 
                 // Combine branches + residual
                 if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
