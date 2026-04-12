@@ -522,15 +522,21 @@ impl ModelWeights {
         let last_gg = gg.with_device(last_dev.clone());
         let norm = last_gg.rms_norm("output_norm.weight", rms_norm_eps)?;
         // gemma4 uses tied word embeddings: the lm_head IS token_embd.
-        // Some GGUFs also have a separate `output.weight` with wrong shape
-        // for lm_head (e.g., [2816, 4096] instead of [vocab, hidden] for
-        // the 26B-A4B model). Always prefer token_embd.weight.
-        let output = last_gg
-            .try_qmatmul("token_embd.weight")
-            .or_else(|| last_gg.try_qmatmul("output.weight"))
-            .ok_or_else(|| {
-                candle::Error::Msg("missing lm_head weight (token_embd.weight or output.weight)".into())
-            })?;
+        // IMPORTANT: the 26B-A4B GGUF has `output.weight` that shares
+        // the same data offset as `blk.0.attn_output.weight` — loading
+        // it as the lm_head produces wrong logits. Always use
+        // token_embd.weight for the lm_head.
+        let output = if let Some(te) = last_gg.try_qmatmul("token_embd.weight") {
+            eprintln!("[gemma4] lm_head loaded from token_embd.weight");
+            te
+        } else if let Some(ow) = last_gg.try_qmatmul("output.weight") {
+            eprintln!("[gemma4] WARNING: lm_head from output.weight (token_embd not found)");
+            ow
+        } else {
+            return Err(candle::Error::Msg(
+                "missing lm_head weight (token_embd.weight or output.weight)".into(),
+            ));
+        };
 
         // Pre-allocated KV cache slot per layer. Slot is `None` for
         // shared-KV layers (which borrow from another layer's slot).
@@ -702,6 +708,13 @@ impl ModelWeights {
                 (k, v)
             };
 
+            // Dump layer 0 attention inputs for turbo comparison
+            if il == 0 && std::env::var("CANDLE_GEMMA4_DUMP_L0").is_ok() {
+                let xn: Vec<f32> = x_norm.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                eprintln!("[L0 attn_in] first tok [0..5]: {:.6?}", &xn[..5]);
+                let kv = k_use.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+                eprintln!("[L0 k_cache] first 5 vals: {:.6?} shape={:?}", &kv[..5.min(kv.len())], k_use.shape());
+            }
             // Attack C: K is pre-transposed in the cache, so use the
             // `*_transposed` variant which skips the internal
             // `k.t().contiguous()` materialisation inside attention.
@@ -712,6 +725,10 @@ impl ModelWeights {
                 attention_mask.as_ref(),
                 index_pos,
             )?;
+            if il == 0 && std::env::var("CANDLE_GEMMA4_DUMP_L0").is_ok() {
+                let ao: Vec<f32> = attn.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                eprintln!("[L0 attn_out] first tok [0..5]: {:.6?} abs_mean={:.4}", &ao[..5], ao.iter().map(|v| v.abs()).sum::<f32>() / ao.len() as f32);
+            }
             // Fused post-attn norm + residual add (Q0a). On HIP this is
             // one launch; falls back to rms_norm + add otherwise.
             let x = self.layers[il]
