@@ -472,6 +472,12 @@ impl ModelWeights {
 
                 let layer_output_scale =
                     lgg.try_dequantize(&format!("{block_prefix}.layer_output_scale.weight"));
+                if il < 2 {
+                    if let Some(ref s) = layer_output_scale {
+                        let v: Vec<f32> = s.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                        eprintln!("[load L{il}] layer_output_scale = {v:?}");
+                    }
+                }
 
                 let per_layer_embed = if n_embd_per_layer > 0 {
                     let inp_gate = lgg.try_qmatmul(&format!("{block_prefix}.inp_gate.weight"));
@@ -515,11 +521,16 @@ impl ModelWeights {
         let last_dev = devices[layer_to_device[block_count - 1]].clone();
         let last_gg = gg.with_device(last_dev.clone());
         let norm = last_gg.rms_norm("output_norm.weight", rms_norm_eps)?;
-        let lm_head_tensor = last_gg
-            .try_qmatmul("output.weight")
-            .or_else(|| last_gg.try_qmatmul("token_embd.weight"))
-            .ok_or_else(|| candle::Error::Msg("missing output.weight and token_embd.weight".into()))?;
-        let output = lm_head_tensor;
+        // gemma4 uses tied word embeddings: the lm_head IS token_embd.
+        // Some GGUFs also have a separate `output.weight` with wrong shape
+        // for lm_head (e.g., [2816, 4096] instead of [vocab, hidden] for
+        // the 26B-A4B model). Always prefer token_embd.weight.
+        let output = last_gg
+            .try_qmatmul("token_embd.weight")
+            .or_else(|| last_gg.try_qmatmul("output.weight"))
+            .ok_or_else(|| {
+                candle::Error::Msg("missing lm_head weight (token_embd.weight or output.weight)".into())
+            })?;
 
         // Pre-allocated KV cache slot per layer. Slot is `None` for
         // shared-KV layers (which borrow from another layer's slot).
@@ -561,6 +572,10 @@ impl ModelWeights {
         let first_layer_dev = self.layers[0].device.clone();
         let mut layer_in = layer_in_cpu.to_device(&first_layer_dev)?;
         layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
+        if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
+            let emb: Vec<f32> = layer_in.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+            eprintln!("[EMBED] first token (scaled): [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]", emb[0], emb[1], emb[2], emb[3], emb[4]);
+        }
 
         // ----- per-layer embedding (E4B) — compute once on dev0 ------------
         let inp_per_layer: Option<Tensor> = if let Some(ref ple) = self.per_layer_embeddings {
@@ -839,6 +854,11 @@ impl ModelWeights {
                 let residual = x.clone();
                 let ffn_in = self.layers[il].ffn_norm.forward(&x)?;
                 let ffn_out = self.layers[il].mlp.forward(&ffn_in)?;
+                if il == 0 && std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
+                    let d_abs = ffn_out.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_vec0::<f32>().unwrap();
+                    let r_abs = residual.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_vec0::<f32>().unwrap();
+                    eprintln!("[E4B L{il}] dense_ffn={d_abs:.3} residual={r_abs:.3}");
+                }
                 // Fused post-ffn norm + residual add (Q0a).
                 self.layers[il]
                     .post_ffn_norm
@@ -874,11 +894,35 @@ impl ModelWeights {
 
         // ----- final norm + lm_head + softcap ------------------------------
         let x = layer_in.i((.., seq_len - 1, ..))?;
+        if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
+            let x_cpu: Vec<f32> = x.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+            let has_nan = x_cpu.iter().any(|v| v.is_nan());
+            let has_inf = x_cpu.iter().any(|v| v.is_infinite());
+            let abs_mean = x_cpu.iter().map(|v| v.abs()).sum::<f32>() / x_cpu.len() as f32;
+            eprintln!("[FINAL] pre-norm: shape={:?} nan={has_nan} inf={has_inf} abs_mean={abs_mean:.4}", x.shape());
+        }
         let x = self.norm.forward(&x)?;
         let logits = self.output.forward(&x)?;
+        if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
+            eprintln!("[FINAL] softcap={:?}", self.final_logit_softcap);
+            let l_cpu: Vec<f32> = logits.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+            let top5: Vec<(usize, f32)> = {
+                let mut indexed: Vec<_> = l_cpu.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                indexed[..5.min(indexed.len())].to_vec()
+            };
+            eprintln!("[FINAL] logits top5={top5:?} has_nan={}", l_cpu.iter().any(|v| v.is_nan()));
+        }
 
         if let Some(soft_cap) = self.final_logit_softcap {
-            (&logits / soft_cap)?.tanh()? * soft_cap
+            // Compute softcap in f64 to preserve discrimination at high
+            // logit magnitudes. At f32, tanh(x) for x > ~9 returns exactly
+            // 1.0f, losing all contrast between top tokens. The 26B-A4B
+            // model produces raw logits of 300+ (legitimate for Q8_0
+            // embeddings with dim 2816) where f32 tanh saturates.
+            let logits64 = logits.to_dtype(candle::DType::F64)?;
+            let capped = ((&logits64 / soft_cap)?.tanh()? * soft_cap)?;
+            capped.to_dtype(candle::DType::F32)
         } else {
             Ok(logits)
         }
