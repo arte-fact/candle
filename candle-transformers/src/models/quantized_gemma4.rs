@@ -65,12 +65,15 @@ struct PerLayerEmbeddings {
 
 /// Optional MoE branch present in gemma4-A4B (26B) but absent in
 /// gemma4-E4B (4B dense). When present, the FFN block is dual:
-///   out = post_norm_1(dense_mlp(norm_1(attn_out)))
-///       + post_norm_2(moe_ffn(norm_2(attn_out), router(attn_out)))
-/// Both branches read from `attn_out` (attention residual), NOT from
-/// each other. The router uses a custom logit computation:
-///   logits = gate_inp @ (rms_norm(attn_out) / sqrt(n_embd) * gate_inp_s)
+///   combined = post_norm_1(dense_ffn(norm_1(residual)))
+///            + post_norm_2(moe_ffn(norm_2(residual), router(residual)))
+///   out = residual + post_ffw_norm(combined)
+///
+/// THREE post-norms: _1 for dense, _2 for MoE, plain for combined.
+/// Both FFN branches read from `residual` (the post-attention output).
 struct MoeBranch {
+    /// Post-norm for the dense FFN branch (post_ffw_norm_1).
+    dense_post_norm: RmsNorm,
     /// Router weight matrix [n_experts, hidden_dim].
     gate_inp: QMatMul,
     /// Router input scale: learned per-element scale applied to the
@@ -443,17 +446,15 @@ impl ModelWeights {
                     )?;
                     let down_exps_scale =
                         lgg.try_dequantize(&format!("{block_prefix}.ffn_down_exps.scale"));
-                    // When MoE is present, load `post_ffw_norm_1` for
-                    // the dense branch post-norm. `post_ffw_norm` (without
-                    // _1) is a separate tensor — possibly unused or for a
-                    // different purpose in this model variant.
-                    if let Ok(pn1) = lgg.rms_norm(
+                    // post_ffw_norm_1 is the dense branch post-norm.
+                    // post_ffw_norm (plain, no suffix) stays as the THIRD
+                    // norm applied to the COMBINED dense+MoE output.
+                    let dense_post_norm = lgg.rms_norm(
                         &format!("{block_prefix}.post_ffw_norm_1.weight"),
                         rms_norm_eps,
-                    ) {
-                        post_ffn_norm = pn1;
-                    }
+                    )?;
                     Some(MoeBranch {
+                        dense_post_norm,
                         gate_inp,
                         gate_inp_s,
                         gate_up_exps,
@@ -746,7 +747,7 @@ impl ModelWeights {
                 // Branch 1: Dense MLP
                 let dense_in = self.layers[il].ffn_norm.forward(&attn_out)?;
                 let dense_out = self.layers[il].mlp.forward(&dense_in)?;
-                let dense_normed = self.layers[il].post_ffn_norm.forward(&dense_out)?;
+                let dense_normed = moe_branch.dense_post_norm.forward(&dense_out)?;
 
                 // Branch 2: MoE experts
                 let moe_in = moe_branch.pre_norm.forward(&attn_out)?;
@@ -867,26 +868,24 @@ impl ModelWeights {
                     dense_normed
                 };
 
-                // Debug: print first 5 values of each component
-                if il == 0 && std::env::var("CANDLE_GEMMA4_DUMP_L0").is_ok() {
-                    let dn: Vec<f32> = dense_normed.narrow(1,0,1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
-                    let mn: Vec<f32> = moe_normed.narrow(1,0,1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
-                    let ao: Vec<f32> = attn_out.narrow(1,0,1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
-                    eprintln!("[L0 combine] attn_out[:5]   = {:.4?}", &ao[..5]);
-                    eprintln!("[L0 combine] dense_normed[:5] = {:.4?}", &dn[..5]);
-                    eprintln!("[L0 combine] moe_normed[:5]  = {:.4?}", &mn[..5]);
-                    let sum: Vec<f32> = ao.iter().zip(dn.iter()).zip(mn.iter()).map(|((a,d),m)| a+d+m).collect();
-                    eprintln!("[L0 combine] sum[:5]        = {:.4?}", &sum[..5]);
-                }
-                // Combine branches + residual
-                if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
-                    let d_abs = dense_normed.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
-                    let m_abs = moe_normed.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
-                    let a_abs = attn_out.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
-                    let combined_abs = ((&attn_out + &dense_normed).unwrap() + &moe_normed).unwrap().abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
-                    eprintln!("[L{il}] attn={a_abs:.3} dense={d_abs:.3} moe={m_abs:.3} combined={combined_abs:.3}");
-                }
-                ((&attn_out + &dense_normed)? + &moe_normed)?
+                // Combine dense + MoE, apply the THIRD post-norm
+                // (`post_ffw_norm` = `post_feedforward_layernorm` in HF),
+                // THEN add the residual.
+                //
+                // Both turbo (gemma4-iswa.cpp:184-190) AND HF apply this:
+                //   combined = post_norm_1(dense) + post_norm_2(moe)
+                //   cur = post_ffw_norm(combined)     ← third norm!
+                //   cur = residual + cur
+                //
+                // `post_ffw_norm` is loaded from `post_ffw_norm.weight`
+                // (the ORIGINAL, unsuffixed tensor). It's stored in
+                // `self.layers[il].post_ffn_norm` because we did NOT
+                // override it — we loaded `_1` into MoeBranch.dense_post_norm
+                // separately.
+                let combined = (&dense_normed + &moe_normed)?;
+                self.layers[il]
+                    .post_ffn_norm
+                    .forward_post_residual(&combined, &attn_out)?
             } else {
                 // Dense-only path (E4B and similar).
                 let residual = x.clone();
