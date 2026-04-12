@@ -443,10 +443,10 @@ impl ModelWeights {
                     )?;
                     let down_exps_scale =
                         lgg.try_dequantize(&format!("{block_prefix}.ffn_down_exps.scale"));
-                    // Override the dense post-norm: when MoE is active,
-                    // turbo uses `post_ffw_norm_1` (not `post_ffw_norm`)
-                    // for the dense branch. These are different learned
-                    // weights.
+                    // When MoE is present, load `post_ffw_norm_1` for
+                    // the dense branch post-norm. `post_ffw_norm` (without
+                    // _1) is a separate tensor — possibly unused or for a
+                    // different purpose in this model variant.
                     if let Ok(pn1) = lgg.rms_norm(
                         &format!("{block_prefix}.post_ffw_norm_1.weight"),
                         rms_norm_eps,
@@ -810,6 +810,16 @@ impl ModelWeights {
                 let gate_up = moe_branch
                     .gate_up_exps
                     .indexed_moe_forward(&x_3d, &topk_ids)?;
+                // Debug: compare indexed_moe_forward result against CPU manual matmul
+                if il == 0 && std::env::var("CANDLE_GEMMA4_DUMP_L0").is_ok() {
+                    let gu_cpu: Vec<f32> = gate_up.narrow(0, 0, 1)?.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                    eprintln!("[L0 MoE] gate_up[tok0,expert0,:5] = {:.6?} shape={:?}", &gu_cpu[..5.min(gu_cpu.len())], gate_up.shape());
+                    // Manual: dequant expert 0's gate_up row 0, dot with input
+                    let expert0_id: u32 = topk_ids.narrow(0, 0, 1)?.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?[0];
+                    eprintln!("[L0 MoE] top expert for token 0: id={expert0_id}");
+                    let input_vals: Vec<f32> = x_3d.narrow(0, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                    eprintln!("[L0 MoE] input[0,:5] = {:.6?}", &input_vals[..5.min(input_vals.len())]);
+                }
                 let gate = gate_up
                     .narrow(candle::D::Minus1, 0, moe_branch.expert_intermediate)?
                     .contiguous()?;
@@ -857,6 +867,17 @@ impl ModelWeights {
                     dense_normed
                 };
 
+                // Debug: print first 5 values of each component
+                if il == 0 && std::env::var("CANDLE_GEMMA4_DUMP_L0").is_ok() {
+                    let dn: Vec<f32> = dense_normed.narrow(1,0,1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                    let mn: Vec<f32> = moe_normed.narrow(1,0,1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                    let ao: Vec<f32> = attn_out.narrow(1,0,1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
+                    eprintln!("[L0 combine] attn_out[:5]   = {:.4?}", &ao[..5]);
+                    eprintln!("[L0 combine] dense_normed[:5] = {:.4?}", &dn[..5]);
+                    eprintln!("[L0 combine] moe_normed[:5]  = {:.4?}", &mn[..5]);
+                    let sum: Vec<f32> = ao.iter().zip(dn.iter()).zip(mn.iter()).map(|((a,d),m)| a+d+m).collect();
+                    eprintln!("[L0 combine] sum[:5]        = {:.4?}", &sum[..5]);
+                }
                 // Combine branches + residual
                 if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
                     let d_abs = dense_normed.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_scalar::<f32>().unwrap();
