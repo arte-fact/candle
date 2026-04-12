@@ -129,7 +129,7 @@ impl Gguf {
             })
             .collect::<Result<_>>()?;
 
-        let dtype = infos[0].ggml_dtype;
+        let first_dtype = infos[0].ggml_dtype;
         let dims0 = infos[0].shape.dims();
         if dims0.len() != 2 {
             candle::bail!(
@@ -138,13 +138,10 @@ impl Gguf {
             );
         }
         let in_features = dims0[1];
+        let mut all_same_dtype = true;
         for (info, name) in infos.iter().zip(names.iter()).skip(1) {
-            if info.ggml_dtype != dtype {
-                candle::bail!(
-                    "qmatmul_concat_rows: dtype mismatch ({:?} vs {:?}) for {name}",
-                    dtype,
-                    info.ggml_dtype
-                );
+            if info.ggml_dtype != first_dtype {
+                all_same_dtype = false;
             }
             let d = info.shape.dims();
             if d.len() != 2 || d[1] != in_features {
@@ -156,34 +153,54 @@ impl Gguf {
         }
         let total_out: usize = infos.iter().map(|i| i.shape.dims()[0]).sum();
 
-        // Read each constituent's raw bytes from the blob and append.
-        let block_size = dtype.block_size();
-        let type_size = dtype.type_size();
-        let mut combined: Vec<u8> = Vec::with_capacity(
-            (total_out * in_features / block_size) * type_size,
-        );
-        for info in &infos {
-            let elems = info.shape.elem_count();
-            if elems % block_size != 0 {
-                candle::bail!(
-                    "qmatmul_concat_rows: elems {elems} not divisible by block_size {block_size}"
-                );
+        if all_same_dtype {
+            // Fast path: all constituents share the same GGML dtype.
+            // Read each constituent's raw bytes from the blob and append.
+            let dtype = first_dtype;
+            let block_size = dtype.block_size();
+            let type_size = dtype.type_size();
+            let mut combined: Vec<u8> = Vec::with_capacity(
+                (total_out * in_features / block_size) * type_size,
+            );
+            for info in &infos {
+                let elems = info.shape.elem_count();
+                if elems % block_size != 0 {
+                    candle::bail!(
+                        "qmatmul_concat_rows: elems {elems} not divisible by block_size {block_size}"
+                    );
+                }
+                let bytes = elems / block_size * type_size;
+                let abs_offset = self.ct.tensor_data_offset + info.offset;
+                let raw = self.blob.read_to_vec(abs_offset, bytes)?;
+                combined.extend_from_slice(&raw);
             }
-            let bytes = elems / block_size * type_size;
-            let abs_offset = self.ct.tensor_data_offset + info.offset;
-            let raw = self.blob.read_to_vec(abs_offset, bytes)?;
-            combined.extend_from_slice(&raw);
-        }
 
-        // Build a single QTensor from the concatenated bytes.
-        let combined_dims = vec![total_out, in_features];
-        let qt = candle::quantized::ggml_file::qtensor_from_ggml(
-            dtype,
-            &combined,
-            combined_dims,
-            &self.device,
-        )?;
-        QMatMul::from_weights(qt.into())
+            let combined_dims = vec![total_out, in_features];
+            let qt = candle::quantized::ggml_file::qtensor_from_ggml(
+                dtype,
+                &combined,
+                combined_dims,
+                &self.device,
+            )?;
+            QMatMul::from_weights(qt.into())
+        } else {
+            // Q4 MoE unblock: mixed-dtype path. UD quants (Q4_K_XL,
+            // Q8_K_XL, etc.) mix F16 and Q8_0 (or Q6K and Q8_0)
+            // across the Q/K/V heads. We can't byte-concatenate
+            // different quantisation formats. Instead: dequantise each
+            // constituent to f32 on the target device, cat along dim 0,
+            // and wrap as a non-quantized QMatMul::Tensor.
+            let mut f32_parts: Vec<candle::Tensor> = Vec::with_capacity(infos.len());
+            for (info, name) in infos.iter().zip(names.iter()) {
+                let qt = self.ct.tensor_from_blob(&self.blob, name, &self.device)?;
+                let t = qt.dequantize(&self.device)?;
+                f32_parts.push(t);
+            }
+            let refs: Vec<&candle::Tensor> = f32_parts.iter().collect();
+            let combined = candle::Tensor::cat(&refs, 0)?;
+            assert_eq!(combined.dims(), &[total_out, in_features]);
+            Ok(QMatMul::from_tensor(combined))
+        }
     }
 
     /// Load a tensor as RmsNorm.

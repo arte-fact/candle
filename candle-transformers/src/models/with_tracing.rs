@@ -122,6 +122,16 @@ impl QMatMul {
         let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
         Ok(Self { inner, span })
     }
+
+    /// Wrap a non-quantized f32/f16 tensor as a QMatMul. Used by the
+    /// Q4 MoE unblock path when `qmatmul_concat_rows` encounters
+    /// mixed-dtype constituents (e.g., F16 + Q8_0 in UD quants) and
+    /// has to dequantize to f32 before concatenating.
+    pub fn from_tensor(t: Tensor) -> Self {
+        let inner = candle::quantized::QMatMul::Tensor(t);
+        let span = tracing::span!(tracing::Level::TRACE, "qmatmul");
+        Self { inner, span }
+    }
 }
 
 impl Module for QMatMul {
