@@ -743,6 +743,24 @@ impl ModelWeights {
             && std::env::var("CANDLE_G2_REPLAY").is_ok()
             && std::env::var("CANDLE_G2_DISABLE").is_err();
 
+        // Phase P auto-gate. T-major K (Phase P) gives +3.9 % decode on its
+        // own but regresses −48 % when combined with G2 replay (captured
+        // plans reference legacy `flash_attn_v2_fwd_ktvs_*` kernels). So:
+        //   - default on when G2 is NOT requested (most users)
+        //   - default off when `CANDLE_G2_REPLAY` is set (existing G2 users)
+        //   - explicit `CANDLE_KV_TMAJOR=0|1` always wins (benchmarks, Q1 dev)
+        // Mirrors the `CANDLE_NKV_PAD` pattern used below for the G2 pad
+        // boundary. Computed once here, captured by the KvCache-init closure
+        // and re-read at the narrow + dispatch sites below.
+        #[cfg(feature = "hip")]
+        let k_is_canonical: bool = match std::env::var("CANDLE_KV_TMAJOR").ok().as_deref() {
+            Some("1") | Some("true") => true,
+            Some("0") | Some("false") => false,
+            _ => std::env::var("CANDLE_G2_REPLAY").is_err(),
+        };
+        #[cfg(not(feature = "hip"))]
+        let k_is_canonical: bool = false;
+
         // Token embedding lookup (lives on CPU to avoid VRAM blow-up on the
         // larger 31B variants). Move the looked-up rows to the first layer's
         // device — that's where the actual transformer work begins.
@@ -1332,15 +1350,11 @@ impl ModelWeights {
                         .get_or_insert_with(|| {
                             // Phase P: K canonical (B, H_kv, T, D) with D
                             // contiguous — enables mat-vec decode attention
-                            // (+3.9% on default path). OPT-IN via
-                            // `CANDLE_KV_TMAJOR=1` because G2/G3 replay
-                            // plans were captured against the legacy
-                            // flash_attn_v2_fwd_ktvs kernel names and
-                            // regress badly when the dispatch changes
-                            // under them (G2 46 → 27 t/s on E4B). Until
-                            // Phase Q integrates G2/G3 with canonical K,
-                            // default stays on legacy D-major.
-                            if std::env::var("CANDLE_KV_TMAJOR").is_ok() {
+                            // (+3.9% on default path). Gated by
+                            // `k_is_canonical` hoisted at forward() entry:
+                            // on when G2 replay is NOT requested (explicit
+                            // `CANDLE_KV_TMAJOR=0|1` always wins).
+                            if k_is_canonical {
                                 candle_nn::kv_cache::KvCache::new_k_canonical_stable(2, 4096)
                             } else {
                                 candle_nn::kv_cache::KvCache::new_k_transposed(2, 4096)
@@ -1388,12 +1402,10 @@ impl ModelWeights {
                         .ok_or_else(|| candle::Error::Msg("gemma4 k cache empty".into()))?;
                     let v_full = v_cache.all_data().as_ref()
                         .ok_or_else(|| candle::Error::Msg("gemma4 v cache empty".into()))?;
-                    // Phase P opt-in (CANDLE_KV_TMAJOR=1): K stored
-                    // canonically (B, H_kv, maxT, D) — narrow dim 2.
-                    // Default (opt-out): legacy D-major (B, H_kv, D,
-                    // maxT) — narrow dim 3.
-                    let k_tmajor = std::env::var("CANDLE_KV_TMAJOR").is_ok();
-                    let k = if k_tmajor {
+                    // Phase P canonical layout uses dim 2 (T axis);
+                    // legacy D-major uses dim 3. Flag hoisted at
+                    // forward() entry as `k_is_canonical`.
+                    let k = if k_is_canonical {
                         k_full.narrow(2, 0, l_k_padded)?
                     } else {
                         k_full.narrow(3, 0, l_k_padded)?
@@ -1449,10 +1461,10 @@ impl ModelWeights {
                     true
                 } else { false }
             } else { false };
-            // Phase P opt-in dispatch. CANDLE_KV_TMAJOR=1 routes decode
-            // through the mat-vec kernel on canonical K; default
-            // (legacy D-major K) stays on flash_attn_v2_fwd_ktvs.
-            let k_is_canonical = std::env::var("CANDLE_KV_TMAJOR").is_ok();
+            // Phase P dispatch. `k_is_canonical` (hoisted at forward()
+            // entry) routes decode through the mat-vec kernel on
+            // canonical K; legacy D-major K stays on
+            // flash_attn_v2_fwd_ktvs.
             let attn = if let Some((ref q_precomputed, _, _)) = shared_qkv {
                 let (b_sz, seq_len, _) = x_norm.dims3()?;
                 let (_, _, _, k_dim3) = k_use.dims4()?;
