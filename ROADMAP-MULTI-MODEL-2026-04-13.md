@@ -141,9 +141,32 @@ attention → post-norm → residual → ffn → post-ffn-norm → residual
 model formulation isn't the bug — it has to be correct because
 baseline+flash produces correct output.
 
-**Remaining:** replay output still incorrect (" I" instead of " help"
-at index_pos=14) despite full kernel coverage and per-call output
-evolution. Detailed diagnostics from earlier:
+**K13 ROOT CAUSE FOUND (commit 2d8c5ea0):** Gemma4-E4B's
+per-layer-embedding projections (`*.inp_gate.weight` and
+`*.proj.weight`) are stored as **F16** in the GGUF.
+`QMatMul::from_arc` unconditionally dequantizes F16/F32/BF16 to a
+plain `Tensor`, whose `forward` dispatches via `Tensor::matmul` →
+rocBLAS — bypassing the G2 launch recorder. 84 missing matmuls
+(2 per layer × 42 layers). Verified by per-op arg-pointer dump:
+`op[1378] rmsnorm` reads from `0x...95bb00` while preceding
+`op[1377] bmul` writes to `0x...95a600` — no captured op fills
+the gap (that's the missing per_layer_proj's MMVQ output).
+
+Fix: `QMatMul::requantize_to(Q8_0)` at load. Captured plan grew
+1389 → 1557 ops, all op outputs now evolve per replay. G2 replay
+output partially recovers ("Hello! How can I I I I can I help you
+today?"). G3 graph capture works (1557 nodes, 240 dynamic ops).
+Default decode unchanged AND faster — 47 → 62 t/s (Q8_0 MMVQ
+beats rocBLAS gemv for the 256-wide per_layer projections).
+
+**Remaining (smaller):** replays still pick wrong token despite
+per-call output evolution and full kernel coverage. Possibly Q8_0
+vs F16 quantization noise on per_layer, or one more uncaptured
+helper op.
+
+---
+
+(historical, K10) Detailed diagnostics from earlier:
 
   - `layer_in`, `inp_per_layer`, and SWA mask are all verified refreshed
     per call — prelude memcpys hit the sentinel-anchored pool slots
