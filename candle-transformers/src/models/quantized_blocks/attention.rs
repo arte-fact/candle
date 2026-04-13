@@ -249,6 +249,16 @@ pub(crate) fn gqa_attention_k_transposed(
             // replay but only wants to attend to the `l_k_iter` real
             // positions, dispatch to the kernel variant that iterates
             // [0 .. l_k_iter) while keeping strides based on `l_k_alloc`.
+            //
+            // NB: we still pass the contiguous `kt_c` (not the narrow'd
+            // `k_t` view). A previous attempt to skip the `.contiguous()`
+            // by feeding the kernel explicit K strides regressed decode
+            // 46.6 → 42.6 t/s on E4B — the stride-along-D jumps from
+            // `l_k_pad=256` to `max_T` (typically 4096), and the per-warp
+            // K-tile load pattern hits one uncoalesced VMEM transaction
+            // per lane. The copy is cheaper than uncoalesced K loads on
+            // gfx906. The kernel's explicit-K-stride path still exists
+            // for callers that can feed a coalesced stride pattern.
             let lk_iter = FLASH_L_K_ITER_OVERRIDE.with(|c| c.get());
             if let Some(l_k_iter) = lk_iter {
                 if let Ok(o) = candle::hip_backend::flash_attn_v2_kt_strided_v_dyn(

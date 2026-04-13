@@ -69,6 +69,16 @@ static __device__ __forceinline__ float v2_warp_reduce_sum(float x) {
 // only the first L_k_iter positions carry real token state), the kernel
 // skips the padded tail entirely — cutting flash-attn work from O(L_k_pad)
 // to O(L_k_real) each decode step.
+// K strides: when `k_head_stride > 0`, K is read via explicit per-head
+// and per-element strides (same pattern as V). This lets the caller pass
+// a narrow'd (non-contiguous) K view — e.g. gemma4's decode path where K
+// is stored in the KvCache as (B, H_kv, D, max_T) and the per-call
+// narrow to `L_k` keeps stride-along-D equal to `max_T`, not `L_k`.
+// Skipping the .contiguous() call saves a ~100 KiB/layer copy per token.
+//
+// When all three are 0 (the default), the kernel falls back to the
+// contiguous K_TRANS layout K[d * L_k + row] (stride-along-D = L_k,
+// stride-along-seq = 1).
 template <int D, int BR, int BC, bool K_TRANS = false>
 static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     const float * __restrict__ q,     // (B, H_q, L_q, D) contiguous
@@ -80,7 +90,8 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     float scale, int n_rep,
     int mask_b_stride, int mask_lq_stride,
     int v_head_stride = 0, int v_stride_j = 0, int v_stride_d = 0,
-    int L_k_iter = -1)
+    int L_k_iter = -1,
+    int k_head_stride = 0, int k_stride_d = 0, int k_stride_j = 0)
 {
     static_assert(D == 64 || D == 128 || D == 256 || D == 512,
                   "only D=64, D=128, D=256, D=512 supported");
@@ -108,21 +119,28 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     // Per-slice base pointers.
     const int64_t q_offset =
         ((int64_t)(b_idx * H_q) + h_idx) * (int64_t)L_q * D + (int64_t)q_idx * D;
-    // K and V head offsets. K uses the standard or K_TRANS layout.
-    // V uses explicit strides if v_head_stride > 0, else standard L_k*D.
+    // K head offset: use explicit stride when provided (non-contiguous K view),
+    // else fall back to contiguous L_k*D (K_TRANS) / L_k*D (standard).
     const int64_t kv_offset =
         ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)L_k * D;
-    // V head offset: use explicit stride if provided, else same as K.
+    const int64_t k_offset = (k_head_stride > 0)
+        ? ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)k_head_stride
+        : kv_offset;
+    // V head offset: use explicit stride if provided, else same as K (contiguous).
     const int64_t v_offset = (v_head_stride > 0)
         ? ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)v_head_stride
         : kv_offset;
+    // K element strides: default to the contiguous K_TRANS layout
+    //   K[d * L_k + row] (stride-along-D = L_k, stride-along-seq = 1).
     // V element strides: default to standard (j*D + d).
+    const int ks_d = (k_stride_d > 0) ? k_stride_d : (K_TRANS ? L_k : D);
+    const int ks_j = (k_stride_j > 0) ? k_stride_j : (K_TRANS ? 1 : 1);
     const int vs_j = (v_stride_j > 0) ? v_stride_j : D;
     const int vs_d = (v_stride_d > 0) ? v_stride_d : 1;
     const int64_t out_offset = q_offset;
 
     const float * q_ptr = q + q_offset;
-    const float * k_ptr = k + kv_offset;
+    const float * k_ptr = k + k_offset;
     const float * v_ptr = v + v_offset;
     float *       o_ptr = out + out_offset;
 
@@ -178,10 +196,12 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
                 const int d = idx % D;
                 const int row = k_start + j;
                 const bool valid = (row < L_k_effective);
-                // K layout: standard (L_k, D) → k[row*D + d]
-                //           transposed (D, L_k) → k[d*L_k + row]
+                // K layout:
+                //   standard (L_k, D) contiguous → k[row*D + d]
+                //   transposed (D, L_k) default  → k[d*L_k + row]
+                //   transposed + explicit strides → k[d*ks_d + row*ks_j]
                 if (K_TRANS) {
-                    k_lds[idx] = valid ? k_ptr[d * L_k + row] : 0.0f;
+                    k_lds[idx] = valid ? k_ptr[d * ks_d + row * ks_j] : 0.0f;
                 } else {
                     k_lds[idx] = valid ? k_ptr[row * D + d] : 0.0f;
                 }
@@ -432,12 +452,14 @@ flash_attn_v2_fwd_ktvs_dyn_d64_f32(
     float * __restrict__ out,
     int B, int H_q, int H_kv, int L_q, int L_k,
     float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
-    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter,
+    int k_head_stride, int k_stride_d, int k_stride_j)
 {
     flash_attn_fwd_v2_impl<64, 4, 64, true>(
         q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
         scale, n_rep, mask_b_stride, mask_lq_stride,
-        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter,
+        k_head_stride, k_stride_d, k_stride_j);
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
@@ -449,12 +471,14 @@ flash_attn_v2_fwd_ktvs_dyn_d128_f32(
     float * __restrict__ out,
     int B, int H_q, int H_kv, int L_q, int L_k,
     float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
-    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter,
+    int k_head_stride, int k_stride_d, int k_stride_j)
 {
     flash_attn_fwd_v2_impl<128, 4, 32, true>(
         q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
         scale, n_rep, mask_b_stride, mask_lq_stride,
-        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter,
+        k_head_stride, k_stride_d, k_stride_j);
 }
 
 extern "C" __global__ void __launch_bounds__(256, 2)
@@ -466,12 +490,14 @@ flash_attn_v2_fwd_ktvs_dyn_d256_f32(
     float * __restrict__ out,
     int B, int H_q, int H_kv, int L_q, int L_k,
     float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
-    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter,
+    int k_head_stride, int k_stride_d, int k_stride_j)
 {
     flash_attn_fwd_v2_impl<256, 4, 16, true>(
         q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
         scale, n_rep, mask_b_stride, mask_lq_stride,
-        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter,
+        k_head_stride, k_stride_d, k_stride_j);
 }
 
 extern "C" __global__ void __launch_bounds__(256, 1)
@@ -483,10 +509,12 @@ flash_attn_v2_fwd_ktvs_dyn_d512_f32(
     float * __restrict__ out,
     int B, int H_q, int H_kv, int L_q, int L_k,
     float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
-    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter,
+    int k_head_stride, int k_stride_d, int k_stride_j)
 {
     flash_attn_fwd_v2_impl<512, 4, 8, true>(
         q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
         scale, n_rep, mask_b_stride, mask_lq_stride,
-        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter,
+        k_head_stride, k_stride_d, k_stride_j);
 }

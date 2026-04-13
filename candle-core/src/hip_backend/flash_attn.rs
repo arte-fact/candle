@@ -995,6 +995,17 @@ pub fn flash_attn_v2_kt_strided_v_dyn(
     let v_head_stride = v_strides[1] as i32;
     let v_stride_j = v_strides[2] as i32;
     let v_stride_d = v_strides[3] as i32;
+    // Explicit K strides so the caller can pass a narrow'd (non-contiguous)
+    // K view. For gemma4's KvCache K layout (B, H_kv, D, maxT) narrow'd to
+    // (B, H_kv, D, l_k_alloc), the strides are
+    //   (H_kv*D*maxT, D*maxT, maxT, 1)
+    // i.e. stride-along-D = maxT (not l_k_alloc), stride-along-seq = 1.
+    // The kernel needs both so it can index K[d * maxT + row] without the
+    // caller having to .contiguous() first.
+    let k_strides = kl.stride();
+    let k_head_stride = k_strides[1] as i32;
+    let k_stride_d = k_strides[2] as i32;
+    let k_stride_j = k_strides[3] as i32;
 
     let out = unsafe { dev.alloc::<f32>(b*nh*lq*d)? };
     let func = dev.get_or_load_func(kn, &kernels::FLASH_ATTN_V2)?;
@@ -1016,6 +1027,7 @@ pub fn flash_attn_v2_kt_strided_v_dyn(
     bld.arg(&sa);bld.arg(&nra);bld.arg(&mbs);bld.arg(&mls);
     bld.arg(&v_head_stride);bld.arg(&v_stride_j);bld.arg(&v_stride_d);
     bld.arg(&lka_iter);
+    bld.arg(&k_head_stride);bld.arg(&k_stride_d);bld.arg(&k_stride_j);
     unsafe { bld.launch(cfg) }.w()?;
     drop(qs);drop(ks);drop(vs);drop(mo);
     let os = HipStorage::wrap_hip_slice(out, dev);
