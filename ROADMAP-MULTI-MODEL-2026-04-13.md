@@ -82,15 +82,27 @@ first, otherwise G2 replay divergence returns).
 **Target:** another +10-15 % on top of Phase H, like we saw on llama.
 
 - **K1** — Add the `DecodeState` state machine to the Gemma4 `ModelWeights::forward`.
-  Detect `is_decode` (seq_len=1, idx_pos>0), warm up → record → replay.
+  Detect `is_decode` (seq_len=1, idx_pos>0), warm up → record → replay. — **DONE** (commit 10185833)
 - **K2** — Wire G3 graph capture with `hipGraphExecKernelNodeSetParams` node
-  patching (`DecodeGraph::patch_and_launch` already exists, just plumb it).
+  patching (`DecodeGraph::patch_and_launch` already exists, just plumb it). — **DONE** (commit 10185833)
 - **K3** — Port fused Q4_0 FFN path where applicable (Gemma4-E4B has dense
   Mlp in some layers — fits). Gemma4 MoE uses different FFN structure;
   won't apply there without a separate fused-MoE kernel.
 
+**Status (2026-04-13):** Scaffolding wired but no measurable speedup yet.
+Eligibility gates skip both testable models:
+  - Gemma4-E4B Q4_0 (single-GPU): `per_layer_embeddings` adds a second
+    CPU→GPU transfer per token; G2 currently anchors only one external
+    input. Needs `decode_cache::patch_externals_split` to handle
+    multiple input tensors independently.
+  - Gemma4-31B Q4_0: 17 GB doesn't fit on a single 16 GB MI50; multi-GPU
+    pipeline-parallel needs per-device recording.
+Output verified identical to baseline with `CANDLE_G2_REPLAY=1` (gate
+falls through cleanly).
+
 **Owner:** TBD.
-**Effort:** 1 day after Phase H.
+**Effort:** 1 day after Phase H. Follow-up (per-layer-embed support):
+~half day.
 
 ### Phase L — MMVQ per-call tuning
 
