@@ -704,6 +704,18 @@ impl ModelWeights {
             }
         }
 
+        // ── Phase timing (CANDLE_G2_PHASE_TIME=1) ───────────────────────
+        //
+        // Records wall-clock per phase of the forward, prints aggregated
+        // averages at the end of decode. Used to localize the G2 vs
+        // default decode-throughput gap to a specific phase (prelude
+        // CPU embed, prelude per_layer compute, SWA mask rebuild, fast
+        // path replay, etc).
+        #[cfg(feature = "hip")]
+        let phase_time = std::env::var("CANDLE_G2_PHASE_TIME").is_ok();
+        #[cfg(feature = "hip")]
+        let _t_forward_start = std::time::Instant::now();
+
         // ── G2/G3 eligibility check ──
         //
         // Gated by `CANDLE_G2_REPLAY=1` so the default forward path skips
@@ -745,6 +757,8 @@ impl ModelWeights {
         // replay.
         let first_layer_dev = self.layers[0].device.clone();
         #[cfg(feature = "hip")]
+        let _t_prelude_li_start = std::time::Instant::now();
+        #[cfg(feature = "hip")]
         let layer_in = if g2_eligible {
             candle::hip_backend::decode_cache::with_recording_paused(|| -> Result<Tensor> {
                 let cpu = candle::Device::Cpu;
@@ -784,6 +798,10 @@ impl ModelWeights {
             layer_in
         };
         let mut layer_in = layer_in;
+        #[cfg(feature = "hip")]
+        let t_prelude_li = _t_prelude_li_start.elapsed();
+        #[cfg(feature = "hip")]
+        let _t_prelude_pe_start = std::time::Instant::now();
 
         // ── Per-layer embedding compute (E4B) — hoisted above the G2 fast
         // path so its result can serve as a second G2 external anchor.
@@ -842,6 +860,10 @@ impl ModelWeights {
         } else {
             None
         };
+        #[cfg(feature = "hip")]
+        let t_prelude_pe = _t_prelude_pe_start.elapsed();
+        #[cfg(feature = "hip")]
+        let _t_swa_start = std::time::Instant::now();
 
         // Snapshot the GPU inputs used as G2/G3 anchors. `layer_in` is
         // always anchor #0; `inp_per_layer` (when present) is anchor #1.
@@ -941,6 +963,11 @@ impl ModelWeights {
             Vec::new()
         };
 
+        #[cfg(feature = "hip")]
+        let t_prelude_swa = _t_swa_start.elapsed();
+        #[cfg(feature = "hip")]
+        let _t_fastpath_start = std::time::Instant::now();
+
         // Diagnostic: dump the address + first values of each anchored
         // input on replay calls to verify that decode_alloc is returning
         // the same slot AND that the prelude's memcpy refreshed the data.
@@ -1032,9 +1059,23 @@ impl ModelWeights {
                             plan.advance_counters();
                         }
                         unsafe { graph.patch_and_launch(plan, &dev_for_replay)?; }
+                        if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
+                            let _ = dev_for_replay.stream().synchronize();
+                        }
                         hipdarc::driver::decode_alloc_pause();
                         hipdarc::driver::decode_alloc_reset();
-                        return plan.output_tensor(&dev_for_replay);
+                        let out = plan.output_tensor(&dev_for_replay)?;
+                        if phase_time {
+                            let t_fp = _t_fastpath_start.elapsed();
+                            let t_total = _t_forward_start.elapsed();
+                            eprintln!(
+                                "[G2-time graph] li={:>5}us pe={:>5}us swa={:>5}us fp={:>5}us total={:>6}us",
+                                t_prelude_li.as_micros(), t_prelude_pe.as_micros(),
+                                t_prelude_swa.as_micros(), t_fp.as_micros(),
+                                t_total.as_micros(),
+                            );
+                        }
+                        return Ok(out);
                     }
                 }
                 DecodeState::Replay(plan) => {
@@ -1050,6 +1091,13 @@ impl ModelWeights {
                             plan.advance_counters();
                         }
                         unsafe { plan.replay(&dev_for_replay)?; }
+                        // Phase-time: optional sync-here-to-measure-GPU.
+                        // CANDLE_G2_SYNC_REPLAY=1 makes the fp timing
+                        // include actual GPU execution; without this flag
+                        // it only measures launch/dispatch overhead.
+                        if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
+                            let _ = dev_for_replay.stream().synchronize();
+                        }
                         // Diagnostic for K10: dump the first 8 logits to
                         // confirm whether the captured plan actually
                         // produces fresh output per replay or stays
@@ -1162,7 +1210,18 @@ impl ModelWeights {
                         }
                         hipdarc::driver::decode_alloc_pause();
                         hipdarc::driver::decode_alloc_reset();
-                        return plan.output_tensor(&dev_for_replay);
+                        let out = plan.output_tensor(&dev_for_replay)?;
+                        if phase_time {
+                            let t_fp = _t_fastpath_start.elapsed();
+                            let t_total = _t_forward_start.elapsed();
+                            eprintln!(
+                                "[G2-time replay] li={:>5}us pe={:>5}us swa={:>5}us fp={:>5}us total={:>6}us",
+                                t_prelude_li.as_micros(), t_prelude_pe.as_micros(),
+                                t_prelude_swa.as_micros(), t_fp.as_micros(),
+                                t_total.as_micros(),
+                            );
+                        }
+                        return Ok(out);
                     }
                 }
                 _ => {}
@@ -1622,6 +1681,15 @@ impl ModelWeights {
             eprintln!("[FINAL] logits top5={top5:?} has_nan={}", l_cpu.iter().any(|v| v.is_nan()));
         }
 
+        #[cfg(feature = "hip")]
+        if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
+            if let candle::Device::Hip(d) = layer_in.device() {
+                let _ = d.stream().synchronize();
+            }
+        }
+        #[cfg(feature = "hip")]
+        let _t_loop_end = std::time::Instant::now();
+
         let result = if let Some(soft_cap) = self.final_logit_softcap {
             // Compute softcap in f64 to preserve discrimination at high
             // logit magnitudes. At f32, tanh(x) for x > ~9 returns exactly
@@ -1766,6 +1834,17 @@ impl ModelWeights {
             }
         }
 
+        #[cfg(feature = "hip")]
+        if phase_time {
+            let t_total = _t_forward_start.elapsed();
+            let t_loop = _t_loop_end.duration_since(_t_fastpath_start);
+            eprintln!(
+                "[G2-time normal] li={:>5}us pe={:>5}us swa={:>5}us layers={:>5}us total={:>6}us",
+                t_prelude_li.as_micros(), t_prelude_pe.as_micros(),
+                t_prelude_swa.as_micros(), t_loop.as_micros(),
+                t_total.as_micros(),
+            );
+        }
         Ok(result)
     }
 

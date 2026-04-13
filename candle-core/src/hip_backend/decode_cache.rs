@@ -769,11 +769,19 @@ impl DecodePlan {
     /// advanced/patched before calling this.
     pub unsafe fn replay(&self, dev: &HipDevice) -> crate::Result<()> {
         let debug = std::env::var("CANDLE_G2_DEBUG").is_ok();
+        // Per-kernel-name GPU-time profiler: when CANDLE_G2_OP_PROFILE=1,
+        // sync the stream after each kernel and accumulate elapsed time
+        // by kernel name. Prints a sorted summary at the end. This is
+        // expensive (forces serial GPU execution) so use only for
+        // diagnostics.
+        let op_profile = std::env::var("CANDLE_G2_OP_PROFILE").is_ok();
 
         // Multi-device: track the active device ordinal and only call
         // `hipSetDevice` when it changes. Single-device plans pay one
         // `hipSetDevice` at the start and zero per-op overhead.
         let mut current_dev: i32 = -1;
+        let mut op_times: std::collections::HashMap<String, (u128, usize)> =
+            std::collections::HashMap::new();
 
         for (idx, op) in self.ops.iter().enumerate() {
             if op.device_ordinal != current_dev {
@@ -793,6 +801,7 @@ impl DecodePlan {
                 .map(|v| v as *const u64 as *mut c_void)
                 .collect();
 
+            let _t0 = if op_profile { Some(std::time::Instant::now()) } else { None };
             let rc = hipdarc::sys::hipModuleLaunchKernel(
                 op.func,
                 op.grid.0, op.grid.1, op.grid.2,
@@ -808,6 +817,13 @@ impl DecodePlan {
                     idx, rc, op.device_ordinal
                 );
             }
+            if op_profile {
+                let _ = dev.stream().synchronize();
+                let dt = _t0.unwrap().elapsed().as_micros();
+                let entry = op_times.entry(op.name.clone()).or_insert((0, 0));
+                entry.0 += dt;
+                entry.1 += 1;
+            }
             if debug {
                 let src = dev.stream().synchronize();
                 if src.is_err() {
@@ -821,6 +837,22 @@ impl DecodePlan {
             }
         }
 
+        if op_profile {
+            // Sort by total time (descending) and print top 20.
+            let mut entries: Vec<_> = op_times.iter().collect();
+            entries.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+            let total: u128 = entries.iter().map(|(_, (t, _))| t).sum();
+            eprintln!("[G2-op-prof] total {}us across {} kernels:",
+                total, entries.iter().map(|(_, (_, c))| c).sum::<usize>());
+            for (name, (t, count)) in entries.iter().take(20) {
+                let total_t: u128 = *t;
+                let n: usize = *count;
+                let avg = total_t / n as u128;
+                let pct = (total_t as f64 / total as f64) * 100.0;
+                eprintln!("[G2-op-prof]  {:>40} {:>4}× total={:>6}us avg={:>4}us ({:>4.1}%)",
+                    name, n, total_t, avg, pct);
+            }
+        }
         Ok(())
     }
 
