@@ -1390,3 +1390,156 @@ pub fn gqa_attention_decode_gemv(
         false,
     ))
 }
+
+/// Phase P — Decode attention via mat-vec kernel (L_q=1 only).
+///
+/// Assumes K and V are both stored **row-major (B, H_kv, T_pad, D)**
+/// with D as the contiguous axis — llama.cpp-turbo's layout. Use this
+/// only when the KvCache was created with `new_k_canonical_stable`.
+///
+/// One block per (b, h_q). 64 threads (one warp). Threads stride D
+/// coalesced via `lane + i * WARP_SIZE`. No LDS K/V tiling — direct
+/// global reads per t, warp-reduce on the partial dot product.
+///
+/// `l_k_alloc` is K/V's T-axis size (the padded or allocated extent);
+/// `l_k_iter` is how many real positions to attend to (≤ l_k_alloc).
+/// Pass `l_k_iter == l_k_alloc` when not using dynamic-L_k.
+///
+/// Returns `(B, n_head, 1, D)`.
+pub fn gqa_attention_decode_mv(
+    q: &Tensor,                 // (B, n_head, 1, D) f32 contiguous
+    k: &Tensor,                 // (B, n_kv_head, L_k_alloc, D) f32 contiguous
+    v: &Tensor,                 // (B, n_kv_head, L_k_alloc, D) f32 contiguous
+    mask: Option<&Tensor>,      // optional (1,1,1,T_mask) or (B,1,1,T_mask) f32
+    scale: f64,
+    l_k_iter: usize,
+) -> Result<Tensor> {
+    let dev = match q.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("gqa_attention_decode_mv: q must be HIP"),
+    };
+    let (b, n_head, l_q, d) = q.dims4()?;
+    if l_q != 1 {
+        crate::bail!("gqa_attention_decode_mv: requires L_q=1, got {l_q}");
+    }
+    if !q.is_contiguous() || q.dtype() != DType::F32 {
+        crate::bail!("gqa_attention_decode_mv: q must be f32 contiguous");
+    }
+
+    let (kb, n_kv, l_k_alloc, kd) = k.dims4()?;
+    if (kb, kd) != (b, d) {
+        crate::bail!(
+            "gqa_attention_decode_mv: k shape {:?} incompatible with q {:?}",
+            k.dims(), q.dims()
+        );
+    }
+    if !k.is_contiguous() || k.dtype() != DType::F32 {
+        crate::bail!("gqa_attention_decode_mv: k must be f32 contiguous");
+    }
+    let (vb, v_nkv, v_lk, vd) = v.dims4()?;
+    if (vb, v_nkv, v_lk, vd) != (b, n_kv, l_k_alloc, d) {
+        crate::bail!(
+            "gqa_attention_decode_mv: v shape {:?} != expected {:?}",
+            v.dims(), (b, n_kv, l_k_alloc, d)
+        );
+    }
+    if !v.is_contiguous() || v.dtype() != DType::F32 {
+        crate::bail!("gqa_attention_decode_mv: v must be f32 contiguous");
+    }
+    if n_head % n_kv != 0 {
+        crate::bail!("gqa_attention_decode_mv: n_head % n_kv != 0");
+    }
+    let n_rep = n_head / n_kv;
+    if l_k_iter > l_k_alloc {
+        crate::bail!(
+            "gqa_attention_decode_mv: l_k_iter ({l_k_iter}) > l_k_alloc ({l_k_alloc})"
+        );
+    }
+
+    let kernel_name = match d {
+        64 => "gqa_decode_mv_d64_f32",
+        128 => "gqa_decode_mv_d128_f32",
+        256 => "gqa_decode_mv_d256_f32",
+        512 => "gqa_decode_mv_d512_f32",
+        _ => crate::bail!("gqa_attention_decode_mv: unsupported D={d}"),
+    };
+
+    // Mask: (1,1,1,T_mask) or (B,1,1,T_mask). T_mask must be ≥ l_k_iter.
+    let mbs: i32 = match mask {
+        None => 0,
+        Some(m) => {
+            if m.dtype() != DType::F32 || !m.is_contiguous() {
+                crate::bail!("gqa_attention_decode_mv: mask must be f32 contiguous");
+            }
+            let md = m.dims();
+            let last = *md.last().unwrap();
+            if last < l_k_iter {
+                crate::bail!(
+                    "gqa_attention_decode_mv: mask last dim {last} < l_k_iter {l_k_iter}"
+                );
+            }
+            // Per-batch stride: for (B,1,1,T) give T; for broadcast (1,...) give 0.
+            let mb = if md.len() >= 4 { md[0] } else { 1 };
+            if mb == b { last as i32 } else { 0 }
+        }
+    };
+
+    // Extract device slices via layout.
+    let (q_st, q_l) = q.storage_and_layout();
+    let (k_st, k_l) = k.storage_and_layout();
+    let (v_st, v_l) = v.storage_and_layout();
+    let m_owned = mask.map(|m| m.storage_and_layout());
+
+    macro_rules! hv {
+        ($s:expr, $l:expr) => {{
+            let h = match &*$s { Storage::Hip(s) => s, _ => panic!("not HIP") };
+            let sl = h.as_hip_slice::<f32>()?;
+            let off = $l.start_offset();
+            sl.slice(off..sl.len())
+        }};
+    }
+    let q_v = hv!(q_st, q_l);
+    let k_v = hv!(k_st, k_l);
+    let v_v = hv!(v_st, v_l);
+    let m_v = m_owned.as_ref().map(|(st, l)| {
+        let h = match &**st { Storage::Hip(s) => s, _ => panic!("not HIP") };
+        let sl = h.as_hip_slice::<f32>().unwrap();
+        let off = l.start_offset();
+        sl.slice(off..sl.len())
+    });
+
+    let out = unsafe { dev.alloc::<f32>(b * n_head * d)? };
+    let func = dev.get_or_load_func(kernel_name, &kernels::FLASH_ATTN_V2)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, n_head as u32, b as u32),
+        block_dim: (WARP_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let (ba, nha, nka, lka) = (b as i32, n_head as i32, n_kv as i32, l_k_alloc as i32);
+    let sa = scale as f32;
+    let nra = n_rep as i32;
+    let lk_it = l_k_iter as i32;
+
+    let mut bld = func.builder();
+    bld.arg(&q_v); bld.arg(&k_v); bld.arg(&v_v);
+    match m_v.as_ref() {
+        Some(v) => { bld.arg(v); }
+        None => { bld.arg(&hipdarc::driver::NullDevicePtr::default()); }
+    }
+    bld.arg(&out);
+    bld.arg(&ba); bld.arg(&nha); bld.arg(&nka); bld.arg(&lka);
+    bld.arg(&sa); bld.arg(&nra); bld.arg(&mbs); bld.arg(&lk_it);
+    unsafe { bld.launch(cfg) }.w()?;
+
+    drop(q_st); drop(k_st); drop(v_st); drop(m_owned);
+
+    let os = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(os),
+        <Shape as From<(usize, usize, usize, usize)>>::from((b, n_head, 1usize, d)),
+        BackpropOp::none(),
+        false,
+    ))
+}

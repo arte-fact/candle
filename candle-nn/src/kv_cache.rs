@@ -133,6 +133,34 @@ impl KvCache {
         self.k_is_transposed
     }
 
+    /// Phase P — create a KvCache that stores K in its **canonical**
+    /// `(..., T, D)` layout (same as V), pre-allocated for stable
+    /// buffer addresses.
+    ///
+    /// Unlike `new_k_transposed`, no per-append transpose is done:
+    /// `append(k, v)` writes both k and v straight through at the seq
+    /// dim `dim_v`. The returned `k()` has shape `(..., T, D)`, matching
+    /// V — which lets the mat-vec decode attention path (and
+    /// `gqa_attention` canonical dispatch) read K with D as the
+    /// contiguous axis, coalesced across the warp.
+    ///
+    /// Trade-off vs `new_k_transposed`:
+    ///   - Loses: flash-attn-v2 ktvs variants that read K D-major will
+    ///     need to pre-transpose (or we dispatch to the mat-vec kernel
+    ///     instead). Prefill may regress slightly.
+    ///   - Gains: decode attention becomes a coalesced mat-vec, aligned
+    ///     with llama.cpp-turbo's `mul_mat_vec_f` approach. Expected
+    ///     3 ms/tok → ~1 ms/tok on gemma4-E4B.
+    pub fn new_k_canonical_stable(dim_v: usize, max_seq_len: usize) -> Self {
+        let k = Cache::new(dim_v, max_seq_len);
+        let v = Cache::new(dim_v, max_seq_len);
+        Self {
+            k,
+            v,
+            k_is_transposed: false,
+        }
+    }
+
     pub fn k_cache(&self) -> &Cache {
         &self.k
     }

@@ -522,6 +522,85 @@ caller silently relies on the old D-major K.
 gap to turbo's 75 t/s; residual gap is MMVQ tuning per Phase L and
 CPU overhead).
 
+**Landed (2026-04-13, Stage 1 — opt-in):**
+
+Scaffolding done, measured, OPT-IN via `CANDLE_KV_TMAJOR=1`:
+  default (legacy D-major K):   51.82 t/s
+  Phase P (CANDLE_KV_TMAJOR=1): **53.87 t/s**  (+3.9%, output byte-identical)
+
+Implementation:
+- New `KvCache::new_k_canonical_stable(dim, max_seq_len)` stores K
+  in `(B, H_kv, max_T, D)` row-major (D contiguous), identical to V.
+- New HIP kernel `gqa_decode_mv_d{64,128,256,512}_f32` in
+  `candle-hip-kernels/src/flash_attn_v2.cu`. One block per (b, h_q),
+  64-thread warp. Threads stride D coalesced. Online softmax, no LDS
+  K/V tiling. Takes dynamic `L_k_iter` for G2 replay compatibility.
+- Rust wrapper `gqa_attention_decode_mv` in
+  `candle-core/src/hip_backend/flash_attn.rs`.
+- Gemma4 opt-in dispatch in `quantized_gemma4.rs`:
+  - KvCache constructor selection via `CANDLE_KV_TMAJOR`.
+  - K narrow dim 2 (canonical) vs dim 3 (legacy).
+  - Decode L_q=1: route to `gqa_attention_decode_mv` (both
+    `shared_qkv=Some` and `shared_qkv=None` branches).
+  - Prefill: transpose canonical K back to D-major and dispatch via
+    legacy `forward_with_kv_transposed` (hits
+    `flash_attn_v2_fwd_ktvs_d{256,512}`) — keeps d=512 prefill
+    working since the canonical `flash_attn_v2_fused` lacks a d=512
+    variant, and its rocBLAS fallback errors on the E4B shape.
+
+Per-kernel attention under Phase P (all 42 layers routed through the
+new kernel, 63 decode tokens):
+  gqa_decode_mv_d256_f32:   73.0 us/call × 2205 = 2.55 ms/tok
+  gqa_decode_mv_d512_f32:   71.3 us/call × 441  = 0.50 ms/tok
+  total attention:          3.05 ms/tok
+  (baseline flash_attn_v2:  3.98 ms/tok — saved 0.93 ms/tok)
+
+Why Stage 1 is opt-in, not default:
+- G2/G3 captured plans reference the legacy kernel names; enabling
+  Phase P under G2 regresses E4B decode from 46 → 27 t/s because the
+  captured plan rebuilds on every replay. Defaulting Phase P on
+  would silently break the Phase K gemma4 G2/G3 users. Opt-in keeps
+  the upgrade path safe.
+
+**Why the +3.9 % gain is smaller than the +9 t/s target:**
+
+The per-call mat-vec time is 73 μs for d=256 vs turbo's `mul_mat_vec_f`
+at ~9 μs — still 8× slower per call. Turbo's kernel is narrower in
+scope (separate Q·K^T, softmax, V·attn — three launches per layer vs
+our single fused kernel), and uses vectorised float2 reads + a 128-
+thread block. Our kernel uses 64 threads (one warp) and scalar reads.
+
+Optimisation ideas tracked under Phase Q (below):
+
+### Phase Q — Integrate Phase P with G2/G3, tune mat-vec kernel
+
+- **Q1** — Record G2 plans against the canonical-K path. Currently
+  `CANDLE_G2_REPLAY=1 + CANDLE_KV_TMAJOR=1` regresses to 37 t/s
+  because the decode state machine keeps rebuilding when the
+  captured kernel signature doesn't match live dispatch. Need the
+  recorder to either (a) accept the new kernel names or (b) flip the
+  entire plan's kernel-call table when KV layout changes.
+- **Q2** — Kernel tuning for `gqa_decode_mv`. Candidates:
+    * 128-thread block (2 warps), warp-cooperative K loading into
+      registers, then parallel dot product reduction.
+    * `float2`/`float4` vectorised loads (8/16 bytes per thread per
+      iteration) — matches llama.cpp-turbo's `float2` pattern in
+      `ggml-cuda/mmvf.cu:132`.
+    * Split-K via multiple blocks per (b, h_q) and a merge kernel,
+      filling gfx906's 60 CUs (we currently issue only n_head
+      blocks = 8-32 per layer = partial occupancy).
+- **Q3** — Drop the per-decode `.contiguous()` on K/V narrow views
+  by extending the mat-vec kernel to take explicit head/seq/dim
+  strides (like `flash_attn_v2_kt_strided_v`). Eliminates the
+  per-layer ~5 μs copy.
+- **Q4** — Dedicated `flash_attn_v2_fwd_d512_f32` (K_TRANS=false)
+  kernel so prefill on E4B global layers doesn't need the transpose-
+  to-D-major workaround.
+
+**Effort:** Q2 alone should close most of the remaining gap to the
+9 t/s expected improvement. Q1 is a separate track — important for
+users who need both G2 replay and fast decode.
+
 ## Order of attack
 
 ```

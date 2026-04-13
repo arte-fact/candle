@@ -518,3 +518,174 @@ flash_attn_v2_fwd_ktvs_dyn_d512_f32(
         v_head_stride, v_stride_j, v_stride_d, L_k_iter,
         k_head_stride, k_stride_d, k_stride_j);
 }
+
+// ============================================================================
+// Phase P — mat-vec decode attention
+// ----------------------------------------------------------------------------
+// For L_q=1 decode with K, V both stored row-major (B, H_kv, T_pad, D) so D
+// is the CONTIGUOUS axis. This lets the warp's 64 lanes read K[t, 0..64]
+// in a single coalesced VMEM transaction, matching llama.cpp-turbo's
+// `mul_mat_vec_f<float,float,...>` pattern.
+//
+// Grid: (1, H_q, B)     — one block per (batch, q_head); L_q=1 so q_idx=0.
+// Block: (WARP_SIZE, 1, 1) — 64 threads, one warp.
+//
+// Each thread owns D / WARP_SIZE elements along D. D_PER_LANE=4 for D=256,
+// D_PER_LANE=8 for D=512. Q and O live entirely in registers (D/WARP_SIZE
+// floats each). No LDS for K/V tiles — direct global reads per t position,
+// coalesced across the warp.
+//
+// Online softmax (flash-attn v2 style): for each t, compute dot Q·K[t],
+// update running max m_i, output accumulator o_reg, and normaliser l.
+// Final: o_reg /= l.
+//
+// L_k_iter < L_k is supported (defaults to L_k): for G2 dynamic l_k.
+template <int D>
+static __device__ __forceinline__ void gqa_decode_mv_impl(
+    const float * __restrict__ q,       // (B, H_q, 1, D) contiguous
+    const float * __restrict__ k,       // (B, H_kv, T_pad, D) row-major
+    const float * __restrict__ v,       // (B, H_kv, T_pad, D) row-major
+    const float * __restrict__ mask,    // optional (1,1,1,T_pad) or nullptr
+    float * __restrict__ out,           // (B, H_q, 1, D)
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep,
+    int mask_b_stride, int L_k_iter)
+{
+    static_assert(D == 64 || D == 128 || D == 256 || D == 512,
+                  "D must be 64, 128, 256, or 512");
+    static_assert(D % WARP_SIZE == 0, "D must be multiple of WARP_SIZE");
+    constexpr int D_PER_LANE = D / WARP_SIZE;
+
+    const int h_idx = blockIdx.y;
+    const int b_idx = blockIdx.z;
+    const int lane  = threadIdx.x;
+
+    // llama-style GQA: q head h maps to kv head h / n_rep.
+    const int h_kv = (n_rep > 1) ? (h_idx / n_rep) : h_idx;
+
+    // Per-head pointers. L_q=1 so no q_idx offset in Q.
+    const int64_t q_off   = ((int64_t)(b_idx * H_q) + h_idx) * D;
+    const int64_t kv_off  = ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)L_k * D;
+    const int64_t out_off = q_off;
+
+    const float * q_ptr = q + q_off;
+    const float * k_ptr = k + kv_off;
+    const float * v_ptr = v + kv_off;
+    float       * o_ptr = out + out_off;
+
+    // Mask row pointer. For (1,1,1,T_pad): mask_b_stride=0 → shared.
+    // For (B,1,1,T_pad): mask_b_stride=T_pad.
+    const float * mask_row = nullptr;
+    if (mask != nullptr) {
+        mask_row = mask + (int64_t)b_idx * (int64_t)mask_b_stride;
+    }
+
+    // Load Q and init O in registers. Each lane owns D_PER_LANE contiguous
+    // elements at stride WARP_SIZE (lane=0 owns d=0, 64, 128, ...).
+    float q_reg[D_PER_LANE];
+    float o_reg[D_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < D_PER_LANE; ++i) {
+        q_reg[i] = q_ptr[lane + i * WARP_SIZE];
+        o_reg[i] = 0.0f;
+    }
+
+    // Online softmax state.
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    const int L_k_effective = (L_k_iter >= 0) ? L_k_iter : L_k;
+
+    // Main loop over T positions. Each iteration:
+    //   1. Warp-coalesced read of K[t, d_lane..d_lane+D_PER_LANE*WARP_SIZE)
+    //   2. Per-lane partial dot, warp-reduce → scalar s_t
+    //   3. Apply scale + mask
+    //   4. Online softmax update
+    //   5. Warp-coalesced read of V[t, d_lane], MAC into o_reg
+    for (int t = 0; t < L_k_effective; ++t) {
+        const float * k_row = k_ptr + (int64_t)t * D;
+        const float * v_row = v_ptr + (int64_t)t * D;
+
+        // Per-lane partial dot product. Adjacent lanes read adjacent
+        // float elements from k_row → one coalesced VMEM transaction
+        // per D_PER_LANE load batch.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            partial += q_reg[i] * k_row[lane + i * WARP_SIZE];
+        }
+        float s_t = v2_warp_reduce_sum(partial) * scale;
+
+        if (mask_row != nullptr) {
+            s_t += mask_row[t];
+        }
+
+        // Online softmax.
+        const float m_new = fmaxf(m_i, s_t);
+        const float alpha = gfx906_fast_exp(m_i - m_new);
+        const float p     = gfx906_fast_exp(s_t - m_new);
+
+        // O update — coalesced V read.
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            o_reg[i] = alpha * o_reg[i] + p * v_row[lane + i * WARP_SIZE];
+        }
+        l_i = alpha * l_i + p;
+        m_i = m_new;
+    }
+
+    // Normalise and write back.
+    const float inv_l = gfx906_rcp(l_i);
+    #pragma unroll
+    for (int i = 0; i < D_PER_LANE; ++i) {
+        o_ptr[lane + i * WARP_SIZE] = o_reg[i] * inv_l;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_d64_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_impl<64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                           scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_d128_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_impl<128>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                            scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_d256_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_impl<256>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                            scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_d512_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_impl<512>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                            scale, n_rep, mask_b_stride, L_k_iter);
+}

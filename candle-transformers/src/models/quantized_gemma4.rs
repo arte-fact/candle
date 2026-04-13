@@ -1330,14 +1330,21 @@ impl ModelWeights {
                     }
                     let cache = self.kv_caches[il]
                         .get_or_insert_with(|| {
-                            // Attack C: K is stored pre-transposed
-                            // (B, n_kv_head, D, T) so attention can skip
-                            // the per-call `k.t().contiguous()` materialise.
-                            // `dim_v=2` = sequence dim of V's
-                            // `(B, n_kv_head, T, head_dim)`. K lives at
-                            // dim_v+1 = 3. 4096 covers the typical chat
-                            // context; KvCache grows automatically beyond.
-                            candle_nn::kv_cache::KvCache::new_k_transposed(2, 4096)
+                            // Phase P: K canonical (B, H_kv, T, D) with D
+                            // contiguous — enables mat-vec decode attention
+                            // (+3.9% on default path). OPT-IN via
+                            // `CANDLE_KV_TMAJOR=1` because G2/G3 replay
+                            // plans were captured against the legacy
+                            // flash_attn_v2_fwd_ktvs kernel names and
+                            // regress badly when the dispatch changes
+                            // under them (G2 46 → 27 t/s on E4B). Until
+                            // Phase Q integrates G2/G3 with canonical K,
+                            // default stays on legacy D-major.
+                            if std::env::var("CANDLE_KV_TMAJOR").is_ok() {
+                                candle_nn::kv_cache::KvCache::new_k_canonical_stable(2, 4096)
+                            } else {
+                                candle_nn::kv_cache::KvCache::new_k_transposed(2, 4096)
+                            }
                         });
                     // KvCache::append needs contiguous sources.
                     let k_new = if k_new.is_contiguous() { k_new } else { k_new.contiguous()? };
@@ -1381,8 +1388,16 @@ impl ModelWeights {
                         .ok_or_else(|| candle::Error::Msg("gemma4 k cache empty".into()))?;
                     let v_full = v_cache.all_data().as_ref()
                         .ok_or_else(|| candle::Error::Msg("gemma4 v cache empty".into()))?;
-                    // K stored (B, H_kv, D, maxT) → narrow dim 3 to l_k_padded.
-                    let k = k_full.narrow(3, 0, l_k_padded)?;
+                    // Phase P opt-in (CANDLE_KV_TMAJOR=1): K stored
+                    // canonically (B, H_kv, maxT, D) — narrow dim 2.
+                    // Default (opt-out): legacy D-major (B, H_kv, D,
+                    // maxT) — narrow dim 3.
+                    let k_tmajor = std::env::var("CANDLE_KV_TMAJOR").is_ok();
+                    let k = if k_tmajor {
+                        k_full.narrow(2, 0, l_k_padded)?
+                    } else {
+                        k_full.narrow(3, 0, l_k_padded)?
+                    };
                     // V stored (B, H_kv, maxT, D) → narrow dim 2 to l_k_padded.
                     let v = v_full.narrow(2, 0, l_k_padded)?;
                     (k, v, Some((t_cur, l_k_padded)))
@@ -1434,13 +1449,84 @@ impl ModelWeights {
                     true
                 } else { false }
             } else { false };
+            // Phase P opt-in dispatch. CANDLE_KV_TMAJOR=1 routes decode
+            // through the mat-vec kernel on canonical K; default
+            // (legacy D-major K) stays on flash_attn_v2_fwd_ktvs.
+            let k_is_canonical = std::env::var("CANDLE_KV_TMAJOR").is_ok();
             let attn = if let Some((ref q_precomputed, _, _)) = shared_qkv {
                 let (b_sz, seq_len, _) = x_norm.dims3()?;
-                let attn_output = gqa_attention_k_transposed(
-                    q_precomputed, &k_use, &v_use,
-                    attention_mask.as_ref(), self.layers[il].attn.attn_scale,
-                )?;
+                let (_, _, _, k_dim3) = k_use.dims4()?;
+                // Sanity: canonical K has dim3 == head_dim; D-major has dim3 == t_k.
+                let head_dim = q_precomputed.dim(candle::D::Minus1)?;
+                let attn_output = if k_is_canonical && k_dim3 == head_dim {
+                    if seq_len == 1 {
+                        // Decode: mat-vec kernel on T-major K.
+                        // K/V are narrow'd views of the padded cache
+                        // (non-contig); the mat-vec kernel requires
+                        // contiguous inputs. Per-layer copy is
+                        // t_cur*D*4 bytes — cheap.
+                        let t_k = k_use.dim(2)?;
+                        let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
+                        let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
+                        candle::hip_backend::gqa_attention_decode_mv(
+                            q_precomputed, &k_c, &v_c,
+                            attention_mask.as_ref(),
+                            self.layers[il].attn.attn_scale,
+                            t_k,
+                        )?
+                    } else {
+                        // Prefill: reuse the legacy D-major fast path by
+                        // transposing T-major K to (B, H, D, T) once per
+                        // call. Per-call cost is small vs the decode-wide
+                        // win, and keeps the flash_attn_v2_kt_strided_v
+                        // prefill kernel reachable. Long-term: prefill
+                        // kernel rewrite for canonical K (Phase N).
+                        let k_dmajor = k_use.transpose(2, 3)?.contiguous()?;
+                        gqa_attention_k_transposed(
+                            q_precomputed, &k_dmajor, &v_use,
+                            attention_mask.as_ref(), self.layers[il].attn.attn_scale,
+                        )?
+                    }
+                } else {
+                    // Legacy D-major path
+                    gqa_attention_k_transposed(
+                        q_precomputed, &k_use, &v_use,
+                        attention_mask.as_ref(), self.layers[il].attn.attn_scale,
+                    )?
+                };
                 self.layers[il].attn.finish_attn(attn_output, b_sz, seq_len)?
+            } else if k_is_canonical {
+                // Phase P: K canonical (B, H_kv, T, D). For DECODE, route
+                // Q through prepare_q and call decode_mv directly. For
+                // PREFILL, transpose K to D-major and fall into the
+                // legacy flash_attn_v2_fwd_ktvs path (via
+                // forward_with_kv_transposed) — that handles d=512
+                // correctly; the non-transposed canonical prefill path
+                // has no d=512 kernel and bounces to rocBLAS with a
+                // shape rocBLAS refuses.
+                let (b_sz, seq_len_q, _) = x_norm.dims3()?;
+                if seq_len_q == 1 {
+                    let q = self.layers[il].attn.prepare_q(&x_norm, index_pos)?;
+                    let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
+                    let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
+                    let t_k = k_c.dim(2)?;
+                    let attn_output = candle::hip_backend::gqa_attention_decode_mv(
+                        &q, &k_c, &v_c,
+                        attention_mask.as_ref(),
+                        self.layers[il].attn.attn_scale,
+                        t_k,
+                    )?;
+                    self.layers[il].attn.finish_attn(attn_output, b_sz, seq_len_q)?
+                } else {
+                    let k_dmajor = k_use.transpose(2, 3)?.contiguous()?;
+                    self.layers[il].attn.forward_with_kv_transposed(
+                        &x_norm,
+                        &k_dmajor,
+                        &v_use,
+                        attention_mask.as_ref(),
+                        index_pos,
+                    )?
+                }
             } else {
                 self.layers[il].attn.forward_with_kv_transposed(
                     &x_norm,

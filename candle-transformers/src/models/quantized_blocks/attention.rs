@@ -238,6 +238,37 @@ pub(crate) fn gqa_attention_k_transposed(
                 Some(m) => Some(if m.is_contiguous() { m.clone() } else { m.contiguous()? }),
             };
 
+            // Phase P — mat-vec decode attention.
+            //
+            // Stage 1 (current): opt-in test path that runs `k_t.transpose+
+            // contiguous` in Rust to get K T-major, then dispatches the new
+            // mat-vec kernel. This includes transpose overhead; used to
+            // validate kernel correctness and measure the raw mat-vec
+            // speedup before committing to the KvCache layout change.
+            //
+            // Stage 2 (planned): drop the in-Rust transpose once KvCache
+            // stores K canonical T-major natively via
+            // `new_k_canonical_stable`.
+            //
+            // Opt-in: `CANDLE_DECODE_MV_ON=1`.
+            if seq_len == 1
+                && matches!(head_dim, 64 | 128 | 256 | 512)
+                && std::env::var("CANDLE_DECODE_MV_ON").is_ok()
+            {
+                // Transpose K from (B, H_kv, D, T) back to (B, H_kv, T, D)
+                // row-major. Today this is a full copy per layer per token
+                // (~30 us for D=256, T=256). Temporary until Stage 2.
+                let k_canon = k_t.transpose(candle::D::Minus2, candle::D::Minus1)?.contiguous()?;
+                // V may be non-contiguous via narrow+transpose; make it
+                // canonical (T, D) row-major if needed.
+                let v_canon = if v.is_contiguous() { v.clone() } else { v.contiguous()? };
+                if let Ok(o) = candle::hip_backend::gqa_attention_decode_mv(
+                    &q_c, &k_canon, &v_canon, mask_c.as_ref(), attn_scale, t_k,
+                ) {
+                    return Ok(o);
+                }
+            }
+
             // Phase O — rocBLAS GEMV-based decode attention (L_q=1, D≥128).
             // Implementation in `candle::hip_backend::gqa_attention_decode_gemv`
             // dispatches K^T·Q and V·attn through `rocblas_sgemv_strided_batched`,
@@ -851,7 +882,7 @@ impl StandardAttention {
     }
 
     /// Shared prefix for `forward_with_kv*`: project + reshape + Q-norm + RoPE.
-    fn prepare_q(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
+    pub fn prepare_q(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let mut q = self.wq.forward(x)?;
         q = q
