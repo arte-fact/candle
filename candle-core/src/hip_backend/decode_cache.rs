@@ -34,6 +34,12 @@ pub struct RecordedOp {
     pub arg_values: Vec<u64>,
     /// Byte size of each argument as declared by the kernel signature.
     pub arg_sizes: Vec<usize>,
+    /// Device ordinal that was active when this kernel was launched.
+    /// Captured via `hipGetDevice` at record time. On replay we
+    /// `hipSetDevice` to this ordinal before launching, so kernels
+    /// loaded into a per-device module dispatch correctly across the
+    /// pipeline-parallel layer split.
+    pub device_ordinal: i32,
 }
 
 // Thread-local recording state.
@@ -149,6 +155,15 @@ pub fn maybe_record(
                     }
                 })
                 .collect();
+            // Capture which device this launch is bound to. Pipeline-
+            // parallel models (gemma4-31B across 4 GPUs) launch kernels
+            // on multiple devices in a single forward; on replay we'll
+            // `hipSetDevice` to this ordinal before each launch so the
+            // per-device function handle dispatches to the right module.
+            let mut device_ordinal: i32 = 0;
+            unsafe {
+                let _ = hipdarc::sys::hipGetDevice(&mut device_ordinal);
+            }
             ops.push(RecordedOp {
                 func,
                 grid,
@@ -157,6 +172,7 @@ pub fn maybe_record(
                 stream,
                 arg_values,
                 arg_sizes: sizes.to_vec(),
+                device_ordinal,
             });
             true
         } else {
@@ -624,11 +640,25 @@ impl DecodePlan {
     /// sentinel keeps them alive). Dynamic args must have been
     /// advanced/patched before calling this.
     pub unsafe fn replay(&self, dev: &HipDevice) -> crate::Result<()> {
-        let stream = dev.stream();
-        let raw_stream = stream.raw();
         let debug = std::env::var("CANDLE_G2_DEBUG").is_ok();
 
+        // Multi-device: track the active device ordinal and only call
+        // `hipSetDevice` when it changes. Single-device plans pay one
+        // `hipSetDevice` at the start and zero per-op overhead.
+        let mut current_dev: i32 = -1;
+
         for (idx, op) in self.ops.iter().enumerate() {
+            if op.device_ordinal != current_dev {
+                let rc = hipdarc::sys::hipSetDevice(op.device_ordinal);
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    crate::bail!(
+                        "decode_cache replay: op[{}] hipSetDevice({}) failed with {:?}",
+                        idx, op.device_ordinal, rc
+                    );
+                }
+                current_dev = op.device_ordinal;
+            }
+
             let mut arg_ptrs: Vec<*mut c_void> = op
                 .arg_values
                 .iter()
@@ -640,15 +670,18 @@ impl DecodePlan {
                 op.grid.0, op.grid.1, op.grid.2,
                 op.block.0, op.block.1, op.block.2,
                 op.shared_mem,
-                raw_stream,
+                op.stream,
                 arg_ptrs.as_mut_ptr(),
                 std::ptr::null_mut(),
             );
             if rc != hipdarc::sys::hipError_t::hipSuccess {
-                crate::bail!("decode_cache replay: op[{}] hipModuleLaunchKernel failed with {:?}", idx, rc);
+                crate::bail!(
+                    "decode_cache replay: op[{}] hipModuleLaunchKernel failed with {:?} (device={})",
+                    idx, rc, op.device_ordinal
+                );
             }
             if debug {
-                let src = stream.synchronize();
+                let src = dev.stream().synchronize();
                 if src.is_err() {
                     crate::bail!(
                         "decode_cache replay: op[{}] sync failed (replay#{}, grid=({},{},{}), block=({},{},{}))",
@@ -685,22 +718,34 @@ impl DecodePlan {
     )> {
         let stream = dev.stream();
         let graph = hipdarc::driver::with_capture(stream, || {
-            let raw_stream = stream.raw();
+            // Multi-device: switch device via hipSetDevice when an op's
+            // ordinal differs from the previous. Each op uses its own
+            // captured stream (which already encodes the launch device).
+            let mut current_dev: i32 = -1;
             for op in &self.ops {
+                if op.device_ordinal != current_dev {
+                    let rc = unsafe { hipdarc::sys::hipSetDevice(op.device_ordinal) };
+                    if rc != hipdarc::sys::hipError_t::hipSuccess {
+                        return Err(hipdarc::error::DriverError::Hip(rc));
+                    }
+                    current_dev = op.device_ordinal;
+                }
                 let mut arg_ptrs: Vec<*mut c_void> = op
                     .arg_values
                     .iter()
                     .map(|v| v as *const u64 as *mut c_void)
                     .collect();
-                let rc = hipdarc::sys::hipModuleLaunchKernel(
-                    op.func,
-                    op.grid.0, op.grid.1, op.grid.2,
-                    op.block.0, op.block.1, op.block.2,
-                    op.shared_mem,
-                    raw_stream,
-                    arg_ptrs.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                );
+                let rc = unsafe {
+                    hipdarc::sys::hipModuleLaunchKernel(
+                        op.func,
+                        op.grid.0, op.grid.1, op.grid.2,
+                        op.block.0, op.block.1, op.block.2,
+                        op.shared_mem,
+                        op.stream,
+                        arg_ptrs.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                };
                 if rc != hipdarc::sys::hipError_t::hipSuccess {
                     return Err(hipdarc::error::DriverError::Hip(rc));
                 }
