@@ -131,6 +131,16 @@ for Gemma4-E4B's global-layer head_dim=512 (BC=8, 32 KiB LDS).
 The captured plan now contains 100% of attention compute (35×
 d=256 SWA + 7× d=512 global, no masked_softmax fallback).
 
+**K13:** cross-checked our gemma4 forward against
+`llama.cpp/src/models/gemma4-iswa.cpp`. Structure matches —
+`inpL = embed * sqrt(n_embd)` outside the loop, `inp_per_layer`
+prelude (CPU embed + GPU project + norm + residual) outside the
+loop, per-layer block (norm → wq/wk/wv → q/k norm → RoPE →
+attention → post-norm → residual → ffn → post-ffn-norm → residual
+→ per-layer-embed injection → layer scale) inside the loop. So the
+model formulation isn't the bug — it has to be correct because
+baseline+flash produces correct output.
+
 **Remaining:** replay output still incorrect (" I" instead of " help"
 at index_pos=14) despite full kernel coverage and per-call output
 evolution. Detailed diagnostics from earlier:
