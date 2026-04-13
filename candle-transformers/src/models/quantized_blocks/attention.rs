@@ -189,7 +189,7 @@ pub(crate) fn gqa_attention_k_transposed(
         if !strided_off
             && !v.is_contiguous()
             && t_k <= v2_threshold
-            && matches!(head_dim, 64 | 128)
+            && matches!(head_dim, 64 | 128 | 256)
             && matches!(q.device(), candle::Device::Hip(_))
             && q.dtype() == candle::DType::F32
             && mask.map(|m| m.dtype() == candle::DType::F32).unwrap_or(true)

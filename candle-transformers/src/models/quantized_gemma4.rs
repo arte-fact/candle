@@ -30,6 +30,33 @@ use candle_nn::Embedding;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+/// Helper used by the H1 n_kv-padding code path: pull `seq_len` (dim 2) from
+/// either the shared Q tensor or from x_norm.
+fn q_precomputed_shape_or_none(
+    shared: &Option<(Tensor, Tensor, Tensor)>,
+    x_norm: &Tensor,
+) -> Result<(usize, usize, usize, usize)> {
+    match shared {
+        Some((q, _, _)) => q.dims4(),
+        None => {
+            let (b, s, h) = x_norm.dims3()?;
+            // Shape the attention eventually sees is (B, H_q, seq, D) — we
+            // only need seq here (dim 2), reported as dim 2 of our tuple.
+            Ok((b, 1, s, h))
+        }
+    }
+}
+
+fn q_precomputed_device_or_xnorm<'a>(
+    shared: &'a Option<(Tensor, Tensor, Tensor)>,
+    x_norm: &'a Tensor,
+) -> &'a Device {
+    match shared {
+        Some((q, _, _)) => q.device(),
+        None => x_norm.device(),
+    }
+}
+
 pub const MAX_SEQ_LEN: usize = 131072;
 pub const DEFAULT_ROPE_FREQUENCY: f32 = 1_000_000.;
 pub const DEFAULT_ROPE_FREQUENCY_SLIDING: f32 = 10_000.;
@@ -700,28 +727,62 @@ impl ModelWeights {
 
             // Read K/V from this layer's slot or borrow from the source slot
             // (transferring across devices if needed).
-            let (k_use, v_use) = {
+            //
+            // H1: pad attention sequence length to a multiple of
+            // CANDLE_NKV_PAD (default 256) so kernel args stay constant
+            // across a 256-token decode window. Same trick as
+            // quantized_llama.rs. Uses the full cache buffer narrowed to
+            // the padded length — unwritten positions are zero, and we
+            // build a -inf mask for positions [T_cur, L_k_padded).
+            let pad_default: usize = if std::env::var("CANDLE_G2_REPLAY").is_ok() { 256 } else { 1 };
+            let pad_t = std::env::var("CANDLE_NKV_PAD")
+                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(pad_default);
+            let (_b_sz_q, _, seq_len_q, _) = q_precomputed_shape_or_none(&shared_qkv, &x_norm)?;
+            let (k_use, v_use, pad_info) = {
                 let src = if has_kv { il } else { kv_source_idx };
                 let cache = self.kv_caches[src]
                     .as_ref()
                     .expect("KV cache must exist for has_kv source layer");
-                let k = cache
-                    .k()?
-                    .ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
-                let v = cache
-                    .v()?
-                    .ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
-                let k = if device_eq(k.device(), &layer_device) {
-                    k
+                let k_cache = cache.k_cache();
+                let v_cache = cache.v_cache();
+                let t_cur = k_cache.current_seq_len();
+                let max_t = k_cache.max_seq_len();
+                let l_k_padded = if pad_t > 1 {
+                    (((t_cur + pad_t - 1) / pad_t) * pad_t).min(max_t)
                 } else {
-                    k.to_device(&layer_device)?
+                    t_cur
                 };
-                let v = if device_eq(v.device(), &layer_device) {
-                    v
+                let (k, v, padded) = if l_k_padded > t_cur && seq_len_q == 1 {
+                    let k_full = k_cache.all_data().as_ref()
+                        .ok_or_else(|| candle::Error::Msg("gemma4 k cache empty".into()))?;
+                    let v_full = v_cache.all_data().as_ref()
+                        .ok_or_else(|| candle::Error::Msg("gemma4 v cache empty".into()))?;
+                    // K stored (B, H_kv, D, maxT) → narrow dim 3 to l_k_padded.
+                    let k = k_full.narrow(3, 0, l_k_padded)?;
+                    // V stored (B, H_kv, maxT, D) → narrow dim 2 to l_k_padded.
+                    let v = v_full.narrow(2, 0, l_k_padded)?;
+                    (k, v, Some((t_cur, l_k_padded)))
                 } else {
-                    v.to_device(&layer_device)?
+                    let k = cache.k()?.ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
+                    let v = cache.v()?.ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
+                    (k, v, None)
                 };
-                (k, v)
+                let k = if device_eq(k.device(), &layer_device) { k } else { k.to_device(&layer_device)? };
+                let v = if device_eq(v.device(), &layer_device) { v } else { v.to_device(&layer_device)? };
+                (k, v, padded)
+            };
+
+            // When padded, extend the attention_mask (or build a new one
+            // for decode where mask is None) so positions [T_cur, L_k_pad)
+            // get -inf and contribute nothing to softmax.
+            let attention_mask = if let Some((t_cur, l_k_pad)) = pad_info {
+                let dev = q_precomputed_device_or_xnorm(&shared_qkv, &x_norm);
+                let head_dim_neg_inf = Tensor::full(f32::NEG_INFINITY, (1usize, 1, 1, l_k_pad - t_cur), dev)?;
+                let zeros = Tensor::zeros((1usize, 1, 1, t_cur), DType::F32, dev)?;
+                let pad_mask = Tensor::cat(&[&zeros, &head_dim_neg_inf], 3)?.contiguous()?;
+                Some(pad_mask)
+            } else {
+                attention_mask
             };
 
             // Dump layer 0 attention inputs for turbo comparison

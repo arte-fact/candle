@@ -363,3 +363,21 @@ extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_ktvs_d128
         scale, n_rep, mask_b_stride, mask_lq_stride,
         v_head_stride, v_stride_j, v_stride_d);
 }
+
+// D=256 strided variant — needed for Gemma4-E4B SWA layers (key_length_swa=256).
+// BC=16 keeps LDS under 32 KiB (2 * 16 * 256 * 4 = 32 KiB per block).
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_ktvs_d256_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d)
+{
+    flash_attn_fwd_v2_impl<256, 4, 16, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d);
+}

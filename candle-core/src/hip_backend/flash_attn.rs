@@ -943,6 +943,7 @@ pub fn flash_attn_v2_kt_strided_v(
     let kn = match d {
         64 => "flash_attn_v2_fwd_ktvs_d64_f32",
         128 => "flash_attn_v2_fwd_ktvs_d128_f32",
+        256 => "flash_attn_v2_fwd_ktvs_d256_f32",
         _ => crate::bail!("unsupported D={d}"),
     };
 
