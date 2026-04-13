@@ -743,20 +743,19 @@ impl ModelWeights {
             && std::env::var("CANDLE_G2_REPLAY").is_ok()
             && std::env::var("CANDLE_G2_DISABLE").is_err();
 
-        // Phase P auto-gate. T-major K (Phase P) gives +3.9 % decode on its
-        // own but regresses −48 % when combined with G2 replay (captured
-        // plans reference legacy `flash_attn_v2_fwd_ktvs_*` kernels). So:
-        //   - default on when G2 is NOT requested (most users)
-        //   - default off when `CANDLE_G2_REPLAY` is set (existing G2 users)
-        //   - explicit `CANDLE_KV_TMAJOR=0|1` always wins (benchmarks, Q1 dev)
-        // Mirrors the `CANDLE_NKV_PAD` pattern used below for the G2 pad
-        // boundary. Computed once here, captured by the KvCache-init closure
-        // and re-read at the narrow + dispatch sites below.
+        // Phase P auto-gate. T-major K + mat-vec decode kernel is now a
+        // win both on its own (+3.9 %) AND under G2 replay (+2.5 % vs
+        // legacy G2, after Q1 propagated dyn_lk into the mat-vec
+        // `l_k_iter` arg). So default-on is safe.
+        // `CANDLE_KV_TMAJOR=0|1` explicit override still works for
+        // benchmarks and bisecting regressions.
+        // Mirrors the `CANDLE_NKV_PAD` pattern used below. Computed
+        // once here, captured by the KvCache-init closure and re-read
+        // at the narrow + dispatch sites below.
         #[cfg(feature = "hip")]
         let k_is_canonical: bool = match std::env::var("CANDLE_KV_TMAJOR").ok().as_deref() {
-            Some("1") | Some("true") => true,
             Some("0") | Some("false") => false,
-            _ => std::env::var("CANDLE_G2_REPLAY").is_err(),
+            _ => true,
         };
         #[cfg(not(feature = "hip"))]
         let k_is_canonical: bool = false;
@@ -1476,15 +1475,21 @@ impl ModelWeights {
                         // K/V are narrow'd views of the padded cache
                         // (non-contig); the mat-vec kernel requires
                         // contiguous inputs. Per-layer copy is
-                        // t_cur*D*4 bytes — cheap.
-                        let t_k = k_use.dim(2)?;
+                        // l_k_padded*D*4 bytes.
+                        //
+                        // l_k_iter: when pad_info is Some (G2 replay
+                        // active with fixed pad), the K buffer is padded
+                        // past the real context length — iterate only
+                        // t_cur positions, not the padded extent
+                        // (Phase L dyn_lk equivalent for mat-vec).
                         let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
                         let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
+                        let l_k_iter = pad_info.map(|(t_cur, _)| t_cur).unwrap_or(k_c.dim(2)?);
                         candle::hip_backend::gqa_attention_decode_mv(
                             q_precomputed, &k_c, &v_c,
                             attention_mask.as_ref(),
                             self.layers[il].attn.attn_scale,
-                            t_k,
+                            l_k_iter,
                         )?
                     } else {
                         // Prefill: reuse the legacy D-major fast path by
@@ -1521,12 +1526,14 @@ impl ModelWeights {
                     let q = self.layers[il].attn.prepare_q(&x_norm, index_pos)?;
                     let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
                     let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
-                    let t_k = k_c.dim(2)?;
+                    // l_k_iter: same dyn_lk story as the shared_qkv branch
+                    // above — iterate t_cur, not the padded l_k_padded.
+                    let l_k_iter = pad_info.map(|(t_cur, _)| t_cur).unwrap_or(k_c.dim(2)?);
                     let attn_output = candle::hip_backend::gqa_attention_decode_mv(
                         &q, &k_c, &v_c,
                         attention_mask.as_ref(),
                         self.layers[il].attn.attn_scale,
-                        t_k,
+                        l_k_iter,
                     )?;
                     self.layers[il].attn.finish_attn(attn_output, b_sz, seq_len_q)?
                 } else {
