@@ -222,7 +222,10 @@ static __device__ __forceinline__ void flash_attn_decode_strided_impl(
     int k_head_stride, int k_stride_j, int k_stride_d,
     int v_head_stride, int v_stride_j, int v_stride_d) {
 
-    static_assert(D == 64 || D == 128, "only D=64 or D=128 supported");
+    static_assert(D == 64 || D == 128 || D == 256 || D == 512,
+                  "only D=64,128,256,512 supported");
+    static_assert(D % WARP_SIZE == 0, "D must be multiple of WARP_SIZE");
+    constexpr int D_PER_LANE = D / WARP_SIZE;
 
     const int q_idx = blockIdx.x;
     const int h_idx = blockIdx.y;
@@ -248,25 +251,25 @@ static __device__ __forceinline__ void flash_attn_decode_strided_impl(
                             + (int64_t)q_idx * (int64_t)mask_l_q_stride;
     }
 
-    float q_reg0 = 0.0f, q_reg1 = 0.0f;
-    float o_reg0 = 0.0f, o_reg1 = 0.0f;
-    if (D == 64) {
-        q_reg0 = q_ptr[lane];
-    } else {
-        q_reg0 = q_ptr[lane];
-        q_reg1 = q_ptr[lane + WARP_SIZE];
+    // Per-lane register state for Q and accumulated O. For D=256, D_PER_LANE=4
+    // → 8 floats per thread (32 bytes); D=512 → 16 floats per thread (64
+    // bytes). Comfortably under gfx906's 256 VGPR budget.
+    float q_reg[D_PER_LANE];
+    float o_reg[D_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < D_PER_LANE; ++i) {
+        q_reg[i] = q_ptr[lane + i * WARP_SIZE];
+        o_reg[i] = 0.0f;
     }
 
     float m_i = -INFINITY;
     float l_i = 0.0f;
 
     for (int j = 0; j < L_k; ++j) {
-        float partial;
-        if (D == 64) {
-            partial = q_reg0 * k_base[j * k_stride_j + lane * k_stride_d];
-        } else {
-            partial = q_reg0 * k_base[j * k_stride_j + lane * k_stride_d]
-                    + q_reg1 * k_base[j * k_stride_j + (lane + WARP_SIZE) * k_stride_d];
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            partial += q_reg[i] * k_base[j * k_stride_j + (lane + i * WARP_SIZE) * k_stride_d];
         }
         float s_j = flash_warp_reduce_sum_f32(partial);
         s_j *= scale;
@@ -279,22 +282,19 @@ static __device__ __forceinline__ void flash_attn_decode_strided_impl(
         const float alpha = gfx906_fast_exp(m_i - m_new);
         const float p     = gfx906_fast_exp(s_j - m_new);
 
-        if (D == 64) {
-            o_reg0 = alpha * o_reg0 + p * v_base[j * v_stride_j + lane * v_stride_d];
-        } else {
-            o_reg0 = alpha * o_reg0 + p * v_base[j * v_stride_j + lane * v_stride_d];
-            o_reg1 = alpha * o_reg1 + p * v_base[j * v_stride_j + (lane + WARP_SIZE) * v_stride_d];
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            o_reg[i] = alpha * o_reg[i]
+                     + p * v_base[j * v_stride_j + (lane + i * WARP_SIZE) * v_stride_d];
         }
         l_i = alpha * l_i + p;
         m_i = m_new;
     }
 
     const float inv_l = gfx906_rcp(l_i);
-    if (D == 64) {
-        o_ptr[lane] = o_reg0 * inv_l;
-    } else {
-        o_ptr[lane]             = o_reg0 * inv_l;
-        o_ptr[lane + WARP_SIZE] = o_reg1 * inv_l;
+    #pragma unroll
+    for (int i = 0; i < D_PER_LANE; ++i) {
+        o_ptr[lane + i * WARP_SIZE] = o_reg[i] * inv_l;
     }
 }
 
@@ -325,6 +325,46 @@ extern "C" __global__ void __launch_bounds__(64, 1) flash_attn_decode_d128_f32(
     int k_head_stride, int k_stride_j, int k_stride_d,
     int v_head_stride, int v_stride_j, int v_stride_d) {
     flash_attn_decode_strided_impl<128>(q, k, v, mask, out, B, n_head, n_kv_head,
+        L_q, L_k, scale, n_rep, mask_b_stride, mask_l_q_stride,
+        k_head_stride, k_stride_j, k_stride_d,
+        v_head_stride, v_stride_j, v_stride_d);
+}
+
+// D=256 and D=512 variants for gemma4-E4B's wide-head decode path. Same
+// 1-warp-per-(q_head,q_idx,batch) layout as D=64/128 — cheap GEMV-style
+// kernel without LDS K/V tiling. For E4B SWA (D=256, n_rep=2, T<=256)
+// this beats `flash_attn_v2_fwd_ktvs_d256` by a wide margin: turbo's
+// gemm-based decode path runs at ~0.6 ms/tok total attention vs candle's
+// 4 ms/tok with the v2 LDS-tiled kernel — the LDS tiling overhead
+// (cooperative loads across BR warps + __syncthreads) doesn't pay off
+// when L_q=1, since there are no cross-Q-row reuse opportunities.
+extern "C" __global__ void __launch_bounds__(64, 1) flash_attn_decode_d256_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int n_head, int n_kv_head, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_l_q_stride,
+    int k_head_stride, int k_stride_j, int k_stride_d,
+    int v_head_stride, int v_stride_j, int v_stride_d) {
+    flash_attn_decode_strided_impl<256>(q, k, v, mask, out, B, n_head, n_kv_head,
+        L_q, L_k, scale, n_rep, mask_b_stride, mask_l_q_stride,
+        k_head_stride, k_stride_j, k_stride_d,
+        v_head_stride, v_stride_j, v_stride_d);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1) flash_attn_decode_d512_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int n_head, int n_kv_head, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_l_q_stride,
+    int k_head_stride, int k_stride_j, int k_stride_d,
+    int v_head_stride, int v_stride_j, int v_stride_d) {
+    flash_attn_decode_strided_impl<512>(q, k, v, mask, out, B, n_head, n_kv_head,
         L_q, L_k, scale, n_rep, mask_b_stride, mask_l_q_stride,
         k_head_stride, k_stride_j, k_stride_d,
         v_head_stride, v_stride_j, v_stride_d);

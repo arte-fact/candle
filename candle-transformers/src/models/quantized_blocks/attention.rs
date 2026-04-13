@@ -238,6 +238,23 @@ pub(crate) fn gqa_attention_k_transposed(
                 Some(m) => Some(if m.is_contiguous() { m.clone() } else { m.contiguous()? }),
             };
 
+            // Note (2026-04-13): tried routing D=256/512 L_q=1 decode to
+            // `flash_attn_decode_strided` (1-warp-per-q_head GEMV-style)
+            // hoping to mirror turbo's ~0.6 ms/tok gemv+softmax dispatch.
+            // Regressed E4B 50.3 → 43.1 t/s. Per-kernel breakdown:
+            //   flash_attn_decode_d256_f32:   195us/call  (slower)
+            //   flash_attn_v2_fwd_ktvs_d256:   89us/call  (faster)
+            // Root cause: KvCache K layout (B, H_kv, D, max_T) means the
+            // naive GEMV pattern `K[lane * max_T + j]` (adjacent lanes
+            // read max_T apart) is fully uncoalesced — same VMEM-stride
+            // pathology that the K-stride kernel hit. The v2 kernel's
+            // cooperative LDS load IS the right approach for our storage
+            // layout; closing the gap to turbo would require either
+            // changing K storage to (B, H_kv, max_T, D) or a kernel that
+            // rocBLAS-style gemv-batches against the (D, T) view.
+            // Decode-strided D={256,512} kernels stay in the .cu file
+            // for future use (e.g. if KvCache layout changes); not wired.
+
             // v2 LDS-tiled kernel for both prefill (seq_len >= 4) and decode
             // (L_q=1 handled via q_in_range guard). This replaces rocBLAS on
             // the attention hot path — critical for G2/G3 replay which needs

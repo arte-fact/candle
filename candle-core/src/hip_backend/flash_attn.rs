@@ -644,6 +644,8 @@ pub fn flash_attn_decode_strided(
     let kernel_name = match d {
         64 => "flash_attn_decode_d64_f32",
         128 => "flash_attn_decode_d128_f32",
+        256 => "flash_attn_decode_d256_f32",
+        512 => "flash_attn_decode_d512_f32",
         _ => crate::bail!("flash_attn_decode_strided: unsupported D={d}"),
     };
 
