@@ -626,23 +626,29 @@ impl ModelWeights {
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (b_sz, seq_len) = x.dims2()?;
 
-        // ── G2/G3 eligibility check (single-device) ──
+        // ── G2/G3 eligibility check ──
         //
         // Gated by `CANDLE_G2_REPLAY=1` so the default forward path skips
-        // both recording and the prelude pause overhead. Multi-device
-        // (pipeline-parallel 31B) requires per-device recording which we
-        // don't have yet — fall through to normal forward there. E4B
-        // `per_layer_embeddings` is supported via a second external
-        // anchor; the per-layer compute runs with HIP recording + decode-
-        // alloc both paused so its kernels stay outside the captured plan
-        // and the resulting GPU buffer is patched into the captured args
-        // every replay.
+        // both recording and the prelude pause overhead. The plan
+        // captures kernel launches across all devices in order — each
+        // captured op carries its stream which determines the launching
+        // device — so multi-device pipeline-parallel works at the kernel
+        // level. Cross-device tensor transfers (`to_device`) are NOT
+        // captured (memcpy isn't in the recorder hook); instead the
+        // forward continues to call them fresh each token. As long as
+        // the destination buffer ends up at a stable decode_alloc pool
+        // address, the captured kernels on the next device read fresh
+        // data. Multi-device support is therefore opt-in and conditional
+        // on `CANDLE_G2_MULTI_DEV=1` while it's still being validated.
         #[cfg(feature = "hip")]
         let g2_eligible = seq_len == 1
             && index_pos > 0
             && {
-                let d0 = &self.layers[0].device;
-                self.layers.iter().all(|l| device_eq(&l.device, d0))
+                let single_device = {
+                    let d0 = &self.layers[0].device;
+                    self.layers.iter().all(|l| device_eq(&l.device, d0))
+                };
+                single_device || std::env::var("CANDLE_G2_MULTI_DEV").is_ok()
             }
             && std::env::var("CANDLE_G2_REPLAY").is_ok()
             && std::env::var("CANDLE_G2_DISABLE").is_err();
