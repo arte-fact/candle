@@ -97,25 +97,31 @@ first, otherwise G2 replay divergence returns).
     `with_recording_paused` helper that pauses both kernel recording
     and decode_alloc.
   - **K6** (commit a8d22fa0): E4B prelude (CPU embed + per_layer
-    compute) runs paused; results anchored as inputs #0/#1. Plan builds
-    successfully (1305 ops, externals/input=[2,1]) but actual replays
-    produce `"I I I I"` loop + rocBLAS error. **Blocker**: Gemma4's
-    sliding-window-attention mask is built fresh per token at varying
-    sizes (mask `last_dim` depends on `index_pos` until it reaches
-    `sliding_window_size+1`). The captured plan has the mask
-    `last_dim` baked in — replays at a different position fail the
-    `masked_softmax_scale_fused` shape check. Two ways out: pad the SWA
-    mask buffer to a fixed window length the same way `n_kv` pads the
-    K cache, or anchor the mask buffer as a third external input.
-  - **K7** (commit 5a645f77): multi-device replay fails on op[0] with
-    `hipErrorInvalidImage`. **Blocker**: HIP module/function handles
-    are per-device (`get_or_load_func` loads the kernel into each
-    device's module separately), and `hipModuleLaunchKernel` validates
-    the handle against the *current* device set via `hipSetDevice` —
-    not against the stream's device. Needs `RecordedOp` to carry the
-    device ordinal and `DecodePlan::replay` to `hipSetDevice` before
-    each launch (or batch consecutive same-device ops). Opt-in via
-    `CANDLE_G2_MULTI_DEV=1`.
+    compute) runs paused; results anchored as inputs #0/#1.
+  - **K7** (commit 5a645f77): documented multi-device blocker
+    (`hipErrorInvalidImage`) for follow-up under K9.
+  - **K8** (commit 4fb9db04): pad SWA mask via new
+    `causal_mask_padded`; anchor the mask as a third external input
+    (one per device + sliding-window pair). `with_recording_paused`
+    no longer pauses `decode_alloc` — prelude tensors stay at
+    sentinel-anchored pool slots, refreshed in-place by per-call
+    CPU→GPU memcpys. `decode_alloc_resume()` runs at the top of
+    forward when state is Replay/Graph so prelude allocs return the
+    recorded slots.
+  - **K9** (commit d53af394): per-device tracking in `RecordedOp`
+    (`device_ordinal` captured via `hipGetDevice` at record time);
+    `DecodePlan::replay` + `capture_graph_full` `hipSetDevice` once
+    per device boundary. Multi-device 31B G2 plan now builds cleanly
+    (2109 ops, 5 anchors) without the `hipErrorInvalidImage` crash.
+
+**Remaining (K10):** both E4B single-GPU and 31B multi-GPU fail at the
+first replay with a `" I I I I"` loop + rocBLAS error. `layer_in` is
+verified refreshed each replay
+(`CANDLE_G2_REPLAY_TRACE=1`); captured plan has 432 (E4B) / 720 (31B)
+Counter args that should advance positions; but `lm_head` emits a
+stale token. Likely a Counter arg miscategorized as Fixed (KV cache
+slice_set offset?), or one of the per-layer ops reads from a stale
+intermediate buffer. Not a multi-device issue.
 
 Default path (G2 disabled) verified intact — Gemma4-E4B Q4_0 still
 emits `"Hello! How can I help you today?"` at the baseline 47 t/s
