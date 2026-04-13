@@ -71,8 +71,8 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     int mask_b_stride, int mask_lq_stride,
     int v_head_stride = 0, int v_stride_j = 0, int v_stride_d = 0)
 {
-    static_assert(D == 64 || D == 128 || D == 256,
-                  "only D=64, D=128, D=256 supported");
+    static_assert(D == 64 || D == 128 || D == 256 || D == 512,
+                  "only D=64, D=128, D=256, D=512 supported");
     static_assert(D % WARP_SIZE == 0,
                   "D must be a multiple of WARP_SIZE");
     static_assert(BR >= 1 && BR <= 8, "BR must be 1..8");
@@ -377,6 +377,27 @@ extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_ktvs_d256
     int v_head_stride, int v_stride_j, int v_stride_d)
 {
     flash_attn_fwd_v2_impl<256, 4, 16, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d);
+}
+
+// D=512 strided variant — needed for Gemma4-E4B GLOBAL layers
+// (`key_length` = 512 on E4B). BC=8 keeps LDS at 32 KiB
+// (2 * 8 * 512 * 4 = 32 KiB per block — same budget as d=256/BC=16).
+// Halves the j-axis tile so each block does twice as many BC iterations
+// for a fixed L_k, in exchange for staying within the gfx906 LDS limit.
+extern "C" __global__ void __launch_bounds__(256, 1) flash_attn_v2_fwd_ktvs_d512_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d)
+{
+    flash_attn_fwd_v2_impl<512, 4, 8, true>(
         q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
         scale, n_rep, mask_b_stride, mask_lq_stride,
         v_head_stride, v_stride_j, v_stride_d);
