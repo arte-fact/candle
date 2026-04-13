@@ -775,6 +775,75 @@ impl QTensor {
             }
         }
     }
+
+    /// Mat-vec multiply using a pre-quantized Q8_1 activation buffer.
+    /// Skips the per-call `quantize_q8_1` dispatch — the caller must have
+    /// already quantized the input via `quantize_q8_1` or `rmsnorm_q8_fused`.
+    ///
+    /// HIP-only. Returns `(output_storage, output_shape)`.
+    #[cfg(feature = "hip")]
+    pub fn matmul_preq8(
+        &self,
+        y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        b_size: usize,
+        rhs_shape: &[usize],
+    ) -> Result<(crate::HipStorage, Shape)> {
+        match &self.storage {
+            QStorage::Hip(hip_storage) => {
+                hip_storage.fwd_with_preq8(&self.shape, y_q8_1, b_size, rhs_shape)
+            }
+            _ => crate::bail!("matmul_preq8 is only supported on HIP"),
+        }
+    }
+
+    /// Fused gate+up Q4_0 MMVQ with pre-quantized input. Returns two output
+    /// tensors of shape `rhs_shape[..-1] + [nrows(self)]`. Both weights must
+    /// be Q4_0. HIP-only.
+    #[cfg(feature = "hip")]
+    pub fn matmul_gate_up_preq8(
+        &self,
+        w_up: &QTensor,
+        y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        rhs_shape: &[usize],
+    ) -> Result<((crate::HipStorage, Shape), (crate::HipStorage, Shape))> {
+        let self_hip = match &self.storage {
+            QStorage::Hip(s) => s,
+            _ => crate::bail!("matmul_gate_up_preq8 is HIP-only"),
+        };
+        let up_hip = match &w_up.storage {
+            QStorage::Hip(s) => s,
+            _ => crate::bail!("matmul_gate_up_preq8: w_up must be HIP"),
+        };
+        let (gate_storage, up_storage) = self_hip.fwd_gate_up_preq8(up_hip, &self.shape, y_q8_1)?;
+        let (nrows, _) = self.shape.dims2()?;
+        let mut out_shape: Vec<usize> = rhs_shape.to_vec();
+        out_shape.pop();
+        out_shape.push(nrows);
+        let shape_a: Shape = out_shape.clone().into();
+        let shape_b: Shape = out_shape.into();
+        Ok(((gate_storage, shape_a), (up_storage, shape_b)))
+    }
+
+    /// Fused W_down MMVQ + residual add. `residual` must be shape `(nrows,)`
+    /// f32 on the same device as `self`. HIP-only.
+    #[cfg(feature = "hip")]
+    pub fn matmul_down_residual_preq8(
+        &self,
+        y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        residual: &hipdarc::driver::HipView<'_, f32>,
+        rhs_shape: &[usize],
+    ) -> Result<(crate::HipStorage, Shape)> {
+        let self_hip = match &self.storage {
+            QStorage::Hip(s) => s,
+            _ => crate::bail!("matmul_down_residual_preq8 is HIP-only"),
+        };
+        let storage = self_hip.fwd_down_residual_preq8(&self.shape, y_q8_1, residual)?;
+        let (nrows, _) = self.shape.dims2()?;
+        let mut out_shape: Vec<usize> = rhs_shape.to_vec();
+        out_shape.pop();
+        out_shape.push(nrows);
+        Ok((storage, out_shape.into()))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -858,6 +927,32 @@ impl QMatMul {
             _ => {
                 panic!("Not implemented!")
             }
+        }
+    }
+
+    /// Mat-vec forward with a pre-quantized Q8_1 activation buffer.
+    /// Eliminates the per-call `quantize_q8_1` dispatch when the same
+    /// activation feeds multiple weight matrices (Q/K/V projections).
+    ///
+    /// HIP-only. Falls back to regular `forward` on other backends.
+    #[cfg(feature = "hip")]
+    pub fn forward_preq8(
+        &self,
+        y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        b_size: usize,
+        rhs_shape: &[usize],
+    ) -> Result<Tensor> {
+        match self {
+            Self::QTensor(t) => {
+                let (storage, shape) = t.matmul_preq8(y_q8_1, b_size, rhs_shape)?;
+                Ok(Tensor::from_storage(
+                    crate::Storage::Hip(storage),
+                    shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                ))
+            }
+            _ => crate::bail!("forward_preq8 only supports QTensor variant"),
         }
     }
 }

@@ -23,6 +23,7 @@
 use crate::models::quantized_blocks::*;
 use crate::models::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
+use crate::models::quantized_blocks::attention::gqa_attention_k_transposed;
 use candle::quantized::{gguf_file, GgufBlob};
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::Embedding;
@@ -648,13 +649,27 @@ impl ModelWeights {
             let residual = layer_in.clone();
             let x_norm = self.layers[il].attn_norm.forward(&layer_in)?;
 
+            // D2 optimization: try shared Q8_1 quantization for Q/K/V projections.
+            // When x_norm feeds wq, wk, wv separately, pre-quantizing once saves
+            // 2 quantize_q8_1 kernel launches per layer.
+            #[cfg(feature = "hip")]
+            let shared_qkv = if has_kv {
+                self.layers[il].attn.compute_qkv_shared_q8(&x_norm, index_pos)?
+            } else {
+                None
+            };
+            #[cfg(not(feature = "hip"))]
+            let shared_qkv: Option<(candle::Tensor, candle::Tensor, candle::Tensor)> = None;
+
             // Compute fresh K/V if this layer owns its cache and append
-            // them to the pre-allocated `KvCache` (which uses
-            // `slice_set` into a fixed buffer instead of `Tensor::cat`,
-            // so the buffer pointer stays stable across decode steps).
+            // them to the pre-allocated `KvCache`.
             if has_kv {
-                if let Some((k_new, v_new)) =
+                let kv_result = if let Some((_, ref k_new, ref v_new)) = shared_qkv {
+                    Some((k_new.clone(), v_new.clone()))
+                } else {
                     self.layers[il].attn.compute_kv(&x_norm, index_pos)?
+                };
+                if let Some((k_new, v_new)) = kv_result
                 {
                     // First-touch initialization at index_pos == 0:
                     // wipe any state from a previous generation. The
@@ -716,16 +731,25 @@ impl ModelWeights {
                 let kv = k_use.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
                 eprintln!("[L0 k_cache] first 5 vals: {:.6?} shape={:?}", &kv[..5.min(kv.len())], k_use.shape());
             }
-            // Attack C: K is pre-transposed in the cache, so use the
-            // `*_transposed` variant which skips the internal
-            // `k.t().contiguous()` materialisation inside attention.
-            let attn = self.layers[il].attn.forward_with_kv_transposed(
-                &x_norm,
-                &k_use,
-                &v_use,
-                attention_mask.as_ref(),
-                index_pos,
-            )?;
+            // Attack C: K is pre-transposed in the cache.
+            // D2: if shared_qkv provided Q already, use it directly to skip
+            // the redundant wq.forward(x_norm) + quantize_q8_1.
+            let attn = if let Some((ref q_precomputed, _, _)) = shared_qkv {
+                let (b_sz, seq_len, _) = x_norm.dims3()?;
+                let attn_output = gqa_attention_k_transposed(
+                    q_precomputed, &k_use, &v_use,
+                    attention_mask.as_ref(), self.layers[il].attn.attn_scale,
+                )?;
+                self.layers[il].attn.finish_attn(attn_output, b_sz, seq_len)?
+            } else {
+                self.layers[il].attn.forward_with_kv_transposed(
+                    &x_norm,
+                    &k_use,
+                    &v_use,
+                    attention_mask.as_ref(),
+                    index_pos,
+                )?
+            };
             if il == 0 && std::env::var("CANDLE_GEMMA4_DUMP_L0").is_ok() {
                 let ao: Vec<f32> = attn.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
                 eprintln!("[L0 attn_out] first tok [0..5]: {:.6?} abs_mean={:.4}", &ao[..5], ao.iter().map(|v| v.abs()).sum::<f32>() / ao.len() as f32);

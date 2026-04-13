@@ -12,14 +12,16 @@ use half::{bf16, f16};
 mod device;
 mod error;
 mod flash_attn;
+pub mod decode_cache;
 mod fused_pointwise;
 mod gated_delta_net;
 mod utils;
 pub use device::{HipDevice, DeviceId};
 pub use error::{HipError, WrapErr};
-pub use flash_attn::{flash_attn_fused, flash_attn_v2_fused};
+pub use flash_attn::{flash_attn_decode_strided, flash_attn_decode_strided_split_k, flash_attn_fused, flash_attn_v2_fused, flash_attn_v2_kt_fused, flash_attn_v2_kt_strided_v};
 pub use fused_pointwise::{
-    l2_norm_fused, masked_softmax_scale_fused, rms_norm_post_residual_fused,
+    fused_ffn_decode_q4_0, l2_norm_fused, masked_softmax_scale_fused,
+    rms_norm_post_residual_fused, rmsnorm_q8_fused,
     silu_mul_split_last_fused, softplus_fused,
 };
 pub use gated_delta_net::gated_delta_net_step_fused;
@@ -93,6 +95,23 @@ pub enum HipStorageSlice {
     F16(HipSlice<f16>),
     F32(HipSlice<f32>),
     F64(HipSlice<f64>),
+}
+
+impl HipStorageSlice {
+    /// Raw device pointer regardless of element type.
+    pub fn device_ptr(&self) -> hipdarc::sys::hipDeviceptr_t {
+        match self {
+            Self::U8(s) => s.device_ptr(),
+            Self::U32(s) => s.device_ptr(),
+            Self::I16(s) => s.device_ptr(),
+            Self::I32(s) => s.device_ptr(),
+            Self::I64(s) => s.device_ptr(),
+            Self::BF16(s) => s.device_ptr(),
+            Self::F16(s) => s.device_ptr(),
+            Self::F32(s) => s.device_ptr(),
+            Self::F64(s) => s.device_ptr(),
+        }
+    }
 }
 
 struct Clone;
@@ -1267,6 +1286,11 @@ fn gemm_config(
     let lhs_m2 = lhs_stride[lhs_stride.len() - 2];
 
     // The a tensor has dims batching, k, n (rhs)
+    // rocBLAS convention (column-major): for Trans, lda >= k.
+    // For a KvCache V stored as (D, max_T) and transposed to (T, D):
+    //   stride[-1] = max_T (inner stride), stride[-2] = 1
+    //   This is Trans with lda = max_T >= k=T. rocBLAS reads m=D elements
+    //   from each of k=T columns, correctly skipping the (max_T-D) gap.
     let (lda, transa) = if (rhs_m1 == 1 || n == 1) && (rhs_m2 == n || k == 1) {
         (n as i32, GemmOp::NoTrans)
     } else if (rhs_m1 == k || n == 1) && (rhs_m2 == 1 || k == 1) {
@@ -2565,3 +2589,4 @@ mod graph_smoke {
         std::mem::drop(buf);
     }
 }
+// g2 debug force Sun Apr 12 16:26:20 UTC 2026

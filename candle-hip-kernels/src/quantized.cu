@@ -5,6 +5,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 #include<stdint.h>
+#include "gfx906_primitives.cuh"
 
 #define GGML_UNUSED(x) (void)(x)
 #define GGML_CUDA_ASSUME(x)
@@ -28,20 +29,13 @@ typedef float dfloat; // dequantize float
 typedef float2 dfloat2;
 typedef void (*dequantize_kernel_t)(const void * vx, const int ib, const int iqs, dfloat2 & v);
 
+// Use DPP-fused warp reductions from gfx906_primitives.cuh
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
-#pragma unroll
-    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
-        x += __shfl_xor(x, mask);
-    }
-    return x;
+    return gfx906_warp_reduce_sum(x);
 }
 
 static __device__ __forceinline__ float warp_reduce_max(float x) {
-#pragma unroll
-    for (int mask = WARP_SIZE/2; mask > 0; mask >>= 1) {
-        x = fmaxf(x, __shfl_xor(x, mask));
-    }
-    return x;
+    return gfx906_warp_reduce_max(x);
 }
 
 static __device__ __forceinline__ int get_int_from_int8(const int8_t * x8, const int & i32) {
@@ -2604,16 +2598,12 @@ static __device__ void mul_mat_vec_q(
 //   /artefact/llamacpp-turbo/llama-cpp-gfx906-turbo/ggml/src/ggml-cuda/
 //     gfx906/matmul/mmvq-{q4_0,q4_1,q8_0}.cuh
 
+// DPP-fused half-warp reduction from gfx906_primitives.cuh.
+// The template wrapper preserves the existing call-site signature.
 template<int width>
 static __device__ __forceinline__ float gfx906_half_warp_reduce_sum(float x) {
-    // Half-warp shuffle reduction. width=32 keeps the shuffle inside lanes
-    // 0..31 (or 32..63), so the two row-groups in the same wavefront don't
-    // contaminate each other.
-    #pragma unroll
-    for (int offset = width / 2; offset > 0; offset >>= 1) {
-        x += __shfl_xor(x, offset, width);
-    }
-    return x;
+    static_assert(width == 32, "DPP half-warp reduce only supports width=32");
+    return gfx906_half_warp_reduce_sum_dpp(x);
 }
 
 extern "C" __global__ void __launch_bounds__(64, 1)
@@ -2634,42 +2624,70 @@ mul_mat_vec_q4_0_q8_1_cuda1(
     const block_q4_0 * x = (const block_q4_0 *) vx + row * blocks_per_row;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
-    float sumf = 0.0f;
-    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
-        const block_q4_0 * bq4 = x + ib;
-        const block_q8_1 * bq8 = y + ib;
+    // Split accumulators for ILP: two independent FMA chains let the VALU
+    // pipeline overlap work that would otherwise serialize on a single sumf.
+    float sumf_even = 0.0f, sumf_odd = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 64) {
+        // --- Even block (ib) ---
+        {
+            const block_q4_0 * bq4 = x + ib;
+            const block_q8_1 * bq8 = y + ib;
 
-        // 16 bytes of Q4_0 quantized values (32 nibbles)
-        int v0, v1, v2, v3;
-        memcpy(&v0, bq4->qs +  0, 4);
-        memcpy(&v1, bq4->qs +  4, 4);
-        memcpy(&v2, bq4->qs +  8, 4);
-        memcpy(&v3, bq4->qs + 12, 4);
+            int v0, v1, v2, v3;
+            memcpy(&v0, bq4->qs +  0, 4);
+            memcpy(&v1, bq4->qs +  4, 4);
+            memcpy(&v2, bq4->qs +  8, 4);
+            memcpy(&v3, bq4->qs + 12, 4);
 
-        // 32 bytes of Q8_1 quantized values
-        const int * q8 = (const int *) bq8->qs;
-        const int u0 = q8[0], u1 = q8[1], u2 = q8[2], u3 = q8[3];
-        const int u4 = q8[4], u5 = q8[5], u6 = q8[6], u7 = q8[7];
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
 
-        // 8 dp4a — full 32-element dot product per block
-        int sumi = 0;
-        sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, u0, sumi);
-        sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, u4, sumi);
-        sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, u1, sumi);
-        sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, u5, sumi);
-        sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, u2, sumi);
-        sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, u6, sumi);
-        sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, u3, sumi);
-        sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, u7, sumi);
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
 
-        // Q4_0 formula: d4 * (sumi * d8 - 8 * s8). The "-8" comes from the
-        // fact that Q4_0 stores nibbles in [0,15] and gets reinterpreted as
-        // signed [-8,7] at multiply time, so the bias accumulates as -8*sum(y).
-        const float d4 = __half2float(bq4->d);
-        const float2 ds8 = __half22float2(bq8->ds);
-        sumf += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+            const float d4 = __half2float(bq4->d);
+            const float2 ds8 = __half22float2(bq8->ds);
+            sumf_even += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+        }
+
+        // --- Odd block (ib + 32) ---
+        if (ib + 32 < blocks_per_row) {
+            const block_q4_0 * bq4 = x + ib + 32;
+            const block_q8_1 * bq8 = y + ib + 32;
+
+            int v0, v1, v2, v3;
+            memcpy(&v0, bq4->qs +  0, 4);
+            memcpy(&v1, bq4->qs +  4, 4);
+            memcpy(&v2, bq4->qs +  8, 4);
+            memcpy(&v3, bq4->qs + 12, 4);
+
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+
+            const float d4 = __half2float(bq4->d);
+            const float2 ds8 = __half22float2(bq8->ds);
+            sumf_odd += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+        }
     }
 
+    float sumf = sumf_even + sumf_odd;
     sumf = gfx906_half_warp_reduce_sum<32>(sumf);
     if (half_lane == 0) {
         dst[row] = sumf;
@@ -2694,37 +2712,69 @@ mul_mat_vec_q4_1_q8_1_cuda1(
     const block_q4_1 * x = (const block_q4_1 *) vx + row * blocks_per_row;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
-    float sumf = 0.0f;
-    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
-        const block_q4_1 * bq4 = x + ib;
-        const block_q8_1 * bq8 = y + ib;
+    // Split accumulators for ILP
+    float sumf_even = 0.0f, sumf_odd = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 64) {
+        // --- Even block ---
+        {
+            const block_q4_1 * bq4 = x + ib;
+            const block_q8_1 * bq8 = y + ib;
 
-        int v0, v1, v2, v3;
-        memcpy(&v0, bq4->qs +  0, 4);
-        memcpy(&v1, bq4->qs +  4, 4);
-        memcpy(&v2, bq4->qs +  8, 4);
-        memcpy(&v3, bq4->qs + 12, 4);
+            int v0, v1, v2, v3;
+            memcpy(&v0, bq4->qs +  0, 4);
+            memcpy(&v1, bq4->qs +  4, 4);
+            memcpy(&v2, bq4->qs +  8, 4);
+            memcpy(&v3, bq4->qs + 12, 4);
 
-        const int * q8 = (const int *) bq8->qs;
-        const int u0 = q8[0], u1 = q8[1], u2 = q8[2], u3 = q8[3];
-        const int u4 = q8[4], u5 = q8[5], u6 = q8[6], u7 = q8[7];
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
 
-        int sumi = 0;
-        sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, u0, sumi);
-        sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, u4, sumi);
-        sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, u1, sumi);
-        sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, u5, sumi);
-        sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, u2, sumi);
-        sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, u6, sumi);
-        sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, u3, sumi);
-        sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, u7, sumi);
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
 
-        // Q4_1 has (d, m); Q8_1 has (d, s). Result = sumi * d4 * d8 + m4 * s8.
-        const float2 dm4 = __half22float2(bq4->dm);
-        const float2 ds8 = __half22float2(bq8->ds);
-        sumf += sumi * dm4.x * ds8.x + dm4.y * ds8.y;
+            const float2 dm4 = __half22float2(bq4->dm);
+            const float2 ds8 = __half22float2(bq8->ds);
+            sumf_even += sumi * dm4.x * ds8.x + dm4.y * ds8.y;
+        }
+
+        // --- Odd block ---
+        if (ib + 32 < blocks_per_row) {
+            const block_q4_1 * bq4 = x + ib + 32;
+            const block_q8_1 * bq8 = y + ib + 32;
+
+            int v0, v1, v2, v3;
+            memcpy(&v0, bq4->qs +  0, 4);
+            memcpy(&v1, bq4->qs +  4, 4);
+            memcpy(&v2, bq4->qs +  8, 4);
+            memcpy(&v3, bq4->qs + 12, 4);
+
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+
+            const float2 dm4 = __half22float2(bq4->dm);
+            const float2 ds8 = __half22float2(bq8->ds);
+            sumf_odd += sumi * dm4.x * ds8.x + dm4.y * ds8.y;
+        }
     }
 
+    float sumf = sumf_even + sumf_odd;
     sumf = gfx906_half_warp_reduce_sum<32>(sumf);
     if (half_lane == 0) {
         dst[row] = sumf;
@@ -2749,30 +2799,59 @@ mul_mat_vec_q8_0_q8_1_cuda1(
     const block_q8_0 * x = (const block_q8_0 *) vx + row * blocks_per_row;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
-    float sumf = 0.0f;
-    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
-        const block_q8_0 * bq8_0 = x + ib;
-        const block_q8_1 * bq8_1 = y + ib;
+    // Split accumulators for ILP
+    float sumf_even = 0.0f, sumf_odd = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 64) {
+        // --- Even block ---
+        {
+            const block_q8_0 * bq8_0 = x + ib;
+            const block_q8_1 * bq8_1 = y + ib;
 
-        // Both Q8_0 and Q8_1 are int8 arrays — load as 8 ints each.
-        const int * v = (const int *) bq8_0->qs;
-        const int * u = (const int *) bq8_1->qs;
-        int sumi = 0;
-        sumi = ggml_cuda_dp4a(v[0], u[0], sumi);
-        sumi = ggml_cuda_dp4a(v[1], u[1], sumi);
-        sumi = ggml_cuda_dp4a(v[2], u[2], sumi);
-        sumi = ggml_cuda_dp4a(v[3], u[3], sumi);
-        sumi = ggml_cuda_dp4a(v[4], u[4], sumi);
-        sumi = ggml_cuda_dp4a(v[5], u[5], sumi);
-        sumi = ggml_cuda_dp4a(v[6], u[6], sumi);
-        sumi = ggml_cuda_dp4a(v[7], u[7], sumi);
+            const int4 v_lo = *((const int4 *)(bq8_0->qs));
+            const int4 v_hi = *((const int4 *)(bq8_0->qs + 16));
+            const int4 u_lo = *((const int4 *)(bq8_1->qs));
+            const int4 u_hi = *((const int4 *)(bq8_1->qs + 16));
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a(v_lo.x, u_lo.x, sumi);
+            sumi = ggml_cuda_dp4a(v_lo.y, u_lo.y, sumi);
+            sumi = ggml_cuda_dp4a(v_lo.z, u_lo.z, sumi);
+            sumi = ggml_cuda_dp4a(v_lo.w, u_lo.w, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.x, u_hi.x, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.y, u_hi.y, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.z, u_hi.z, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.w, u_hi.w, sumi);
 
-        // Q8_0 formula: d0 * d1 * sumi (no bias term).
-        const float d0 = __half2float(bq8_0->d);
-        const float d1 = __low2float(bq8_1->ds);
-        sumf += d0 * d1 * (float) sumi;
+            const float d0 = __half2float(bq8_0->d);
+            const float d1 = __low2float(bq8_1->ds);
+            sumf_even += d0 * d1 * (float) sumi;
+        }
+
+        // --- Odd block ---
+        if (ib + 32 < blocks_per_row) {
+            const block_q8_0 * bq8_0 = x + ib + 32;
+            const block_q8_1 * bq8_1 = y + ib + 32;
+
+            const int4 v_lo = *((const int4 *)(bq8_0->qs));
+            const int4 v_hi = *((const int4 *)(bq8_0->qs + 16));
+            const int4 u_lo = *((const int4 *)(bq8_1->qs));
+            const int4 u_hi = *((const int4 *)(bq8_1->qs + 16));
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a(v_lo.x, u_lo.x, sumi);
+            sumi = ggml_cuda_dp4a(v_lo.y, u_lo.y, sumi);
+            sumi = ggml_cuda_dp4a(v_lo.z, u_lo.z, sumi);
+            sumi = ggml_cuda_dp4a(v_lo.w, u_lo.w, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.x, u_hi.x, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.y, u_hi.y, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.z, u_hi.z, sumi);
+            sumi = ggml_cuda_dp4a(v_hi.w, u_hi.w, sumi);
+
+            const float d0 = __half2float(bq8_0->d);
+            const float d1 = __low2float(bq8_1->ds);
+            sumf_odd += d0 * d1 * (float) sumi;
+        }
     }
 
+    float sumf = sumf_even + sumf_odd;
     sumf = gfx906_half_warp_reduce_sum<32>(sumf);
     if (half_lane == 0) {
         dst[row] = sumf;
@@ -2780,7 +2859,340 @@ mul_mat_vec_q8_0_q8_1_cuda1(
 }
 
 // ============================================================================
-// Original mul_mat_vec_q1 wrappers — kept for Q5_0/Q5_1 + K-quants which
+// gfx906 warp-cooperative MMVQ kernels for K-quants (Q4_K, Q5_K, Q6_K)
+// ============================================================================
+//
+// Same 64-thread/2-rows-per-block design as the Q4_0/Q4_1/Q8_0 kernels above.
+// Each thread processes entire Q_K blocks (QK_K=256 elements) with stride-32
+// over blocks. The per-block dot product uses dp4a for the inner products
+// and accumulates across all 8 sub-blocks.
+
+// --- Q4_K warp-cooperative MMVQ ---
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q4_K_q8_1_warp_coop(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK_K;
+    const block_q4_K * x = (const block_q4_K *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q4_K * bq4 = x + ib;
+        // 8 Q8_1 sub-blocks per Q4_K block
+        const block_q8_1 * bq8_base = y + ib * (QK_K / QK8_1);
+
+        const float dall = __low2float(bq4->dm);
+        const float dmin = __high2float(bq4->dm);
+
+        // Decode 6-bit sub-block scales and mins from the packed 12-byte array.
+        // Layout: scales[0..5] hold 8 scales, scales[6..11] hold 8 mins,
+        // with the top 2 bits of scales[0..3] borrowed for scales[4..7].
+        const uint16_t * a = (const uint16_t *)bq4->scales;
+        uint8_t sc[8], mn[8];
+        {
+            uint16_t aux[4];
+            // Sub-blocks 0-3
+            aux[0] = a[0] & 0x3f3f; aux[1] = a[1] & 0x3f3f;
+            aux[2] = a[2] & 0x3f3f; aux[3] = a[3] & 0x3f3f;
+            sc[0] = ((const uint8_t*)aux)[0]; sc[1] = ((const uint8_t*)aux)[1];
+            sc[2] = ((const uint8_t*)aux)[2]; sc[3] = ((const uint8_t*)aux)[3];
+            mn[0] = ((const uint8_t*)aux)[4]; mn[1] = ((const uint8_t*)aux)[5];
+            mn[2] = ((const uint8_t*)aux)[6]; mn[3] = ((const uint8_t*)aux)[7];
+            // Sub-blocks 4-7
+            aux[0] = ((a[4] >> 0) & 0x0f0f) | ((a[0] & 0xc0c0) >> 2);
+            aux[1] = ((a[4] >> 4) & 0x0f0f) | ((a[1] & 0xc0c0) >> 2);
+            aux[2] = ((a[5] >> 0) & 0x0f0f) | ((a[2] & 0xc0c0) >> 2);
+            aux[3] = ((a[5] >> 4) & 0x0f0f) | ((a[3] & 0xc0c0) >> 2);
+            sc[4] = ((const uint8_t*)aux)[0]; sc[5] = ((const uint8_t*)aux)[1];
+            sc[6] = ((const uint8_t*)aux)[2]; sc[7] = ((const uint8_t*)aux)[3];
+            mn[4] = ((const uint8_t*)aux)[4]; mn[5] = ((const uint8_t*)aux)[5];
+            mn[6] = ((const uint8_t*)aux)[6]; mn[7] = ((const uint8_t*)aux)[7];
+        }
+
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+
+        // Process all 8 sub-blocks (each 32 elements = 1 Q8_1 block)
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const block_q8_1 * bq8 = bq8_base + sub;
+            const float d8 = __low2float(bq8->ds);
+
+            // Q4_K quants: 16 bytes per sub-block (32 4-bit values)
+            // Layout: qs[sub*16 .. sub*16+15]
+            const int * q4 = (const int *)(bq4->qs + sub * 16);
+            // Q8_1 quants: 32 bytes (32 int8 values)
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+
+            // dp4a: low nibbles with q8 first half, high nibbles with q8 second half
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a(q4[0] & 0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a(q4[1] & 0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a(q4[2] & 0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a(q4[3] & 0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((q4[0] >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((q4[1] >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((q4[2] >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((q4[3] >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+
+            // sum of q8 values for the min correction
+            int sumi_q8 = 0;
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.x, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.y, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.z, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.w, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.x, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.y, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.z, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.w, sumi_q8);
+
+            sumf_d += d8 * (sumi * sc[sub]);
+            sumf_m += d8 * (sumi_q8 * mn[sub]);
+        }
+
+        sumf += dall * sumf_d - dmin * sumf_m;
+    }
+
+    sumf = gfx906_half_warp_reduce_sum_dpp(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
+// --- Q5_K warp-cooperative MMVQ ---
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q5_K_q8_1_warp_coop(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK_K;
+    const block_q5_K * x = (const block_q5_K *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q5_K * bq5 = x + ib;
+        const block_q8_1 * bq8_base = y + ib * (QK_K / QK8_1);
+
+        const float dall = __low2float(bq5->dm);
+        const float dmin = __high2float(bq5->dm);
+
+        // Decode scales/mins — same packing as Q4_K
+        const uint16_t * a = (const uint16_t *)bq5->scales;
+        uint8_t sc[8], mn[8];
+        {
+            uint16_t aux[4];
+            aux[0] = a[0] & 0x3f3f; aux[1] = a[1] & 0x3f3f;
+            aux[2] = a[2] & 0x3f3f; aux[3] = a[3] & 0x3f3f;
+            sc[0] = ((const uint8_t*)aux)[0]; sc[1] = ((const uint8_t*)aux)[1];
+            sc[2] = ((const uint8_t*)aux)[2]; sc[3] = ((const uint8_t*)aux)[3];
+            mn[0] = ((const uint8_t*)aux)[4]; mn[1] = ((const uint8_t*)aux)[5];
+            mn[2] = ((const uint8_t*)aux)[6]; mn[3] = ((const uint8_t*)aux)[7];
+            aux[0] = ((a[4] >> 0) & 0x0f0f) | ((a[0] & 0xc0c0) >> 2);
+            aux[1] = ((a[4] >> 4) & 0x0f0f) | ((a[1] & 0xc0c0) >> 2);
+            aux[2] = ((a[5] >> 0) & 0x0f0f) | ((a[2] & 0xc0c0) >> 2);
+            aux[3] = ((a[5] >> 4) & 0x0f0f) | ((a[3] & 0xc0c0) >> 2);
+            sc[4] = ((const uint8_t*)aux)[0]; sc[5] = ((const uint8_t*)aux)[1];
+            sc[6] = ((const uint8_t*)aux)[2]; sc[7] = ((const uint8_t*)aux)[3];
+            mn[4] = ((const uint8_t*)aux)[4]; mn[5] = ((const uint8_t*)aux)[5];
+            mn[6] = ((const uint8_t*)aux)[6]; mn[7] = ((const uint8_t*)aux)[7];
+        }
+
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const block_q8_1 * bq8 = bq8_base + sub;
+            const float d8 = __low2float(bq8->ds);
+
+            // Q5_K: low 4 bits in qs[sub*16..+16], high bit in qh[sub*4..+4]
+            const int * ql = (const int *)(bq5->qs + sub * 16);
+            const int * qh_ptr = (const int *)(bq5->qh + sub * 4);
+            const int qh = qh_ptr[0];
+
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+
+            // Reconstruct 5-bit values: low nibble | (high bit << 4)
+            // High bits: qh has 32 bits, one per element in this sub-block
+            int sumi = 0;
+            // Process low nibbles + high bit for first 16 elements
+            {
+                int v0 = (ql[0] & 0x0F0F0F0F) | (((qh >>  0) & 0x01010101) << 4);
+                int v1 = (ql[1] & 0x0F0F0F0F) | (((qh >>  4) & 0x01010101) << 4);
+                int v2 = (ql[2] & 0x0F0F0F0F) | (((qh >>  8) & 0x01010101) << 4);
+                int v3 = (ql[3] & 0x0F0F0F0F) | (((qh >> 12) & 0x01010101) << 4);
+                sumi = ggml_cuda_dp4a(v0, q8_lo.x, sumi);
+                sumi = ggml_cuda_dp4a(v1, q8_lo.y, sumi);
+                sumi = ggml_cuda_dp4a(v2, q8_lo.z, sumi);
+                sumi = ggml_cuda_dp4a(v3, q8_lo.w, sumi);
+            }
+            // High nibbles + high bit for last 16 elements
+            {
+                int v0 = ((ql[0] >> 4) & 0x0F0F0F0F) | (((qh >> 16) & 0x01010101) << 4);
+                int v1 = ((ql[1] >> 4) & 0x0F0F0F0F) | (((qh >> 20) & 0x01010101) << 4);
+                int v2 = ((ql[2] >> 4) & 0x0F0F0F0F) | (((qh >> 24) & 0x01010101) << 4);
+                int v3 = ((ql[3] >> 4) & 0x0F0F0F0F) | (((qh >> 28) & 0x01010101) << 4);
+                sumi = ggml_cuda_dp4a(v0, q8_hi.x, sumi);
+                sumi = ggml_cuda_dp4a(v1, q8_hi.y, sumi);
+                sumi = ggml_cuda_dp4a(v2, q8_hi.z, sumi);
+                sumi = ggml_cuda_dp4a(v3, q8_hi.w, sumi);
+            }
+
+            int sumi_q8 = 0;
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.x, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.y, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.z, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_lo.w, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.x, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.y, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.z, sumi_q8);
+            sumi_q8 = ggml_cuda_dp4a(0x01010101, q8_hi.w, sumi_q8);
+
+            sumf_d += d8 * (sumi * sc[sub]);
+            sumf_m += d8 * (sumi_q8 * mn[sub]);
+        }
+
+        sumf += dall * sumf_d - dmin * sumf_m;
+    }
+
+    sumf = gfx906_half_warp_reduce_sum_dpp(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
+// --- Q6_K warp-cooperative MMVQ ---
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q6_K_q8_1_warp_coop(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK_K;
+    const block_q6_K * x = (const block_q6_K *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q6_K * bq6 = x + ib;
+        const block_q8_1 * bq8_base = y + ib * (QK_K / QK8_1);
+
+        const float d6 = __half2float(bq6->d);
+
+        float block_sum = 0.0f;
+
+        // Q6_K has 16 sub-groups of 16 elements each (256 total).
+        // Each sub-group has a signed 8-bit scale in bq6->scales[i].
+        // Quants: lower 4 bits in ql[128], upper 2 bits in qh[64].
+        //
+        // Process in groups of 32 (matching Q8_1 block size = 32 elements).
+        // 8 Q8_1 blocks per Q6_K block.
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const block_q8_1 * bq8 = bq8_base + sub;
+            const float d8 = __low2float(bq8->ds);
+
+            // Q6_K element layout for sub-block `sub` (32 elements at positions sub*32..sub*32+31):
+            // Low 4 bits: ql[sub*16..sub*16+15] (16 bytes for 32 nibbles, packed)
+            // High 2 bits: qh[sub*8..sub*8+7] (8 bytes, 2 bits per element)
+            // Scales: scales[sub*2] and scales[sub*2+1] (2 sub-groups of 16)
+            const uint8_t * ql = bq6->ql + sub * 16;
+            const uint8_t * qh = bq6->qh + sub * 8;
+            const int8_t sc0 = bq6->scales[sub * 2];
+            const int8_t sc1 = bq6->scales[sub * 2 + 1];
+
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+
+            // Reconstruct 6-bit signed values and compute dot product
+            // First 16 elements (low nibbles of ql + bits from qh)
+            int sumi0 = 0;
+            {
+                const int * ql4 = (const int *)ql;
+                const int * qh4 = (const int *)qh;
+                // Low nibbles
+                int v0 = ql4[0] & 0x0F0F0F0F;
+                int v1 = ql4[1] & 0x0F0F0F0F;
+                int v2 = ql4[2] & 0x0F0F0F0F;
+                int v3 = ql4[3] & 0x0F0F0F0F;
+                // Add high 2 bits from qh
+                v0 |= ((qh4[0] << 4) & 0x30303030);
+                v1 |= ((qh4[0] >> 0) & 0x30303030) & 0x30303030; // bits 4-5
+                v2 |= ((qh4[1] << 4) & 0x30303030);
+                v3 |= ((qh4[1] >> 0) & 0x30303030) & 0x30303030;
+                // Subtract 32 to get signed values
+                v0 = __vsubss4(v0, 0x20202020);
+                v1 = __vsubss4(v1, 0x20202020);
+                v2 = __vsubss4(v2, 0x20202020);
+                v3 = __vsubss4(v3, 0x20202020);
+                sumi0 = ggml_cuda_dp4a(v0, q8_lo.x, sumi0);
+                sumi0 = ggml_cuda_dp4a(v1, q8_lo.y, sumi0);
+                sumi0 = ggml_cuda_dp4a(v2, q8_lo.z, sumi0);
+                sumi0 = ggml_cuda_dp4a(v3, q8_lo.w, sumi0);
+            }
+            // Second 16 elements (high nibbles of ql + bits from qh)
+            int sumi1 = 0;
+            {
+                const int * ql4 = (const int *)ql;
+                const int * qh4 = (const int *)qh;
+                int v0 = (ql4[0] >> 4) & 0x0F0F0F0F;
+                int v1 = (ql4[1] >> 4) & 0x0F0F0F0F;
+                int v2 = (ql4[2] >> 4) & 0x0F0F0F0F;
+                int v3 = (ql4[3] >> 4) & 0x0F0F0F0F;
+                v0 |= ((qh4[0] >> 2) & 0x30303030);
+                v1 |= ((qh4[0] >> 6) & 0x30303030);
+                v2 |= ((qh4[1] >> 2) & 0x30303030);
+                v3 |= ((qh4[1] >> 6) & 0x30303030);
+                v0 = __vsubss4(v0, 0x20202020);
+                v1 = __vsubss4(v1, 0x20202020);
+                v2 = __vsubss4(v2, 0x20202020);
+                v3 = __vsubss4(v3, 0x20202020);
+                sumi1 = ggml_cuda_dp4a(v0, q8_hi.x, sumi1);
+                sumi1 = ggml_cuda_dp4a(v1, q8_hi.y, sumi1);
+                sumi1 = ggml_cuda_dp4a(v2, q8_hi.z, sumi1);
+                sumi1 = ggml_cuda_dp4a(v3, q8_hi.w, sumi1);
+            }
+
+            block_sum += d8 * (sumi0 * sc0 + sumi1 * sc1);
+        }
+
+        sumf += d6 * block_sum;
+    }
+
+    sumf = gfx906_half_warp_reduce_sum_dpp(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
+// ============================================================================
+// Original mul_mat_vec_q1 wrappers — kept for Q5_0/Q5_1 + Q2_K/Q3_K which
 // don't have a warp-cooperative variant yet.
 // ============================================================================
 //
@@ -2823,28 +3235,221 @@ extern "C" __global__ void mul_mat_vec_q3_K_q8_1_cuda1(
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void mul_mat_vec_q4_K_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
+// K-quant cuda1 (b_size=1): warp-cooperative versions.
+// The Rust dispatcher launches with grid=(ceil(nrows/2)), block=(64,1,1)
+// matching the Q4_0/Q4_1/Q8_0 warp-coop pattern.
+// NOTE: these are thin wrappers that duplicate the warp_coop kernel body
+// because extern "C" __global__ functions can't call other __global__ functions.
+// The actual implementation is in mul_mat_vec_q*_K_q8_1_warp_coop above;
+// these entry points replicate that logic under the cuda1 name.
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q4_K_q8_1_cuda1(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
-    mul_mat_vec_q<1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    (void) nrows_y;
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK_K;
+    const block_q4_K * x = (const block_q4_K *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q4_K * bq4 = x + ib;
+        const block_q8_1 * bq8_base = y + ib * (QK_K / QK8_1);
+        const float dall = __low2float(bq4->dm);
+        const float dmin = __high2float(bq4->dm);
+        const uint16_t * a = (const uint16_t *)bq4->scales;
+        uint8_t sc[8], mn[8];
+        { uint16_t aux[4];
+          aux[0]=a[0]&0x3f3f; aux[1]=a[1]&0x3f3f; aux[2]=a[2]&0x3f3f; aux[3]=a[3]&0x3f3f;
+          sc[0]=((const uint8_t*)aux)[0]; sc[1]=((const uint8_t*)aux)[1];
+          sc[2]=((const uint8_t*)aux)[2]; sc[3]=((const uint8_t*)aux)[3];
+          mn[0]=((const uint8_t*)aux)[4]; mn[1]=((const uint8_t*)aux)[5];
+          mn[2]=((const uint8_t*)aux)[6]; mn[3]=((const uint8_t*)aux)[7];
+          aux[0]=((a[4]>>0)&0x0f0f)|((a[0]&0xc0c0)>>2);
+          aux[1]=((a[4]>>4)&0x0f0f)|((a[1]&0xc0c0)>>2);
+          aux[2]=((a[5]>>0)&0x0f0f)|((a[2]&0xc0c0)>>2);
+          aux[3]=((a[5]>>4)&0x0f0f)|((a[3]&0xc0c0)>>2);
+          sc[4]=((const uint8_t*)aux)[0]; sc[5]=((const uint8_t*)aux)[1];
+          sc[6]=((const uint8_t*)aux)[2]; sc[7]=((const uint8_t*)aux)[3];
+          mn[4]=((const uint8_t*)aux)[4]; mn[5]=((const uint8_t*)aux)[5];
+          mn[6]=((const uint8_t*)aux)[6]; mn[7]=((const uint8_t*)aux)[7];
+        }
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const block_q8_1 * bq8 = bq8_base + sub;
+            const float d8 = __low2float(bq8->ds);
+            const int * q4 = (const int *)(bq4->qs + sub * 16);
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a(q4[0]&0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a(q4[1]&0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a(q4[2]&0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a(q4[3]&0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((q4[0]>>4)&0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((q4[1]>>4)&0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((q4[2]>>4)&0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((q4[3]>>4)&0x0F0F0F0F, q8_hi.w, sumi);
+            int sq8 = 0;
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.x, sq8);
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.y, sq8);
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.z, sq8);
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.w, sq8);
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.x, sq8);
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.y, sq8);
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.z, sq8);
+            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.w, sq8);
+            sumf_d += d8 * (sumi * sc[sub]);
+            sumf_m += d8 * (sq8 * mn[sub]);
+        }
+        sumf += dall * sumf_d - dmin * sumf_m;
+    }
+    sumf = gfx906_half_warp_reduce_sum_dpp(sumf);
+    if (half_lane == 0) dst[row] = sumf;
 }
 
-extern "C" __global__ void mul_mat_vec_q5_K_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q5_K_q8_1_cuda1(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
-    mul_mat_vec_q<1, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    (void) nrows_y;
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+    const int blocks_per_row = ncols_x / QK_K;
+    const block_q5_K * x = (const block_q5_K *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q5_K * bq5 = x + ib;
+        const block_q8_1 * bq8_base = y + ib * (QK_K / QK8_1);
+        const float dall = __low2float(bq5->dm);
+        const float dmin = __high2float(bq5->dm);
+        const uint16_t * a = (const uint16_t *)bq5->scales;
+        uint8_t sc[8], mn[8];
+        { uint16_t aux[4];
+          aux[0]=a[0]&0x3f3f; aux[1]=a[1]&0x3f3f; aux[2]=a[2]&0x3f3f; aux[3]=a[3]&0x3f3f;
+          sc[0]=((const uint8_t*)aux)[0]; sc[1]=((const uint8_t*)aux)[1];
+          sc[2]=((const uint8_t*)aux)[2]; sc[3]=((const uint8_t*)aux)[3];
+          mn[0]=((const uint8_t*)aux)[4]; mn[1]=((const uint8_t*)aux)[5];
+          mn[2]=((const uint8_t*)aux)[6]; mn[3]=((const uint8_t*)aux)[7];
+          aux[0]=((a[4]>>0)&0x0f0f)|((a[0]&0xc0c0)>>2);
+          aux[1]=((a[4]>>4)&0x0f0f)|((a[1]&0xc0c0)>>2);
+          aux[2]=((a[5]>>0)&0x0f0f)|((a[2]&0xc0c0)>>2);
+          aux[3]=((a[5]>>4)&0x0f0f)|((a[3]&0xc0c0)>>2);
+          sc[4]=((const uint8_t*)aux)[0]; sc[5]=((const uint8_t*)aux)[1];
+          sc[6]=((const uint8_t*)aux)[2]; sc[7]=((const uint8_t*)aux)[3];
+          mn[4]=((const uint8_t*)aux)[4]; mn[5]=((const uint8_t*)aux)[5];
+          mn[6]=((const uint8_t*)aux)[6]; mn[7]=((const uint8_t*)aux)[7];
+        }
+        float sumf_d = 0.0f, sumf_m = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const block_q8_1 * bq8 = bq8_base + sub;
+            const float d8 = __low2float(bq8->ds);
+            const int * ql = (const int *)(bq5->qs + sub * 16);
+            const int * qh_ptr = (const int *)(bq5->qh + sub * 4);
+            const int qh = qh_ptr[0];
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+            int sumi = 0;
+            { int v0=(ql[0]&0x0F0F0F0F)|(((qh>>0)&0x01010101)<<4);
+              int v1=(ql[1]&0x0F0F0F0F)|(((qh>>4)&0x01010101)<<4);
+              int v2=(ql[2]&0x0F0F0F0F)|(((qh>>8)&0x01010101)<<4);
+              int v3=(ql[3]&0x0F0F0F0F)|(((qh>>12)&0x01010101)<<4);
+              sumi=ggml_cuda_dp4a(v0,q8_lo.x,sumi); sumi=ggml_cuda_dp4a(v1,q8_lo.y,sumi);
+              sumi=ggml_cuda_dp4a(v2,q8_lo.z,sumi); sumi=ggml_cuda_dp4a(v3,q8_lo.w,sumi); }
+            { int v0=((ql[0]>>4)&0x0F0F0F0F)|(((qh>>16)&0x01010101)<<4);
+              int v1=((ql[1]>>4)&0x0F0F0F0F)|(((qh>>20)&0x01010101)<<4);
+              int v2=((ql[2]>>4)&0x0F0F0F0F)|(((qh>>24)&0x01010101)<<4);
+              int v3=((ql[3]>>4)&0x0F0F0F0F)|(((qh>>28)&0x01010101)<<4);
+              sumi=ggml_cuda_dp4a(v0,q8_hi.x,sumi); sumi=ggml_cuda_dp4a(v1,q8_hi.y,sumi);
+              sumi=ggml_cuda_dp4a(v2,q8_hi.z,sumi); sumi=ggml_cuda_dp4a(v3,q8_hi.w,sumi); }
+            int sq8=0;
+            sq8=ggml_cuda_dp4a(0x01010101,q8_lo.x,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_lo.y,sq8);
+            sq8=ggml_cuda_dp4a(0x01010101,q8_lo.z,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_lo.w,sq8);
+            sq8=ggml_cuda_dp4a(0x01010101,q8_hi.x,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_hi.y,sq8);
+            sq8=ggml_cuda_dp4a(0x01010101,q8_hi.z,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_hi.w,sq8);
+            sumf_d += d8 * (sumi * sc[sub]);
+            sumf_m += d8 * (sq8 * mn[sub]);
+        }
+        sumf += dall * sumf_d - dmin * sumf_m;
+    }
+    sumf = gfx906_half_warp_reduce_sum_dpp(sumf);
+    if (half_lane == 0) dst[row] = sumf;
 }
 
-extern "C" __global__ void mul_mat_vec_q6_K_q8_1_cuda1(
-    const void * vx, const void * vy, float * dst,
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q6_K_q8_1_cuda1(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
 
-    mul_mat_vec_q<1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
-        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+    (void) nrows_y;
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+    const int blocks_per_row = ncols_x / QK_K;
+    const block_q6_K * x = (const block_q6_K *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q6_K * bq6 = x + ib;
+        const block_q8_1 * bq8_base = y + ib * (QK_K / QK8_1);
+        const float d6 = __half2float(bq6->d);
+        float block_sum = 0.0f;
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const block_q8_1 * bq8 = bq8_base + sub;
+            const float d8 = __low2float(bq8->ds);
+            const uint8_t * ql = bq6->ql + sub * 16;
+            const uint8_t * qh = bq6->qh + sub * 8;
+            const int8_t sc0 = bq6->scales[sub * 2];
+            const int8_t sc1 = bq6->scales[sub * 2 + 1];
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+            int sumi0 = 0;
+            { const int * ql4=(const int*)ql; const int * qh4=(const int*)qh;
+              int v0=(ql4[0]&0x0F0F0F0F)|((qh4[0]<<4)&0x30303030);
+              int v1=(ql4[1]&0x0F0F0F0F)|(((qh4[0]>>0)&0x0C0C0C0C)<<2);
+              int v2=(ql4[2]&0x0F0F0F0F)|((qh4[1]<<4)&0x30303030);
+              int v3=(ql4[3]&0x0F0F0F0F)|(((qh4[1]>>0)&0x0C0C0C0C)<<2);
+              v0=__vsubss4(v0,0x20202020); v1=__vsubss4(v1,0x20202020);
+              v2=__vsubss4(v2,0x20202020); v3=__vsubss4(v3,0x20202020);
+              sumi0=ggml_cuda_dp4a(v0,q8_lo.x,sumi0); sumi0=ggml_cuda_dp4a(v1,q8_lo.y,sumi0);
+              sumi0=ggml_cuda_dp4a(v2,q8_lo.z,sumi0); sumi0=ggml_cuda_dp4a(v3,q8_lo.w,sumi0); }
+            int sumi1 = 0;
+            { const int * ql4=(const int*)ql; const int * qh4=(const int*)qh;
+              int v0=((ql4[0]>>4)&0x0F0F0F0F)|((qh4[0]>>2)&0x30303030);
+              int v1=((ql4[1]>>4)&0x0F0F0F0F)|((qh4[0]>>6)&0x30303030);
+              int v2=((ql4[2]>>4)&0x0F0F0F0F)|((qh4[1]>>2)&0x30303030);
+              int v3=((ql4[3]>>4)&0x0F0F0F0F)|((qh4[1]>>6)&0x30303030);
+              v0=__vsubss4(v0,0x20202020); v1=__vsubss4(v1,0x20202020);
+              v2=__vsubss4(v2,0x20202020); v3=__vsubss4(v3,0x20202020);
+              sumi1=ggml_cuda_dp4a(v0,q8_hi.x,sumi1); sumi1=ggml_cuda_dp4a(v1,q8_hi.y,sumi1);
+              sumi1=ggml_cuda_dp4a(v2,q8_hi.z,sumi1); sumi1=ggml_cuda_dp4a(v3,q8_hi.w,sumi1); }
+            block_sum += d8 * (sumi0 * sc0 + sumi1 * sc1);
+        }
+        sumf += d6 * block_sum;
+    }
+    sumf = gfx906_half_warp_reduce_sum_dpp(sumf);
+    if (half_lane == 0) dst[row] = sumf;
 }
 
 // batch size = 2
@@ -3435,12 +4040,9 @@ extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __
     float sum = xi;
 
     // QK8_1=32: reduce within half-warp (32 threads) not full warp.
-    // On Wave64, a full warp_reduce would mix two adjacent Q8_1 blocks.
-#pragma unroll
-    for (int mask = QK8_1/2; mask > 0; mask >>= 1) {
-        amax = fmaxf(amax, __shfl_xor(amax, mask));
-        sum += __shfl_xor(sum, mask);
-    }
+    // DPP-fused half-warp reductions from gfx906_primitives.cuh.
+    amax = gfx906_half_warp_reduce_max_dpp(amax);
+    sum = gfx906_half_warp_reduce_sum_dpp(sum);
 
     const float d = amax / 127;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
@@ -4890,7 +5492,7 @@ static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_0_gfx906_v2(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -4899,14 +5501,14 @@ mul_mat_q4_0_gfx906_v2(
     mul_mat_q4_0_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_0_gfx906_v2_tile16(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q4_0_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_0_gfx906_v2_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -4937,13 +5539,80 @@ static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_fast(
     const int blocks_per_row_x = ncols_x / QK4_0;
     const int blocks_per_col_y = nrows_y / QK8_1;
 
-    float sums[TILE_N] = {0.0f};
+    // Split accumulators for ILP: sums_a and sums_b accumulate alternating
+    // K-blocks, breaking the serial FMA dependency chain.
+    float sums_a[TILE_N] = {0.0f};
+    float sums_b[TILE_N] = {0.0f};
 
-    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+    // K-loop unrolled by 2: process two K-blocks per iteration to amortize
+    // SALU overhead (increment, branch, address recompute).
+    int ib = 0;
+    for (; ib + 1 < blocks_per_row_x; ib += 2) {
+        // --- K-block 0 (even) ---
+        int x_lo0[4], x_hi0[4];
+        float scale_x0 = 0.0f;
+        if (row_valid) {
+            const block_q4_0 * bx = &x[row * blocks_per_row_x + ib];
+            scale_x0 = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = get_int_from_uint8(bx->qs, j);
+                x_lo0[j] = p & 0x0F0F0F0F;
+                x_hi0[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        // --- K-block 1 (odd) ---
+        int x_lo1[4], x_hi1[4];
+        float scale_x1 = 0.0f;
+        if (row_valid) {
+            const block_q4_0 * bx = &x[row * blocks_per_row_x + ib + 1];
+            scale_x1 = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = get_int_from_uint8(bx->qs, j);
+                x_lo1[j] = p & 0x0F0F0F0F;
+                x_hi1[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            // Even K-block → sums_a
+            {
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+                const float2 ds8f = __half22float2(by->ds);
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo0[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi0[j], y_packed[j + 4], sumi);
+                }
+                sums_a[c] += scale_x0 * (sumi * ds8f.x - 8.0f * ds8f.y);
+            }
+            // Odd K-block → sums_b
+            {
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib + 1];
+                const float2 ds8f = __half22float2(by->ds);
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo1[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi1[j], y_packed[j + 4], sumi);
+                }
+                sums_b[c] += scale_x1 * (sumi * ds8f.x - 8.0f * ds8f.y);
+            }
+        }
+    }
+
+    // Handle remainder if blocks_per_row_x is odd
+    if (ib < blocks_per_row_x) {
         int x_lo[4] = {0, 0, 0, 0};
         int x_hi[4] = {0, 0, 0, 0};
         float scale_x = 0.0f;
-
         if (row_valid) {
             const block_q4_0 * bx = &x[row * blocks_per_row_x + ib];
             scale_x = __half2float(bx->d);
@@ -4954,15 +5623,11 @@ static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_fast(
                 x_hi[j] = (p >> 4) & 0x0F0F0F0F;
             }
         }
-
-        // Unconditional col loop — no bounds check.
         #pragma unroll
         for (int c = 0; c < TILE_N; ++c) {
             const int col = tile_n + c;
             const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
             const float2 ds8f = __half22float2(by->ds);
-            const float d8 = ds8f.x;
-            const float s8 = ds8f.y;
             const int * y_packed = (const int *) by->qs;
             int sumi = 0;
             #pragma unroll
@@ -4970,8 +5635,15 @@ static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_fast(
                 sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
                 sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
             }
-            sums[c] += scale_x * (sumi * d8 - 8.0f * s8);
+            sums_a[c] += scale_x * (sumi * ds8f.x - 8.0f * ds8f.y);
         }
+    }
+
+    // Combine split accumulators
+    float sums[TILE_N];
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        sums[c] = sums_a[c] + sums_b[c];
     }
 
     if (!row_valid) return;
@@ -4984,7 +5656,7 @@ static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_fast(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_0_gfx906_v2f_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5094,7 +5766,7 @@ static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_1_gfx906_v2(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5108,21 +5780,21 @@ mul_mat_q4_1_gfx906_v2(
 // changes. See `candle-core/src/quantized/hip.rs::mul_mat_q_v2` for the
 // CANDLE_MMQ_TILE_N env switch that picks the variant at runtime.
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_1_gfx906_v2_tile16(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q4_1_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_1_gfx906_v2_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q4_1_gfx906_impl<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_1_gfx906_v2_tile64(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5232,7 +5904,7 @@ static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_clamp(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_1_gfx906_v2c_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5368,7 +6040,7 @@ static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_v2d(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_1_gfx906_v2d_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5400,18 +6072,81 @@ static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_fast(
     const int blocks_per_row_x = ncols_x / QK4_1;
     const int blocks_per_col_y = nrows_y / QK8_1;
 
-    float sums[TILE_N] = {0.0f};
+    // Split accumulators + K-loop unroll by 2 for ILP.
+    float sums_a[TILE_N] = {0.0f};
+    float sums_b[TILE_N] = {0.0f};
 
-    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
-        int x_lo[4] = {0, 0, 0, 0};
-        int x_hi[4] = {0, 0, 0, 0};
-        float d4 = 0.0f, m4 = 0.0f;
-
+    int ib = 0;
+    for (; ib + 1 < blocks_per_row_x; ib += 2) {
+        // --- K-block 0 ---
+        int x_lo0[4], x_hi0[4];
+        float d4_0 = 0.0f, m4_0 = 0.0f;
         if (row_valid) {
             const block_q4_1 * bx = &x[row * blocks_per_row_x + ib];
             const float2 dm4f = __half22float2(bx->dm);
-            d4 = dm4f.x;
-            m4 = dm4f.y;
+            d4_0 = dm4f.x; m4_0 = dm4f.y;
+            const int * q4_packed = (const int *) bx->qs;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q4_packed[j];
+                x_lo0[j] = p & 0x0F0F0F0F;
+                x_hi0[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+        // --- K-block 1 ---
+        int x_lo1[4], x_hi1[4];
+        float d4_1 = 0.0f, m4_1 = 0.0f;
+        if (row_valid) {
+            const block_q4_1 * bx = &x[row * blocks_per_row_x + ib + 1];
+            const float2 dm4f = __half22float2(bx->dm);
+            d4_1 = dm4f.x; m4_1 = dm4f.y;
+            const int * q4_packed = (const int *) bx->qs;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = q4_packed[j];
+                x_lo1[j] = p & 0x0F0F0F0F;
+                x_hi1[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            {
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+                const float2 ds8f = __half22float2(by->ds);
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo0[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi0[j], y_packed[j + 4], sumi);
+                }
+                sums_a[c] += sumi * d4_0 * ds8f.x + m4_0 * ds8f.y;
+            }
+            {
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib + 1];
+                const float2 ds8f = __half22float2(by->ds);
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo1[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi1[j], y_packed[j + 4], sumi);
+                }
+                sums_b[c] += sumi * d4_1 * ds8f.x + m4_1 * ds8f.y;
+            }
+        }
+    }
+
+    // Remainder if odd number of K-blocks
+    if (ib < blocks_per_row_x) {
+        int x_lo[4] = {0,0,0,0}, x_hi[4] = {0,0,0,0};
+        float d4 = 0.0f, m4 = 0.0f;
+        if (row_valid) {
+            const block_q4_1 * bx = &x[row * blocks_per_row_x + ib];
+            const float2 dm4f = __half22float2(bx->dm);
+            d4 = dm4f.x; m4 = dm4f.y;
             const int * q4_packed = (const int *) bx->qs;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -5420,16 +6155,11 @@ static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_fast(
                 x_hi[j] = (p >> 4) & 0x0F0F0F0F;
             }
         }
-
-        // UNCONDITIONAL col loop — no bounds check. Caller must ensure
-        // ncols_y is a multiple of TILE_N (or tolerate reading past end).
         #pragma unroll
         for (int c = 0; c < TILE_N; ++c) {
             const int col = tile_n + c;
             const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
             const float2 ds8f = __half22float2(by->ds);
-            const float d8 = ds8f.x;
-            const float s8 = ds8f.y;
             const int * y_packed = (const int *) by->qs;
             int sumi = 0;
             #pragma unroll
@@ -5437,8 +6167,15 @@ static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_fast(
                 sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
                 sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
             }
-            sums[c] += sumi * d4 * d8 + m4 * s8;
+            sums_a[c] += sumi * d4 * ds8f.x + m4 * ds8f.y;
         }
+    }
+
+    // Combine split accumulators
+    float sums[TILE_N];
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        sums[c] = sums_a[c] + sums_b[c];
     }
 
     if (!row_valid) return;
@@ -5451,7 +6188,7 @@ static __device__ __forceinline__ void mul_mat_q4_1_gfx906_impl_fast(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q4_1_gfx906_v2f_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5549,21 +6286,21 @@ static __device__ __forceinline__ void mul_mat_q8_0_gfx906_impl(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q8_0_gfx906_v2(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q8_0_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q8_0_gfx906_v2_tile16(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q8_0_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q8_0_gfx906_v2_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5632,7 +6369,7 @@ static __device__ __forceinline__ void mul_mat_q8_0_gfx906_impl_fast(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q8_0_gfx906_v2f_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5819,21 +6556,21 @@ static __device__ __forceinline__ void mul_mat_q5_K_gfx906_impl(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q5_K_gfx906_v2(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q5_K_gfx906_impl<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q5_K_gfx906_v2_tile16(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q5_K_gfx906_impl<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q5_K_gfx906_v2_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
@@ -5955,9 +6692,231 @@ static __device__ __forceinline__ void mul_mat_q5_K_gfx906_impl_fast(
     }
 }
 
-extern "C" __global__ void
+extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_q5_K_gfx906_v2f_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q5_K_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// ============================================================================
+// FFN fusion (Q4_0 decode, B=1)
+// ----------------------------------------------------------------------------
+// Two kernels that cut the FFN kernel-launch count per layer from 7 to 5:
+//
+//   gate_up_fused: computes W_gate @ x_q8  AND  W_up @ x_q8 in ONE pass.
+//                  Reads x_q8 once (half the L2 traffic of two separate MMVQs)
+//                  and writes two f32 outputs per half-warp-row.
+//   down_residual: W_down @ hidden_q8 + residual, fused into a single kernel.
+//
+// Both share the warp-cooperative structure of mul_mat_vec_q4_0_q8_1_cuda1:
+// 64 threads / block, 2 rows per block (half-warp split), DP4A inner loop,
+// split accumulator for ILP, DPP half-warp reduce.
+// ============================================================================
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q4_0_q8_1_gate_up_fused(
+    const void * __restrict__ vx_gate,
+    const void * __restrict__ vx_up,
+    const void * __restrict__ vy,
+    float * __restrict__ dst_gate,
+    float * __restrict__ dst_up,
+    const int ncols_x, const int nrows_x) {
+
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK4_0;
+    const block_q4_0 * xg = (const block_q4_0 *) vx_gate + row * blocks_per_row;
+    const block_q4_0 * xu = (const block_q4_0 *) vx_up   + row * blocks_per_row;
+    const block_q8_1 * y  = (const block_q8_1 *) vy;
+
+    float sumf_g_even = 0.0f, sumf_g_odd = 0.0f;
+    float sumf_u_even = 0.0f, sumf_u_odd = 0.0f;
+
+    for (int ib = half_lane; ib < blocks_per_row; ib += 64) {
+        // --- Even block (ib) — reuse the Q8_1 vectors for both weights ---
+        {
+            const block_q8_1 * bq8 = y + ib;
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+            const float2 ds8 = __half22float2(bq8->ds);
+
+            // Gate
+            {
+                const block_q4_0 * bq4 = xg + ib;
+                int v0, v1, v2, v3;
+                memcpy(&v0, bq4->qs +  0, 4);
+                memcpy(&v1, bq4->qs +  4, 4);
+                memcpy(&v2, bq4->qs +  8, 4);
+                memcpy(&v3, bq4->qs + 12, 4);
+                int sumi = 0;
+                sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+                sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+                const float d4 = __half2float(bq4->d);
+                sumf_g_even += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+            }
+            // Up
+            {
+                const block_q4_0 * bq4 = xu + ib;
+                int v0, v1, v2, v3;
+                memcpy(&v0, bq4->qs +  0, 4);
+                memcpy(&v1, bq4->qs +  4, 4);
+                memcpy(&v2, bq4->qs +  8, 4);
+                memcpy(&v3, bq4->qs + 12, 4);
+                int sumi = 0;
+                sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+                sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+                const float d4 = __half2float(bq4->d);
+                sumf_u_even += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+            }
+        }
+
+        // --- Odd block (ib + 32) ---
+        if (ib + 32 < blocks_per_row) {
+            const block_q8_1 * bq8 = y + ib + 32;
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+            const float2 ds8 = __half22float2(bq8->ds);
+
+            {
+                const block_q4_0 * bq4 = xg + ib + 32;
+                int v0, v1, v2, v3;
+                memcpy(&v0, bq4->qs +  0, 4);
+                memcpy(&v1, bq4->qs +  4, 4);
+                memcpy(&v2, bq4->qs +  8, 4);
+                memcpy(&v3, bq4->qs + 12, 4);
+                int sumi = 0;
+                sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+                sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+                const float d4 = __half2float(bq4->d);
+                sumf_g_odd += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+            }
+            {
+                const block_q4_0 * bq4 = xu + ib + 32;
+                int v0, v1, v2, v3;
+                memcpy(&v0, bq4->qs +  0, 4);
+                memcpy(&v1, bq4->qs +  4, 4);
+                memcpy(&v2, bq4->qs +  8, 4);
+                memcpy(&v3, bq4->qs + 12, 4);
+                int sumi = 0;
+                sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+                sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+                sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+                sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+                sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+                const float d4 = __half2float(bq4->d);
+                sumf_u_odd += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+            }
+        }
+    }
+
+    float sumf_g = sumf_g_even + sumf_g_odd;
+    float sumf_u = sumf_u_even + sumf_u_odd;
+    sumf_g = gfx906_half_warp_reduce_sum<32>(sumf_g);
+    sumf_u = gfx906_half_warp_reduce_sum<32>(sumf_u);
+    if (half_lane == 0) {
+        dst_gate[row] = sumf_g;
+        dst_up[row]   = sumf_u;
+    }
+}
+
+// Down + residual fused. Adds residual[row] to the matmul output. Shape
+// invariant: residual is (nrows_x,) f32 — same layout as dst.
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q4_0_q8_1_down_residual(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    const float * __restrict__ residual,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x) {
+
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK4_0;
+    const block_q4_0 * x = (const block_q4_0 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf_even = 0.0f, sumf_odd = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 64) {
+        {
+            const block_q4_0 * bq4 = x + ib;
+            const block_q8_1 * bq8 = y + ib;
+            int v0, v1, v2, v3;
+            memcpy(&v0, bq4->qs +  0, 4);
+            memcpy(&v1, bq4->qs +  4, 4);
+            memcpy(&v2, bq4->qs +  8, 4);
+            memcpy(&v3, bq4->qs + 12, 4);
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+            const float d4 = __half2float(bq4->d);
+            const float2 ds8 = __half22float2(bq8->ds);
+            sumf_even += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+        }
+        if (ib + 32 < blocks_per_row) {
+            const block_q4_0 * bq4 = x + ib + 32;
+            const block_q8_1 * bq8 = y + ib + 32;
+            int v0, v1, v2, v3;
+            memcpy(&v0, bq4->qs +  0, 4);
+            memcpy(&v1, bq4->qs +  4, 4);
+            memcpy(&v2, bq4->qs +  8, 4);
+            memcpy(&v3, bq4->qs + 12, 4);
+            const int4 q8_lo = *((const int4 *)(bq8->qs));
+            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+            int sumi = 0;
+            sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+            sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+            sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+            sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+            sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+            const float d4 = __half2float(bq4->d);
+            const float2 ds8 = __half22float2(bq8->ds);
+            sumf_odd += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+        }
+    }
+
+    float sumf = sumf_even + sumf_odd;
+    sumf = gfx906_half_warp_reduce_sum<32>(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf + residual[row];
+    }
 }

@@ -70,18 +70,12 @@ pub(crate) fn gqa_attention(
     debug_assert_eq!(n_head % n_kv_head, 0, "n_head must be divisible by n_kv_head");
     let n_rep = n_head / n_kv_head;
 
-    // P2/Q3: HIP flash-attention — BOTH variants are OPT-IN and default
-    // OFF. Benchmarking on gfx906 consistently shows that rocBLAS's
-    // Tensile matrix-tile kernels beat our scalar f32 flash-attn
-    // designs for every head-dim we can compile today. The v1 BR=1
-    // postmortem is in BENCH-P2-FLASH-ATTN-v1-2026-04-11.md; v2 (BR=4,
-    // LDS-tiled, D in {64, 128, 256}) is the follow-up from Q3 and
-    // surfaces the same story — correctness passes, performance loses
-    // because each j iteration has a 6-shuffle warp reduce plus two
-    // __expf calls that we can't amortise the way a GEMM kernel does.
-    //
-    // Enabled via `CANDLE_FLASH_ATTN_V2_ENABLE` for experimentation,
-    // or `CANDLE_FLASH_ATTN_V1_ENABLE` for the BR=1 variant.
+    // Flash-attention v2 with DPP warp reductions + SFU exp/rcp.
+    // Opt-in via CANDLE_FLASH_ATTN_V2_ENABLE=1. The fused kernel is
+    // correct but currently ~15-50% slower per-call than rocBLAS on
+    // gfx906 due to the per-j warp reduction bottleneck. The dispatch
+    // reduction benefit (10k+ → 48 on gemma4 sliding window) can
+    // outweigh the per-call penalty at very long sequences.
     #[cfg(feature = "hip")]
     {
         if std::env::var("CANDLE_FLASH_ATTN_V2_ENABLE").is_ok()
@@ -116,19 +110,6 @@ pub(crate) fn gqa_attention(
             ) {
                 return Ok(o);
             }
-        }
-        if std::env::var("CANDLE_FLASH_ATTN_V1_ENABLE").is_ok()
-            && matches!(q.device(), candle::Device::Hip(_))
-            && q.dtype() == candle::DType::F32
-            && q.is_contiguous()
-            && k.is_contiguous()
-            && v.is_contiguous()
-            && mask
-                .map(|m| m.is_contiguous() && m.dtype() == candle::DType::F32)
-                .unwrap_or(true)
-            && (head_dim == 64 || head_dim == 128)
-        {
-            return candle::hip_backend::flash_attn_fused(q, k, v, mask, attn_scale);
         }
     }
 
@@ -175,6 +156,100 @@ pub(crate) fn gqa_attention_k_transposed(
     let n_kv_head = kkv;
     debug_assert_eq!(n_head % n_kv_head, 0, "n_head must be divisible by n_kv_head");
     let n_rep = n_head / n_kv_head;
+
+    // G1: Strided decode/prefill attention — fused kernel that reads K/V
+    // via explicit strides from KvCache pre-allocated buffers.
+    // Uses the v2 LDS-tiled kernel with V stride support for both
+    // decode (L_q=1) and prefill (L_q>=4).
+    // G1: Strided flash attention dispatch.
+    // - Prefill (seq_len >= 4): v2 LDS-tiled kernel with strided V (default).
+    // - Decode (L_q=1): rocBLAS via the inner fallback (default). Strided
+    //   flash-attn decode kernels lose to rocBLAS on gfx906 for K/V in
+    //   transposed layout — the per-thread access pattern across D is
+    //   stride-maxT (uncoalesced). The split-K kernel is kept as opt-in
+    //   via CANDLE_SPLITK=1 for experimentation.
+    #[cfg(feature = "hip")]
+    {
+        let strided_off = std::env::var("CANDLE_FLASH_STRIDED_OFF").is_ok();
+        // v2's LDS-tiled kernel beats rocBLAS for narrow T (<=256) but
+        // loses badly at wide T (the BC=64 outer loop isn't unrolled and
+        // occupancy is limited). Fall through to rocBLAS when L_k is
+        // large regardless of V contiguity.
+        // v2's LDS-tiled kernel is typically faster than rocBLAS for
+        // narrow L_k (<=128 observed), but rocBLAS wins for wider T —
+        // v2's BC=64 outer loop isn't unrolled and occupancy is limited.
+        // When G2 replay is active, we pad L_k to 256 so rocBLAS becomes
+        // the decisive winner; turn v2 off entirely in that mode.
+        let v2_threshold: usize = if std::env::var("CANDLE_G2_REPLAY").is_ok() {
+            0 // skip v2 → always rocBLAS
+        } else {
+            std::env::var("CANDLE_FLASH_V2_MAX_LK")
+                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(512)
+        };
+        if !strided_off
+            && !v.is_contiguous()
+            && t_k <= v2_threshold
+            && matches!(head_dim, 64 | 128)
+            && matches!(q.device(), candle::Device::Hip(_))
+            && q.dtype() == candle::DType::F32
+            && mask.map(|m| m.dtype() == candle::DType::F32).unwrap_or(true)
+        {
+            let q_c = if q.is_contiguous() { q.clone() } else { q.contiguous()? };
+            let mask_c = match mask {
+                None => None,
+                Some(m) => Some(if m.is_contiguous() { m.clone() } else { m.contiguous()? }),
+            };
+
+            // v2 LDS-tiled kernel for both prefill (seq_len >= 4) and decode
+            // (L_q=1 handled via q_in_range guard). This replaces rocBLAS on
+            // the attention hot path — critical for G2/G3 replay which needs
+            // a stable kernel set (rocBLAS Tensile picks different kernels
+            // as GEMM dims grow past thresholds, breaking graph replay).
+            let kt_c = if k_t.is_contiguous() { k_t.clone() } else { k_t.contiguous()? };
+            if let Ok(o) = candle::hip_backend::flash_attn_v2_kt_strided_v(
+                &q_c, &kt_c, v, mask_c.as_ref(), attn_scale, t_k,
+            ) {
+                return Ok(o);
+            }
+            if std::env::var("CANDLE_SPLITK").is_ok() {
+                if let Ok(o) = candle::hip_backend::flash_attn_decode_strided_split_k(
+                    &q_c, k_t, v, mask_c.as_ref(), attn_scale, t_k,
+                ) {
+                    return Ok(o);
+                }
+            }
+        }
+    }
+
+    // Flash-attention v2 with native K-transposed support.
+    // Opt-in via CANDLE_FLASH_ATTN_V2_ENABLE=1.
+    #[cfg(feature = "hip")]
+    {
+        if std::env::var("CANDLE_FLASH_ATTN_V2_ENABLE").is_ok()
+            && seq_len >= 4
+            && matches!(head_dim, 64 | 128 | 256)
+            && matches!(q.device(), candle::Device::Hip(_))
+            && q.dtype() == candle::DType::F32
+            && mask
+                .map(|m| m.dtype() == candle::DType::F32)
+                .unwrap_or(true)
+        {
+            let q_c = if q.is_contiguous() { q.clone() } else { q.contiguous()? };
+            let kt_c = if k_t.is_contiguous() { k_t.clone() } else { k_t.contiguous()? };
+            // Flash attn kernel requires contiguous V; rocBLAS handles strided.
+            let v_c = if v.is_contiguous() { v.clone() } else { v.contiguous()? };
+            let mask_c = match mask {
+                None => None,
+                Some(m) => Some(if m.is_contiguous() { m.clone() } else { m.contiguous()? }),
+            };
+            if let Ok(o) = candle::hip_backend::flash_attn_v2_kt_fused(
+                &q_c, &kt_c, &v_c, mask_c.as_ref(), attn_scale,
+            ) {
+                return Ok(o);
+            }
+        }
+    }
+
     // k_t is assumed already contiguous; if not, materialise (this is a
     // one-time transition cost that rocBLAS batched gemm needs).
     let k_t_owned;
@@ -262,8 +337,14 @@ fn gqa_attention_inner(
     // Re-group for V matmul: (B, n_head, L, T) → (B, n_kv_head, n_rep*L, T).
     let attn_weights_grouped =
         attn_weights.reshape((b_sz, n_kv_head, n_rep * seq_len, t_k))?;
-    let v_c = v.contiguous()?;
-    let attn_output = attn_weights_grouped.matmul(&v_c)?;
+
+    let attn_output = if v.is_contiguous() {
+        attn_weights_grouped.matmul(v)?
+    } else {
+        // V is non-contiguous (KvCache narrow+transpose). Make contiguous.
+        let v_c = v.contiguous()?;
+        attn_weights_grouped.matmul(&v_c)?
+    };
 
     // Un-flatten back to (B, n_head, L, D) for the caller.
     attn_output.reshape((b_sz, n_head, seq_len, head_dim))
@@ -314,7 +395,7 @@ pub struct StandardAttention {
     pub n_head: usize,
     pub n_kv_head: usize,
     pub head_dim: usize,
-    attn_scale: f64,
+    pub attn_scale: f64,
     v_norm_eps: Option<f64>,
     /// Per-layer RoPE — owned, not Arc'd, so each layer can have its own
     /// `freq_base`/`freq_factors`/`dim` (gemma4 sliding vs global, etc.).
@@ -497,6 +578,122 @@ impl StandardAttention {
         Ok(Some((k, v)))
     }
 
+    /// Compute K, V, and Q projections with **shared Q8_1 quantization**.
+    ///
+    /// When all three projections consume the same normalized activation
+    /// `x_norm`, the standard path quantizes `x_norm` to Q8_1 three times
+    /// (once per matmul). This method quantizes once and reuses the buffer
+    /// for all three projections, saving 2 `quantize_q8_1` kernel launches
+    /// per layer per forward step.
+    ///
+    /// Returns `(q, k, v)` with Q already RoPE'd and K already RoPE'd + normed.
+    /// Falls back to separate compute_kv + prepare_q when conditions aren't met.
+    #[cfg(feature = "hip")]
+    pub fn compute_qkv_shared_q8(
+        &self,
+        x: &Tensor,
+        offset: usize,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        use candle::quantized::hip::{quantize_q8_1, pad, MATRIX_ROW_PADDING};
+        use candle::quantized::GgmlDType;
+
+        let (b_sz, seq_len, hidden) = x.dims3()?;
+        let b_size = b_sz * seq_len;
+
+        // Only use shared Q8_1 for small batch (decode path, b*m <= 8)
+        // and when all three projections exist and input is HIP f32 contiguous
+        if b_size > 8
+            || !matches!(x.device(), candle::Device::Hip(_))
+            || x.dtype() != candle::DType::F32
+            || !x.is_contiguous()
+        {
+            return Ok(None);
+        }
+
+        let wk = match &self.wk {
+            Some(wk) => wk,
+            None => return Ok(None),
+        };
+        let wv = match &self.wv {
+            Some(wv) => wv,
+            None => return Ok(None),
+        };
+
+        // Only use shared Q8_1 when all three are quantized (not dequantized f32/f16)
+        if !self.wq.is_qtensor() || !wk.is_qtensor() || !wv.is_qtensor() {
+            return Ok(None);
+        }
+
+        // Pre-quantize x to Q8_1 once
+        let dev = match x.device() {
+            candle::Device::Hip(d) => d.clone(),
+            _ => return Ok(None),
+        };
+        let (x_st, x_l) = x.storage_and_layout();
+        let x_hip = match &*x_st {
+            candle::Storage::Hip(s) => s,
+            _ => return Ok(None),
+        };
+        let x_slice = x_hip.as_hip_slice::<f32>()?;
+        let x_view = match x_l.contiguous_offsets() {
+            Some((lo, hi)) => x_slice.slice(lo..hi),
+            None => return Ok(None),
+        };
+
+        let ncols_padded = pad(hidden, MATRIX_ROW_PADDING);
+        let q8_bytes = b_size * ncols_padded
+            * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+        let mut y_q8_1 = unsafe { dev.alloc::<u8>(q8_bytes)? };
+        quantize_q8_1(&x_view, &mut y_q8_1, hidden, b_size, &dev)?;
+        let q8_view = y_q8_1.slice(0..y_q8_1.len());
+
+        let rhs_shape = x.dims();
+        drop(x_st);
+
+        // Project Q using pre-quantized Q8_1
+        let q_raw = self.wq.forward_preq8(&q8_view, b_size, rhs_shape)?;
+        let mut q = q_raw
+            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        if let Some(ref qn) = self.q_norm {
+            q = qn.forward(&q)?;
+        }
+        let q = self.rotary.apply_one(&q, offset)?;
+
+        // Project K using pre-quantized Q8_1
+        let k_raw = wk.forward_preq8(&q8_view, b_size, rhs_shape)?;
+        let k_3d = k_raw
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // Project V using pre-quantized Q8_1
+        let v_pre = if let Some(ref wv_mat) = self.wv {
+            let v_raw = wv_mat.forward_preq8(&q8_view, b_size, rhs_shape)?;
+            v_raw.reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+                .transpose(1, 2)?
+                .contiguous()?
+        } else {
+            k_3d.clone()
+        };
+
+        // Apply K norm + RoPE
+        let k = if let Some(ref kn) = self.k_norm {
+            kn.forward(&k_3d)?
+        } else {
+            k_3d
+        };
+        let v = if let Some(eps) = self.v_norm_eps {
+            super::norms::v_norm(&v_pre, eps)?
+        } else {
+            v_pre
+        };
+        let k = self.rotary.apply_one(&k, offset)?;
+
+        Ok(Some((q, k, v)))
+    }
+
     /// Run the attention block with externally-provided (K, V) tensors.
     ///
     /// `k` and `v` are the **full cumulative cache** for this layer (or its
@@ -555,7 +752,7 @@ impl StandardAttention {
     }
 
     /// Shared suffix for `forward_with_kv*`: reshape back + wo.
-    fn finish_attn(&self, attn_output: Tensor, b_sz: usize, seq_len: usize) -> Result<Tensor> {
+    pub fn finish_attn(&self, attn_output: Tensor, b_sz: usize, seq_len: usize) -> Result<Tensor> {
         let attn_output = attn_output
             .transpose(1, 2)?
             .contiguous()?

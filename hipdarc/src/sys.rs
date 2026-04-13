@@ -17,6 +17,31 @@ pub type hipEvent_t = *mut c_void;
 pub type hipGraph_t = *mut c_void;
 /// Opaque handle to an instantiated executable graph (`hipGraphExec_t`).
 pub type hipGraphExec_t = *mut c_void;
+/// Opaque handle to a node within a graph (`hipGraphNode_t`).
+pub type hipGraphNode_t = *mut c_void;
+
+/// Grid / block dims (matches HIP's `dim3`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct dim3 {
+    pub x: c_uint,
+    pub y: c_uint,
+    pub z: c_uint,
+}
+
+/// Mirror of `hipKernelNodeParams`. Used to mutate a kernel node's launch
+/// parameters on an already-instantiated graph via
+/// `hipGraphExecKernelNodeSetParams`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct hipKernelNodeParams {
+    pub blockDim: dim3,
+    pub extra: *mut *mut c_void,
+    pub func: *mut c_void,
+    pub gridDim: dim3,
+    pub kernelParams: *mut *mut c_void,
+    pub sharedMemBytes: c_uint,
+}
 
 /// Capture modes for [`hipStreamBeginCapture`]:
 /// - 0 = `hipStreamCaptureModeGlobal` — captures all activity on the
@@ -161,6 +186,26 @@ extern "C" {
     pub fn hipGraphLaunch(exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t;
     pub fn hipGraphDestroy(graph: hipGraph_t) -> hipError_t;
     pub fn hipGraphExecDestroy(exec: hipGraphExec_t) -> hipError_t;
+    /// Walk a captured graph in topological order. Call with `nodes = null`
+    /// and `num_nodes = &N` (N large enough, say 2048) to fill both the
+    /// count and the array in one call.
+    pub fn hipGraphGetNodes(
+        graph: hipGraph_t,
+        nodes: *mut hipGraphNode_t,
+        num_nodes: *mut size_t,
+    ) -> hipError_t;
+    /// Patch a kernel node's launch parameters in an already-instantiated
+    /// executable graph. This lets us replay the graph repeatedly while
+    /// updating the handful of per-token scalar / pointer args (KV append
+    /// offsets, L_k counter, rope position) without re-capturing the whole
+    /// graph. This is the ROCm equivalent of what llamacpp uses for CUDA
+    /// graph reuse. `pNodeParams` must point to a `hipKernelNodeParams`
+    /// whose `kernelParams` array entries are pointers to the arg values.
+    pub fn hipGraphExecKernelNodeSetParams(
+        exec: hipGraphExec_t,
+        node: hipGraphNode_t,
+        pNodeParams: *const hipKernelNodeParams,
+    ) -> hipError_t;
 
     // Modules (load compiled GPU code objects)
     pub fn hipModuleLoadData(module: *mut hipModule_t, image: *const c_void) -> hipError_t;

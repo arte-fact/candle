@@ -35,17 +35,15 @@
 // iterations of the outer K-chunk loop.
 
 #include "compatibility.cuh"
+#include "gfx906_primitives.cuh"
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 64
 #endif
 
+// Use DPP-fused warp reduction from gfx906_primitives.cuh
 static __device__ __forceinline__ float v2_warp_reduce_sum(float x) {
-#pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        x += __shfl_xor(x, mask);
-    }
-    return x;
+    return gfx906_warp_reduce_sum(x);
 }
 
 // -------------------------------------------------------------------
@@ -57,16 +55,21 @@ static __device__ __forceinline__ float v2_warp_reduce_sum(float x) {
 //   BR       = rows of Q per block (fixed at 4)
 //   BC       = K/V rows per LDS tile (picked per-D; see wrappers below)
 //
-template <int D, int BR, int BC>
+// K_TRANS: if true, K is (B, H_kv, D, L_k) instead of (B, H_kv, L_k, D).
+// v_stride_j / v_stride_d: strides for V access. If both are 0, use standard layout.
+//   Standard V (L_k, D): v[j*D + d]       → v_stride_j=D, v_stride_d=1
+//   Transposed V (D, T): v[d*max_T + j]   → v_stride_j=1, v_stride_d=max_T
+template <int D, int BR, int BC, bool K_TRANS = false>
 static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     const float * __restrict__ q,     // (B, H_q, L_q, D) contiguous
-    const float * __restrict__ k,     // (B, H_kv, L_k, D) contiguous
-    const float * __restrict__ v,     // (B, H_kv, L_k, D) contiguous
+    const float * __restrict__ k,     // (B, H_kv, L_k, D) or (B, H_kv, D, L_k) if K_TRANS
+    const float * __restrict__ v,     // (B, H_kv, ...) with strides
     const float * __restrict__ mask,  // additive f32 or nullptr
     float * __restrict__ out,         // (B, H_q, L_q, D)
     int B, int H_q, int H_kv, int L_q, int L_k,
     float scale, int n_rep,
-    int mask_b_stride, int mask_lq_stride)
+    int mask_b_stride, int mask_lq_stride,
+    int v_head_stride = 0, int v_stride_j = 0, int v_stride_d = 0)
 {
     static_assert(D == 64 || D == 128 || D == 256,
                   "only D=64, D=128, D=256 supported");
@@ -94,13 +97,22 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     // Per-slice base pointers.
     const int64_t q_offset =
         ((int64_t)(b_idx * H_q) + h_idx) * (int64_t)L_q * D + (int64_t)q_idx * D;
+    // K and V head offsets. K uses the standard or K_TRANS layout.
+    // V uses explicit strides if v_head_stride > 0, else standard L_k*D.
     const int64_t kv_offset =
         ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)L_k * D;
+    // V head offset: use explicit stride if provided, else same as K.
+    const int64_t v_offset = (v_head_stride > 0)
+        ? ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)v_head_stride
+        : kv_offset;
+    // V element strides: default to standard (j*D + d).
+    const int vs_j = (v_stride_j > 0) ? v_stride_j : D;
+    const int vs_d = (v_stride_d > 0) ? v_stride_d : 1;
     const int64_t out_offset = q_offset;
 
     const float * q_ptr = q + q_offset;
     const float * k_ptr = k + kv_offset;
-    const float * v_ptr = v + kv_offset;
+    const float * v_ptr = v + v_offset;
     float *       o_ptr = out + out_offset;
 
     // Additive mask row pointer. Row index is driven by (b, q_idx)
@@ -154,8 +166,14 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
                 const int d = idx % D;
                 const int row = k_start + j;
                 const bool valid = (row < L_k);
-                k_lds[idx] = valid ? k_ptr[row * D + d] : 0.0f;
-                v_lds[idx] = valid ? v_ptr[row * D + d] : 0.0f;
+                // K layout: standard (L_k, D) → k[row*D + d]
+                //           transposed (D, L_k) → k[d*L_k + row]
+                if (K_TRANS) {
+                    k_lds[idx] = valid ? k_ptr[d * L_k + row] : 0.0f;
+                } else {
+                    k_lds[idx] = valid ? k_ptr[row * D + d] : 0.0f;
+                }
+                v_lds[idx] = valid ? v_ptr[row * vs_j + d * vs_d] : 0.0f;
             }
         }
         __syncthreads();
@@ -190,8 +208,8 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
 
                 // Online softmax update.
                 const float m_new = fmaxf(m_i, s_j);
-                const float alpha = __expf(m_i - m_new);
-                const float p     = __expf(s_j - m_new);
+                const float alpha = gfx906_fast_exp(m_i - m_new);
+                const float p     = gfx906_fast_exp(s_j - m_new);
 
                 #pragma unroll
                 for (int i = 0; i < D_PER_LANE; ++i) {
@@ -207,7 +225,7 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
 
     // ---- Final normalisation and write back. ----
     if (q_in_range) {
-        const float inv_l = 1.0f / l_i;
+        const float inv_l = gfx906_rcp(l_i);
         #pragma unroll
         for (int i = 0; i < D_PER_LANE; ++i) {
             o_ptr[lane + i * WARP_SIZE] = o_reg[i] * inv_l;
@@ -221,7 +239,7 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
 // -------------------------------------------------------------------
 
 // D=64  : LDS = 2 * BC * 64 * 4 = 512*BC bytes. BC=64 -> 32 KiB.
-extern "C" __global__ void flash_attn_v2_fwd_d64_f32(
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_d64_f32(
     const float * __restrict__ q,
     const float * __restrict__ k,
     const float * __restrict__ v,
@@ -236,7 +254,7 @@ extern "C" __global__ void flash_attn_v2_fwd_d64_f32(
 }
 
 // D=128 : LDS = 2 * BC * 128 * 4 = 1024*BC bytes. BC=32 -> 32 KiB.
-extern "C" __global__ void flash_attn_v2_fwd_d128_f32(
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_d128_f32(
     const float * __restrict__ q,
     const float * __restrict__ k,
     const float * __restrict__ v,
@@ -251,7 +269,7 @@ extern "C" __global__ void flash_attn_v2_fwd_d128_f32(
 }
 
 // D=256 : LDS = 2 * BC * 256 * 4 = 2048*BC bytes. BC=16 -> 32 KiB.
-extern "C" __global__ void flash_attn_v2_fwd_d256_f32(
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_d256_f32(
     const float * __restrict__ q,
     const float * __restrict__ k,
     const float * __restrict__ v,
@@ -260,7 +278,88 @@ extern "C" __global__ void flash_attn_v2_fwd_d256_f32(
     int B, int H_q, int H_kv, int L_q, int L_k,
     float scale, int n_rep, int mask_b_stride, int mask_lq_stride)
 {
-    flash_attn_fwd_v2_impl<256, 4, 16>(
+    flash_attn_fwd_v2_impl<256, 4, 16, false>(
         q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
         scale, n_rep, mask_b_stride, mask_lq_stride);
+}
+
+// ---- K-transposed variants: K is (B, H_kv, D, L_k) ----
+// Used when the KV cache stores K pre-transposed (Attack C).
+
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_kt_d64_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,  // (B, H_kv, D, L_k) transposed
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride)
+{
+    flash_attn_fwd_v2_impl<64, 4, 64, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_kt_d128_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride)
+{
+    flash_attn_fwd_v2_impl<128, 4, 32, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_kt_d256_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride)
+{
+    flash_attn_fwd_v2_impl<256, 4, 16, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride);
+}
+
+// ---- K+V transposed with strided V: for KvCache decode ----
+// Both K and V stored as (B, H_kv, D, max_T) with seq on last dim.
+// K uses K_TRANS template. V uses runtime strides.
+
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_ktvs_d64_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d)
+{
+    flash_attn_fwd_v2_impl<64, 4, 64, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2) flash_attn_v2_fwd_ktvs_d128_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d)
+{
+    flash_attn_fwd_v2_impl<128, 4, 32, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d);
 }

@@ -172,37 +172,63 @@ impl HipStream {
             });
         }
         let size = len * std::mem::size_of::<T>();
-        // Pool fast path: if a buffer of exactly this byte size is
-        // sitting in the per-device pool, take it. The pool is
-        // populated on `Drop` so steady-state inference (which reuses
-        // the same shapes every forward) hits the pool from the
-        // second forward onward, avoiding hipMallocAsync entirely.
-        if let Some(ptr) = pool_try_take(ordinal, size) {
+
+        // Decode-alloc replay: serve from pre-recorded (padded) table.
+        if let Some(ptr) = decode_alloc_try_take(size) {
             return Ok(HipSlice {
                 ptr,
                 len,
-                // The pooled buffer was originally allocated via
-                // hipMallocAsync; the `free_stream` field is only
-                // consulted in the (now-inactive) capture path, so
-                // it's fine to leave it null here.
+                free_stream: std::ptr::null_mut(),
+                device_ordinal: DECODE_ALLOC_SENTINEL,
+                _marker: PhantomData,
+            });
+        }
+        let recording = decode_alloc_is_recording();
+
+        // During decode-alloc recording, allocate at padded size to
+        // accommodate kv_len growth on the next token.
+        let alloc_size = if recording { pad_decode_size(size) } else { size };
+
+        // Pool fast path.
+        if let Some(ptr) = pool_try_take(ordinal, alloc_size) {
+            if recording {
+                decode_alloc_record(alloc_size, ptr);
+                return Ok(HipSlice {
+                    ptr,
+                    len,
+                    free_stream: std::ptr::null_mut(),
+                    device_ordinal: DECODE_ALLOC_SENTINEL,
+                    _marker: PhantomData,
+                });
+            }
+            return Ok(HipSlice {
+                ptr,
+                len,
                 free_stream: std::ptr::null_mut(),
                 device_ordinal: ordinal,
                 _marker: PhantomData,
             });
         }
         let mut ptr = std::ptr::null_mut();
-        // Pool miss: allocate via hipMallocAsync (fast async pool in
-        // the runtime), with a fallback to sync hipMalloc on older
-        // ROCm versions where the async API isn't supported.
         let mut free_stream: sys::hipStream_t = std::ptr::null_mut();
         unsafe {
-            let rc = sys::hipMallocAsync(&mut ptr, size, self.raw);
+            let rc = sys::hipMallocAsync(&mut ptr, alloc_size, self.raw);
             if rc != sys::hipError_t::hipSuccess {
-                check_hip(sys::hipMalloc(&mut ptr, size))?;
+                check_hip(sys::hipMalloc(&mut ptr, alloc_size))?;
             } else {
                 free_stream = self.raw;
             }
         };
+        if recording {
+            decode_alloc_record(alloc_size, ptr);
+            return Ok(HipSlice {
+                ptr,
+                len,
+                free_stream: std::ptr::null_mut(),
+                device_ordinal: DECODE_ALLOC_SENTINEL,
+                _marker: PhantomData,
+            });
+        }
         Ok(HipSlice {
             ptr,
             len,
@@ -229,12 +255,35 @@ impl HipStream {
             });
         }
         let size = len * std::mem::size_of::<T>();
-        // Pool fast path: take an existing buffer of the right size
-        // and zero it. The memset is still required because the pool
-        // doesn't track buffer initialization state.
-        if let Some(ptr) = pool_try_take(ordinal, size) {
+
+        // Decode-alloc replay: serve from padded table, zero for correctness.
+        if let Some(ptr) = decode_alloc_try_take(size) {
+            unsafe { check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?; }
+            return Ok(HipSlice {
+                ptr,
+                len,
+                free_stream: std::ptr::null_mut(),
+                device_ordinal: DECODE_ALLOC_SENTINEL,
+                _marker: PhantomData,
+            });
+        }
+        let recording = decode_alloc_is_recording();
+        let alloc_size = if recording { pad_decode_size(size) } else { size };
+
+        // Pool fast path.
+        if let Some(ptr) = pool_try_take(ordinal, alloc_size) {
             unsafe {
                 check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?;
+            }
+            if recording {
+                decode_alloc_record(alloc_size, ptr);
+                return Ok(HipSlice {
+                    ptr,
+                    len,
+                    free_stream: std::ptr::null_mut(),
+                    device_ordinal: DECODE_ALLOC_SENTINEL,
+                    _marker: PhantomData,
+                });
             }
             return Ok(HipSlice {
                 ptr,
@@ -247,13 +296,23 @@ impl HipStream {
         let mut ptr = std::ptr::null_mut();
         let mut free_stream: sys::hipStream_t = std::ptr::null_mut();
         unsafe {
-            let rc = sys::hipMallocAsync(&mut ptr, size, self.raw);
+            let rc = sys::hipMallocAsync(&mut ptr, alloc_size, self.raw);
             if rc != sys::hipError_t::hipSuccess {
-                check_hip(sys::hipMalloc(&mut ptr, size))?;
+                check_hip(sys::hipMalloc(&mut ptr, alloc_size))?;
             } else {
                 free_stream = self.raw;
             }
             check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?;
+        }
+        if recording {
+            decode_alloc_record(alloc_size, ptr);
+            return Ok(HipSlice {
+                ptr,
+                len,
+                free_stream: std::ptr::null_mut(),
+                device_ordinal: DECODE_ALLOC_SENTINEL,
+                _marker: PhantomData,
+            });
         }
         Ok(HipSlice {
             ptr,
@@ -467,6 +526,36 @@ impl HipGraph {
         self.raw
     }
 
+    /// Enumerate every node in the captured graph in topological order.
+    /// The handles returned identify the same nodes inside any
+    /// `HipGraphExec` produced by `instantiate`, so they can be passed
+    /// to `HipGraphExec::set_kernel_node_params`.
+    pub fn nodes(&self) -> Result<Vec<sys::hipGraphNode_t>, DriverError> {
+        // First call: query the count with null pointer.
+        let mut n: usize = 0;
+        unsafe {
+            check_hip(sys::hipGraphGetNodes(
+                self.raw,
+                std::ptr::null_mut(),
+                &mut n as *mut usize,
+            ))?;
+        }
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut nodes: Vec<sys::hipGraphNode_t> = vec![std::ptr::null_mut(); n];
+        let mut n2: usize = n;
+        unsafe {
+            check_hip(sys::hipGraphGetNodes(
+                self.raw,
+                nodes.as_mut_ptr(),
+                &mut n2 as *mut usize,
+            ))?;
+        }
+        nodes.truncate(n2);
+        Ok(nodes)
+    }
+
     /// Compile this graph into an executable that can be replayed
     /// repeatedly via [`HipGraphExec::launch`].
     pub fn instantiate(&self) -> Result<HipGraphExec, DriverError> {
@@ -513,6 +602,42 @@ impl HipGraphExec {
     pub fn launch(&self, stream: &HipStream) -> Result<(), DriverError> {
         unsafe { check_hip(sys::hipGraphLaunch(self.raw, stream.raw)) }
     }
+
+    /// Patch the launch parameters of a single kernel node on this
+    /// instantiated graph. The node handle comes from [`HipGraph::nodes`].
+    ///
+    /// `kernel_params` is an array of pointers to the argument values,
+    /// same convention as `hipModuleLaunchKernel`'s `kernelParams` — each
+    /// entry must point to an argument value that stays alive until the
+    /// next `hipGraphLaunch` completes. `grid`/`block`/`shared_mem`/`func`
+    /// must match the values the node was captured with.
+    ///
+    /// # Safety
+    /// `kernel_params` must point to valid argument storage for the
+    /// kernel's expected signature; `func` must match the captured kernel.
+    pub unsafe fn set_kernel_node_params(
+        &self,
+        node: sys::hipGraphNode_t,
+        func: sys::hipFunction_t,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_mem: u32,
+        kernel_params: *mut *mut std::ffi::c_void,
+    ) -> Result<(), DriverError> {
+        let params = sys::hipKernelNodeParams {
+            blockDim: sys::dim3 { x: block.0, y: block.1, z: block.2 },
+            extra: std::ptr::null_mut(),
+            func: func as *mut std::ffi::c_void,
+            gridDim: sys::dim3 { x: grid.0, y: grid.1, z: grid.2 },
+            kernelParams: kernel_params,
+            sharedMemBytes: shared_mem,
+        };
+        check_hip(sys::hipGraphExecKernelNodeSetParams(
+            self.raw,
+            node,
+            &params as *const sys::hipKernelNodeParams,
+        ))
+    }
 }
 
 impl Drop for HipGraphExec {
@@ -553,6 +678,23 @@ unsafe impl<T> Send for HipSlice<T> {}
 unsafe impl<T> Sync for HipSlice<T> {}
 
 impl<T> HipSlice<T> {
+    /// Create a non-owning view into existing device memory for decode
+    /// replay. Uses `DECODE_ALLOC_SENTINEL` so `Drop` is a no-op.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid device pointer to at least `len` elements of `T`.
+    /// The memory must outlive this `HipSlice` (guaranteed when it belongs
+    /// to the decode allocator table).
+    pub unsafe fn decode_view(ptr: sys::hipDeviceptr_t, len: usize) -> Self {
+        Self {
+            ptr,
+            len,
+            free_stream: std::ptr::null_mut(),
+            device_ordinal: DECODE_ALLOC_SENTINEL,
+            _marker: PhantomData,
+        }
+    }
+
     /// Number of elements.
     pub fn len(&self) -> usize {
         self.len
@@ -587,9 +729,13 @@ impl<T> HipSlice<T> {
     }
 }
 
+/// Sentinel ordinal for decode-allocated HipSlice. `Drop` becomes a
+/// no-op so the buffer stays alive for replay across decode tokens.
+pub const DECODE_ALLOC_SENTINEL: i32 = -2;
+
 impl<T> Drop for HipSlice<T> {
     fn drop(&mut self) {
-        if self.ptr.is_null() {
+        if self.ptr.is_null() || self.device_ordinal == DECODE_ALLOC_SENTINEL {
             return;
         }
         // Inside a HIP graph capture, sync `hipFree` would abort the
@@ -836,6 +982,168 @@ fn pool_give_back(ordinal: i32, ptr: sys::hipDeviceptr_t, size: usize) {
         }
     };
     guard.give_back(ptr, size);
+}
+
+// ---------------------------------------------------------------------------
+// Decode-mode allocator — stable buffer addresses for op replay (G2)
+// ---------------------------------------------------------------------------
+//
+// During decode recording, every allocation is captured in an ordered
+// table. On replay, alloc() serves from this table so all intermediate
+// buffers get the exact same device address every token. This eliminates
+// the LIFO-pool non-determinism that caused 44% dynamic args in the
+// decode plan.
+//
+// Buffers owned by the decode allocator use `device_ordinal =
+// DECODE_ALLOC_SENTINEL` so `HipSlice::Drop` is a no-op — the buffers
+// stay alive across the entire decode session.
+
+use std::cell::RefCell;
+
+/// Pad alloc size during recording to accommodate kv_len growth.
+/// Adds 25% headroom (minimum 4 KB).
+#[inline]
+fn pad_decode_size(size: usize) -> usize {
+    size + std::cmp::max(4096, size / 4)
+}
+
+/// Decode allocator mode.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeAllocMode {
+    /// Recording: new allocs are appended to entries, returned with sentinel.
+    Recording,
+    /// Replaying: allocs are served from entries (if size matches).
+    Replaying,
+    /// Paused: the table is kept alive but neither recording nor replaying.
+    /// Allocations go through the normal pool.
+    Paused,
+}
+
+/// Decode allocator state: records or replays a fixed sequence of
+/// `(byte_size, device_ptr)` allocations.
+struct DecodeAllocState {
+    /// Ordered list of (padded_byte_size, device_ptr) captured during recording.
+    /// Sizes are padded via `pad_decode_size` to absorb kv_len growth.
+    entries: Vec<(usize, sys::hipDeviceptr_t)>,
+    /// Read cursor — advances on each `try_take`, reset between forwards.
+    cursor: usize,
+    /// Current mode.
+    mode: DecodeAllocMode,
+}
+
+thread_local! {
+    static DECODE_ALLOC: RefCell<Option<DecodeAllocState>> = RefCell::new(None);
+}
+
+/// Start recording decode allocations. Every `alloc()`/`alloc_zeros()`
+/// that happens while recording is active is appended to the table.
+/// The returned `HipSlice` is sentinel-marked so its `Drop` is a no-op.
+pub fn decode_alloc_start_record() {
+    DECODE_ALLOC.with(|d| {
+        *d.borrow_mut() = Some(DecodeAllocState {
+            entries: Vec::with_capacity(512),
+            cursor: 0,
+            mode: DecodeAllocMode::Recording,
+        });
+    });
+}
+
+/// Switch to replay mode, keeping recorded entries. Resets cursor.
+pub fn decode_alloc_start_replay() {
+    DECODE_ALLOC.with(|d| {
+        if let Some(ref mut state) = *d.borrow_mut() {
+            state.mode = DecodeAllocMode::Replaying;
+            state.cursor = 0;
+        }
+    });
+}
+
+/// Reset cursor for the next forward pass (call before each replay).
+pub fn decode_alloc_reset() {
+    DECODE_ALLOC.with(|d| {
+        if let Some(ref mut state) = *d.borrow_mut() {
+            state.cursor = 0;
+        }
+    });
+}
+
+/// Pause — subsequent allocs go through normal pool. Table preserved.
+pub fn decode_alloc_pause() {
+    DECODE_ALLOC.with(|d| {
+        if let Some(ref mut state) = *d.borrow_mut() {
+            state.mode = DecodeAllocMode::Paused;
+        }
+    });
+}
+
+/// Resume replay mode (re-enable serving from table).
+pub fn decode_alloc_resume() {
+    DECODE_ALLOC.with(|d| {
+        if let Some(ref mut state) = *d.borrow_mut() {
+            state.mode = DecodeAllocMode::Replaying;
+        }
+    });
+}
+
+/// Disable the decode allocator. Sentinel-marked buffers remain
+/// allocated until process exit (GPU driver reclaims them).
+pub fn decode_alloc_stop() {
+    DECODE_ALLOC.with(|d| {
+        *d.borrow_mut() = None;
+    });
+}
+
+/// True if decode alloc is active in any mode.
+#[inline]
+fn decode_alloc_active() -> bool {
+    DECODE_ALLOC.with(|d| d.borrow().is_some())
+}
+
+/// True if in recording mode.
+#[inline]
+fn decode_alloc_is_recording() -> bool {
+    DECODE_ALLOC.with(|d| {
+        d.borrow().as_ref().map_or(false, |s| s.mode == DecodeAllocMode::Recording)
+    })
+}
+
+/// Replay mode: try to serve a buffer of `size` bytes from the table.
+#[inline]
+fn decode_alloc_try_take(size: usize) -> Option<sys::hipDeviceptr_t> {
+    DECODE_ALLOC.with(|d| {
+        let mut guard = d.borrow_mut();
+        let state = guard.as_mut()?;
+        if state.mode != DecodeAllocMode::Replaying {
+            return None;
+        }
+        if state.cursor < state.entries.len() {
+            let (entry_size, ptr) = state.entries[state.cursor];
+            if entry_size >= size {
+                state.cursor += 1;
+                return Some(ptr);
+            }
+        }
+        None
+    })
+}
+
+/// Record mode: append `(size, ptr)` to the table.
+#[inline]
+fn decode_alloc_record(size: usize, ptr: sys::hipDeviceptr_t) {
+    DECODE_ALLOC.with(|d| {
+        if let Some(ref mut state) = *d.borrow_mut() {
+            if state.mode == DecodeAllocMode::Recording {
+                state.entries.push((size, ptr));
+            }
+        }
+    });
+}
+
+/// Number of entries recorded.
+pub fn decode_alloc_entry_count() -> usize {
+    DECODE_ALLOC.with(|d| {
+        d.borrow().as_ref().map_or(0, |s| s.entries.len())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1450,7 @@ impl HipFunc {
             func: &self.func,
             stream: &self.stream,
             args: Vec::new(),
+            arg_sizes: Vec::new(),
         }
     }
 }
@@ -1156,14 +1465,20 @@ pub struct LaunchArgs<'a> {
     func: &'a HipFunction,
     stream: &'a HipStream,
     args: Vec<*mut c_void>,
+    /// Byte size of each argument (from `PushKernelArg::as_kernel_arg`).
+    /// Used by the launch recorder to capture the correct number of bytes
+    /// per arg — over-reading into adjacent stack memory would produce
+    /// meaningless composite values for packed int32 args.
+    arg_sizes: Vec<usize>,
 }
 
 impl<'a> LaunchArgs<'a> {
     /// Push a kernel argument. The argument must outlive this builder (it is
     /// borrowed by pointer until `launch` is called).
     pub fn arg<A: PushKernelArg>(&mut self, val: &A) -> &mut Self {
-        let (ptr, _size) = val.as_kernel_arg();
+        let (ptr, size) = val.as_kernel_arg();
         self.args.push(ptr as *mut c_void);
+        self.arg_sizes.push(size);
         self
     }
 
@@ -1174,6 +1489,24 @@ impl<'a> LaunchArgs<'a> {
     /// signature and that device pointers are valid.
     pub unsafe fn launch(self, cfg: LaunchConfig) -> Result<(), DriverError> {
         let mut args = self.args;
+        let sizes = self.arg_sizes;
+
+        // G2: invoke the recording callback (if registered) to capture
+        // this kernel launch for decode op cache replay.
+        LAUNCH_RECORDER.with(|rec| {
+            if let Some(ref cb) = *rec.borrow() {
+                cb(
+                    self.func.raw,
+                    cfg.grid_dim,
+                    cfg.block_dim,
+                    cfg.shared_mem_bytes,
+                    self.stream.raw(),
+                    &args,
+                    &sizes,
+                );
+            }
+        });
+
         check_hip(sys::hipModuleLaunchKernel(
             self.func.raw,
             cfg.grid_dim.0,
@@ -1188,6 +1521,36 @@ impl<'a> LaunchArgs<'a> {
             std::ptr::null_mut(),
         ))
     }
+}
+
+/// G2: Thread-local kernel launch recorder callback.
+/// When set, every `LaunchArgs::launch()` call invokes this function
+/// with the kernel function handle, grid/block config, and arg pointers.
+pub type LaunchRecorderFn = Box<
+    dyn Fn(
+        sys::hipFunction_t,
+        (u32, u32, u32),
+        (u32, u32, u32),
+        u32,
+        sys::hipStream_t,
+        &[*mut std::ffi::c_void],
+        &[usize],
+    ),
+>;
+
+thread_local! {
+    /// The active launch recorder, if any.
+    pub static LAUNCH_RECORDER: std::cell::RefCell<Option<LaunchRecorderFn>> = std::cell::RefCell::new(None);
+}
+
+/// Set the launch recorder callback. Returns the previous one (if any).
+pub fn set_launch_recorder(recorder: Option<LaunchRecorderFn>) -> Option<LaunchRecorderFn> {
+    LAUNCH_RECORDER.with(|r| {
+        let mut r = r.borrow_mut();
+        let prev = r.take();
+        *r = recorder;
+        prev
+    })
 }
 
 /// Convenience macro to push a scalar kernel argument.

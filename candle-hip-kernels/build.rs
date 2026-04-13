@@ -16,6 +16,7 @@ fn main() {
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
     println!("cargo::rerun-if-changed=src/hip_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
+    println!("cargo::rerun-if-changed=src/gfx906_primitives.cuh");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".to_string());

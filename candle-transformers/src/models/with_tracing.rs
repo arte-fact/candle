@@ -134,6 +134,26 @@ impl QMatMul {
     }
 }
 
+impl QMatMul {
+    /// Mat-vec forward with a pre-quantized Q8_1 buffer.
+    /// Skips the per-call quantize_q8_1 dispatch.
+    #[cfg(feature = "hip")]
+    pub fn forward_preq8(
+        &self,
+        y_q8_1: &candle::hip_backend::hipdarc::driver::HipView<'_, u8>,
+        b_size: usize,
+        rhs_shape: &[usize],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        self.inner.forward_preq8(y_q8_1, b_size, rhs_shape)
+    }
+
+    /// Returns true if the inner representation is a QTensor (not dequantized).
+    pub fn is_qtensor(&self) -> bool {
+        matches!(&self.inner, candle::quantized::QMatMul::QTensor(_))
+    }
+}
+
 impl Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();

@@ -21,7 +21,7 @@ macro_rules! barg {
 }
 
 #[derive(Debug)]
-struct PaddedHipSlice {
+pub struct PaddedHipSlice {
     inner: HipSlice<u8>,
     len: usize,
 }
@@ -54,11 +54,14 @@ fn ceil_div(p: usize, q: usize) -> usize {
     p.div_ceil(q)
 }
 
-fn pad(p: usize, q: usize) -> usize {
+pub fn pad(p: usize, q: usize) -> usize {
     ceil_div(p, q) * q
 }
 
-fn quantize_q8_1(
+/// Quantize f32 input to Q8_1 format for use with MMVQ/MMQ kernels.
+/// Public so that model code can pre-quantize once and reuse across
+/// multiple matmul consumers (D1/D2 optimization from the roadmap).
+pub fn quantize_q8_1(
     src: &HipView<'_, f32>,
     dst: &mut HipSlice<u8>,
     k: usize,
@@ -331,11 +334,12 @@ fn mul_mat_vec_via_q8_1(
 
 /// Launch one specialized `mul_mat_vec_<dtype>_q8_1_cuda<b_size>` kernel
 /// against an externally-managed (already-quantized) Q8_1 input view and an
+/// externally-allocated output view. Public for D1/D2 cache optimization.
 /// externally-allocated output view. Used by both [`mul_mat_vec_via_q8_1`]
 /// (which allocates everything itself) and [`mul_mat_via_q8_1_chunked`]
 /// (which loops this function across slices of a single big buffer).
 #[allow(clippy::too_many_arguments)]
-fn launch_mul_mat_vec_q8_1_chunk(
+pub fn launch_mul_mat_vec_q8_1_chunk(
     data: &PaddedHipSlice,
     y_q8_1: &hipdarc::driver::HipView<'_, u8>,
     dst: &hipdarc::driver::HipView<'_, f32>,
@@ -374,6 +378,7 @@ fn launch_mul_mat_vec_q8_1_chunk(
         && matches!(
             dtype,
             GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0
+            | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
         );
     let cfg = if warp_coop {
         hipdarc::driver::LaunchConfig {
@@ -407,6 +412,73 @@ fn launch_mul_mat_vec_q8_1_chunk(
         /* nrows_y */ ncols_padded as i32,
         /* nrows_dst */ nrows as i32
     );
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(())
+}
+
+/// Fused gate+up MMVQ for Q4_0 decode. Runs ONE kernel that produces both
+/// `W_gate @ x_q8_1` and `W_up @ x_q8_1` into separate output buffers,
+/// sharing the Q8_1 vector reads. Saves one kernel launch per FFN layer and
+/// cuts L2 traffic on the input vector roughly in half.
+///
+/// Preconditions: both weights are Q4_0, same shape `(nrows, ncols)`. Output
+/// buffers must each hold `nrows` f32 elements.
+pub fn launch_mul_mat_vec_q4_0_gate_up_fused(
+    w_gate: &PaddedHipSlice,
+    w_up: &PaddedHipSlice,
+    y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+    dst_gate: &hipdarc::driver::HipView<'_, f32>,
+    dst_up: &hipdarc::driver::HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    dev: &HipDevice,
+) -> Result<()> {
+    let func = dev.get_or_load_func(
+        "mul_mat_vec_q4_0_q8_1_gate_up_fused",
+        &candle_hip_kernels::QUANTIZED,
+    )?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(2), 1, 1),
+        block_dim: (WARP_SIZE as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&w_gate.inner);
+    builder.arg(&w_up.inner);
+    builder.arg(y_q8_1);
+    builder.arg(dst_gate);
+    builder.arg(dst_up);
+    barg!(builder, ncols as i32, nrows as i32);
+    unsafe { builder.launch(cfg) }.w()?;
+    Ok(())
+}
+
+/// Fused down+residual MMVQ for Q4_0 decode. Computes `W_down @ hidden_q8_1
+/// + residual` in a single kernel. Saves one kernel launch per FFN layer.
+pub fn launch_mul_mat_vec_q4_0_down_residual(
+    w_down: &PaddedHipSlice,
+    y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+    residual: &hipdarc::driver::HipView<'_, f32>,
+    dst: &hipdarc::driver::HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    dev: &HipDevice,
+) -> Result<()> {
+    let func = dev.get_or_load_func(
+        "mul_mat_vec_q4_0_q8_1_down_residual",
+        &candle_hip_kernels::QUANTIZED,
+    )?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(2), 1, 1),
+        block_dim: (WARP_SIZE as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = func.builder();
+    builder.arg(&w_down.inner);
+    builder.arg(y_q8_1);
+    builder.arg(residual);
+    builder.arg(dst);
+    barg!(builder, ncols as i32, nrows as i32);
     unsafe { builder.launch(cfg) }.w()?;
     Ok(())
 }
@@ -795,7 +867,8 @@ fn mul_mat_via_q8_1(
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_hip_kernels::QUANTIZED)?;
-    let dst = dev.alloc_zeros::<f32>(x_rows * y_cols)?;
+    // SAFETY: the MMQ kernel fully writes all x_rows × y_cols output elements.
+    let dst = unsafe { dev.alloc::<f32>(x_rows * y_cols)? };
     let cfg = hipdarc::driver::LaunchConfig {
         grid_dim: (
             ceil_div(x_rows, mmq_y) as u32,
@@ -1253,6 +1326,101 @@ impl QHipStorage {
 
     pub fn device_ptr(&self) -> Result<*const u8> {
         Ok(self.data.inner.device_ptr() as *const u8)
+    }
+
+    pub fn data_padded(&self) -> &PaddedHipSlice {
+        &self.data
+    }
+
+    /// Mat-vec multiply using a **pre-quantized Q8_1** activation buffer.
+    ///
+    /// Skips the per-call `quantize_q8_1` dispatch — the caller is responsible
+    /// for producing `y_q8_1` (e.g. via `rmsnorm_q8_fused` or a manual
+    /// `quantize_q8_1` call) and ensuring it matches `ncols` / `ncols_padded`.
+    ///
+    /// Returns `(output_storage, output_shape)`.
+    pub fn fwd_with_preq8(
+        &self,
+        self_shape: &crate::Shape,
+        y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        b_size: usize,
+        rhs_shape: &[usize],
+    ) -> Result<(HipStorage, crate::Shape)> {
+        let (nrows, ncols) = self_shape.dims2()?;
+        let ncols_padded = pad(ncols, MATRIX_ROW_PADDING);
+
+        if b_size == 0 || b_size > 8 {
+            crate::bail!("fwd_with_preq8: b_size must be 1..=8, got {b_size}");
+        }
+
+        let dst = unsafe { self.device.alloc::<f32>(nrows * b_size)? };
+        let dst_view = dst.slice(0..dst.len());
+        launch_mul_mat_vec_q8_1_chunk(
+            &self.data,
+            y_q8_1,
+            &dst_view,
+            self.dtype,
+            ncols,
+            nrows,
+            b_size,
+            ncols_padded,
+            &self.device,
+        )?;
+
+        let mut out_shape = rhs_shape.to_vec();
+        out_shape.pop();
+        out_shape.push(nrows);
+        Ok((HipStorage::wrap_hip_slice(dst, self.device.clone()), out_shape.into()))
+    }
+
+    /// Fused gate+up Q4_0 MMVQ on pre-quantized Q8_1 input. Produces two
+    /// output tensors from a single kernel launch (vs two separate MMVQs).
+    /// `self` is the gate weight; `w_up` is the up weight. Returns
+    /// `(gate_out_storage, up_out_storage)` each shape `(b_size, nrows)`.
+    pub fn fwd_gate_up_preq8(
+        &self,
+        w_up: &QHipStorage,
+        self_shape: &crate::Shape,
+        y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+    ) -> Result<(HipStorage, HipStorage)> {
+        let (nrows, ncols) = self_shape.dims2()?;
+        if self.dtype != GgmlDType::Q4_0 || w_up.dtype != GgmlDType::Q4_0 {
+            crate::bail!("fwd_gate_up_preq8: both weights must be Q4_0");
+        }
+        let dst_gate = unsafe { self.device.alloc::<f32>(nrows)? };
+        let dst_up = unsafe { self.device.alloc::<f32>(nrows)? };
+        let v_gate = dst_gate.slice(0..dst_gate.len());
+        let v_up = dst_up.slice(0..dst_up.len());
+        launch_mul_mat_vec_q4_0_gate_up_fused(
+            &self.data, &w_up.data, y_q8_1,
+            &v_gate, &v_up,
+            ncols, nrows, &self.device,
+        )?;
+        Ok((
+            HipStorage::wrap_hip_slice(dst_gate, self.device.clone()),
+            HipStorage::wrap_hip_slice(dst_up, self.device.clone()),
+        ))
+    }
+
+    /// Fused W_down @ hidden_q8_1 + residual. The output overwrites `dst`;
+    /// caller supplies the pre-allocated (nrows-shaped) destination.
+    pub fn fwd_down_residual_preq8(
+        &self,
+        self_shape: &crate::Shape,
+        y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        residual: &hipdarc::driver::HipView<'_, f32>,
+    ) -> Result<HipStorage> {
+        let (nrows, ncols) = self_shape.dims2()?;
+        if self.dtype != GgmlDType::Q4_0 {
+            crate::bail!("fwd_down_residual_preq8: weight must be Q4_0");
+        }
+        let dst = unsafe { self.device.alloc::<f32>(nrows)? };
+        let dst_view = dst.slice(0..dst.len());
+        launch_mul_mat_vec_q4_0_down_residual(
+            &self.data, y_q8_1, residual, &dst_view,
+            ncols, nrows, &self.device,
+        )?;
+        Ok(HipStorage::wrap_hip_slice(dst, self.device.clone()))
     }
 }
 

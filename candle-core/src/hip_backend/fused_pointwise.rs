@@ -588,3 +588,221 @@ pub fn l2_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
         /* is_variable */ false,
     ))
 }
+
+/// Fused RMSNorm + Scale + Q8_1 quantize.
+///
+/// Combines three operations into a single kernel launch:
+///   1. `norm = rmsnorm(x, eps)`
+///   2. `scaled = norm * alpha` (per-channel weight)
+///   3. `q8 = quantize_q8_1(scaled)` (Q8_1 quantization)
+///
+/// Returns `(q8_buffer, optional_f32_output)`:
+///   - `q8_buffer`: raw Q8_1 blocks as a byte buffer, shape = (nrows * blocks_per_row * 36) bytes
+///   - `f32_output`: if `need_f32` is true, also returns the f32 scaled output for residual use
+///
+/// This eliminates 2 kernel launches + 1 HBM round-trip per call.
+/// On a layer with 3 MMQ consumers (Q/K/V), the Q8_1 is produced once
+/// and consumed 3 times instead of each consumer independently quantizing.
+///
+/// # Requirements
+/// - `x` must be on a HIP device, f32, contiguous, rank >= 2.
+/// - `alpha` must be f32, contiguous, length == last dim of x.
+pub fn rmsnorm_q8_fused(
+    x: &Tensor,
+    alpha: &Tensor,
+    eps: f64,
+    need_f32: bool,
+) -> Result<(hipdarc::driver::HipSlice<u8>, Option<Tensor>)> {
+    let dev = match x.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("rmsnorm_q8_fused: input must be on a HIP device"),
+    };
+    if x.dtype() != DType::F32 {
+        crate::bail!("rmsnorm_q8_fused: input must be f32");
+    }
+    if !x.is_contiguous() {
+        crate::bail!("rmsnorm_q8_fused: input must be contiguous");
+    }
+
+    let dims = x.dims();
+    let ncols = *dims.last().unwrap();
+    let nrows = x.elem_count() / ncols;
+
+    if ncols % 32 != 0 {
+        crate::bail!("rmsnorm_q8_fused: ncols ({}) must be a multiple of 32 (QK8_1)", ncols);
+    }
+
+    let blocks_per_row = ncols / 32;
+    let q8_bytes = nrows * blocks_per_row * 36; // 36 bytes per Q8_1 block
+
+    let (x_st, x_l) = x.storage_and_layout();
+    let x_hip = match &*x_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("rmsnorm_q8_fused: storage is not HIP"),
+    };
+    let x_slice = x_hip.as_hip_slice::<f32>()?;
+    let x_view = match x_l.contiguous_offsets() {
+        Some((lo, hi)) => x_slice.slice(lo..hi),
+        None => crate::bail!("rmsnorm_q8_fused: non-contiguous storage"),
+    };
+
+    let (a_st, a_l) = alpha.storage_and_layout();
+    let a_hip = match &*a_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("rmsnorm_q8_fused: alpha not HIP"),
+    };
+    let a_slice = a_hip.as_hip_slice::<f32>()?;
+    let a_view = match a_l.contiguous_offsets() {
+        Some((lo, hi)) => a_slice.slice(lo..hi),
+        None => crate::bail!("rmsnorm_q8_fused: alpha non-contiguous"),
+    };
+
+    // Allocate Q8_1 output buffer
+    let q8_out = unsafe { dev.alloc::<u8>(q8_bytes)? };
+
+    // Optionally allocate f32 output
+    let f32_out = if need_f32 {
+        Some(unsafe { dev.alloc::<f32>(x.elem_count())? })
+    } else {
+        None
+    };
+
+    let func = dev.get_or_load_func("rmsnorm_q8_fused_f32", &kernels::REDUCE)?;
+
+    let block_size: u32 = if ncols >= 1024 { 1024 } else { 64 };
+    let cfg = LaunchConfig {
+        grid_dim: (nrows as u32, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let ncols_i32 = ncols as i32;
+    let block_size_i32 = block_size as i32;
+    let eps_f32 = eps as f32;
+
+    let mut builder = func.builder();
+    builder.arg(&x_view);
+    builder.arg(&a_view);
+    builder.arg(&q8_out);
+    match &f32_out {
+        Some(buf) => { builder.arg(buf); }
+        None => {
+            let null: usize = 0;
+            builder.arg(&null);
+        }
+    }
+    builder.arg(&ncols_i32);
+    builder.arg(&block_size_i32);
+    builder.arg(&eps_f32);
+
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(x_st);
+    drop(a_st);
+
+    let f32_tensor = if let Some(buf) = f32_out {
+        let st = HipStorage::wrap_hip_slice(buf, dev.clone());
+        Some(Tensor::from_storage(
+            Storage::Hip(st),
+            x.shape().clone(),
+            BackpropOp::none(),
+            false,
+        ))
+    } else {
+        None
+    };
+
+    Ok((q8_out, f32_tensor))
+}
+
+/// Fused FFN decode: rmsnorm → gate matmul → up matmul → silu*gate → down matmul → residual add.
+///
+/// Eliminates 7 kernel launches per layer by fusing the entire FFN path into
+/// a single persistent kernel. The hidden state stays in registers between
+/// operations; only weight data is streamed from HBM.
+///
+/// # Requirements
+/// - `h` must be contiguous f32 on HIP, shape `(1, 1, hidden_dim)` or `(hidden_dim,)`
+/// - All weight tensors must be Q4_0 quantized on the same device
+/// - `hidden_dim` must be a multiple of 64 (WARP_SIZE)
+/// - `intermediate_dim` must fit in LDS (max ~8704 for 64KB LDS)
+///
+/// Modifies `h` in-place (residual add included).
+pub fn fused_ffn_decode_q4_0(
+    h: &mut Tensor,
+    ffn_norm_w: &Tensor,
+    w_gate: &crate::quantized::QTensor,
+    w_up: &crate::quantized::QTensor,
+    w_down: &crate::quantized::QTensor,
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    eps: f64,
+) -> Result<()> {
+    let dev = match h.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("fused_ffn_decode_q4_0: h must be HIP"),
+    };
+    if h.dtype() != DType::F32 || !h.is_contiguous() {
+        crate::bail!("fused_ffn_decode_q4_0: h must be f32 contiguous");
+    }
+    if h.elem_count() != hidden_dim {
+        crate::bail!("fused_ffn_decode_q4_0: h elem count {} != hidden_dim {hidden_dim}", h.elem_count());
+    }
+    if intermediate_dim > 8704 {
+        crate::bail!("fused_ffn_decode_q4_0: intermediate_dim {intermediate_dim} > 8704 (LDS limit)");
+    }
+
+    let (h_st, h_l) = h.storage_and_layout();
+    let h_hip = match &*h_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("fused_ffn_decode_q4_0: h not HIP"),
+    };
+    let h_slice = h_hip.as_hip_slice::<f32>()?;
+    let h_view = match h_l.contiguous_offsets() {
+        Some((lo, hi)) => h_slice.slice(lo..hi),
+        None => crate::bail!("fused_ffn_decode_q4_0: h non-contiguous"),
+    };
+
+    let (nw_st, nw_l) = ffn_norm_w.storage_and_layout();
+    let nw_hip = match &*nw_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("fused_ffn_decode_q4_0: norm weight not HIP"),
+    };
+    let nw_slice = nw_hip.as_hip_slice::<f32>()?;
+    let nw_view = match nw_l.contiguous_offsets() {
+        Some((lo, hi)) => nw_slice.slice(lo..hi),
+        None => crate::bail!("fused_ffn_decode_q4_0: norm weight non-contiguous"),
+    };
+
+    // Get raw pointers to quantized weight data
+    let gate_ptr = w_gate.device_ptr()? as usize;
+    let up_ptr = w_up.device_ptr()? as usize;
+    let down_ptr = w_down.device_ptr()? as usize;
+
+    let func = dev.get_or_load_func("fused_ffn_decode_q4_0", &kernels::FUSED_FFN_DECODE)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (WARP_SIZE, 1, 1),
+        shared_mem_bytes: (intermediate_dim * 4 * 2) as u32, // gate_lds + up_lds
+    };
+
+    let hdim = hidden_dim as i32;
+    let idim = intermediate_dim as i32;
+    let eps_f32 = eps as f32;
+
+    let mut builder = func.builder();
+    builder.arg(&h_view);
+    builder.arg(&nw_view);
+    builder.arg(&gate_ptr);
+    builder.arg(&up_ptr);
+    builder.arg(&down_ptr);
+    builder.arg(&hdim);
+    builder.arg(&idim);
+    builder.arg(&eps_f32);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(h_st);
+    drop(nw_st);
+    Ok(())
+}

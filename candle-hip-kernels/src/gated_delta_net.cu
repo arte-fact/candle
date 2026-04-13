@@ -45,17 +45,15 @@
 // of the same (b, h) share instruction issue.
 
 #include "compatibility.cuh"
+#include "gfx906_primitives.cuh"
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 64
 #endif
 
+// Use DPP-fused warp reduction from gfx906_primitives.cuh
 static __device__ __forceinline__ float warp_reduce_sum_f32(float x) {
-#pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        x += __shfl_xor(x, mask);
-    }
-    return x;
+    return gfx906_warp_reduce_sum(x);
 }
 
 template <int S_v>
@@ -129,7 +127,7 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
     for (int t = 0; t < L; t++) {
         // Per-token scalars. All lanes read the same memory location —
         // scalar-broadcast via GCN L1.
-        const float g_val    = expf(gate_bh[t]);
+        const float g_val    = gfx906_fast_exp(gate_bh[t]);
         const float beta_val = beta_bh[t];
 
         // Cache the per-token row shard of k and q in registers. Each lane
@@ -199,7 +197,7 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
 // V/state/gate/beta at `H` heads (the V/output head count).
 // When `n_rep == 1` the behaviour is identical to the pre-Phase-3
 // kernel.
-extern "C" __global__ void gated_delta_net_step_s128_f32(
+extern "C" __global__ void __launch_bounds__(256, 1) gated_delta_net_step_s128_f32(
     const float * __restrict__ q,
     const float * __restrict__ k,
     const float * __restrict__ v,

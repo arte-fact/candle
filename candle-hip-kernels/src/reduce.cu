@@ -1,4 +1,5 @@
 #include "hip_utils.cuh"
+#include "gfx906_primitives.cuh"
 #include <cmath>
 #include <stdint.h>
 #include <limits>
@@ -149,24 +150,14 @@ fast_sum(const size_t src_numel, const size_t el_to_sum_per_block,
     dst[dst_id] = shr[0];
 }
 
-// Warp-level reduction using __shfl_xor for Wave64.
-// On HIP/AMD, __shfl_xor does not take a mask or width argument.
-// For WARP_SIZE=64, we need 6 stages (32,16,8,4,2,1).
+// DPP-fused warp reductions from gfx906_primitives.cuh.
+// ~7 cycles per 64-wide reduction vs ~12 with __shfl_xor loops.
 static __device__ __forceinline__ float2 warp_reduce_sum(float2 a) {
-#pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        a.x += __shfl_xor(a.x, mask);
-        a.y += __shfl_xor(a.y, mask);
-    }
-    return a;
+    return gfx906_warp_reduce_sum(a);
 }
 
 static __device__ __forceinline__ float warp_reduce_sum(float x) {
-#pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        x += __shfl_xor(x, mask);
-    }
-    return x;
+    return gfx906_warp_reduce_sum(x);
 }
 
 // LayerNorm implementation adapted from ggml, accumulation is made using f32.
@@ -431,28 +422,22 @@ __device__ void softmax(const T * x, T * dst, const int ncols) {
         max_val = maxg(max_val, x[i]);
     }
 
-    // find the max value in the block
-#pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        max_val = maxg(max_val, __shfl_xor(max_val, mask));
-    }
+    // find the max value in the block — DPP-fused reduction
+    max_val = static_cast<T>(gfx906_warp_reduce_max(static_cast<float>(max_val)));
 
     ACC tmp = static_cast<ACC>(0);
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
-        const T val = expg(x[i] - max_val);
+        const T val = static_cast<T>(gfx906_fast_exp(static_cast<float>(x[i] - max_val)));
         tmp += static_cast<ACC>(val);
         dst[i] = val;
     }
 
-    // sum up partial sums
-#pragma unroll
-    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
-        tmp += __shfl_xor(tmp, mask);
-    }
+    // sum up partial sums — DPP-fused reduction
+    tmp = static_cast<ACC>(gfx906_warp_reduce_sum(static_cast<float>(tmp)));
 
-    const ACC inv_tmp = static_cast<ACC>(1) / tmp;
+    const ACC inv_tmp = static_cast<ACC>(gfx906_rcp(static_cast<float>(tmp)));
 
     for (int col = tid; col < ncols; col += block_size) {
         const int i = row*ncols + col;
@@ -521,10 +506,8 @@ __device__ void masked_softmax_scale(
         }
         max_val = maxg(max_val, s);
     }
-    #pragma unroll
-    for (int m = WARP_SIZE / 2; m > 0; m >>= 1) {
-        max_val = maxg(max_val, __shfl_xor(max_val, m));
-    }
+    // DPP-fused max reduction
+    max_val = static_cast<T>(gfx906_warp_reduce_max(static_cast<float>(max_val)));
 
     // --- Pass 2: compute exp(s - max), sum, write to dst. ---
     ACC tmp = static_cast<ACC>(0);
@@ -534,17 +517,15 @@ __device__ void masked_softmax_scale(
         if (mask_row != nullptr) {
             s = s + mask_row[col];
         }
-        const T val = expg(s - max_val);
+        const T val = static_cast<T>(gfx906_fast_exp(static_cast<float>(s - max_val)));
         tmp += static_cast<ACC>(val);
         dst[i] = val;
     }
-    #pragma unroll
-    for (int m = WARP_SIZE / 2; m > 0; m >>= 1) {
-        tmp += __shfl_xor(tmp, m);
-    }
+    // DPP-fused sum reduction
+    tmp = static_cast<ACC>(gfx906_warp_reduce_sum(static_cast<float>(tmp)));
 
     // --- Pass 3: normalise. ---
-    const ACC inv_tmp = static_cast<ACC>(1) / tmp;
+    const ACC inv_tmp = static_cast<ACC>(gfx906_rcp(static_cast<float>(tmp)));
     for (int col = tid; col < n_cols; col += block_size) {
         const int i = row*n_cols + col;
         dst[i] = static_cast<T>(static_cast<ACC>(dst[i]) * inv_tmp);
@@ -888,6 +869,130 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
         src, mask, dst, n_cols, b_dim, h_dim, lq_dim,                          \
         scale, mask_b_stride, mask_lq_stride);                                 \
   }                                                                            \
+
+// =========================================================================
+// Fused RMSNorm + Scale + Q8_1 Quantize
+// =========================================================================
+//
+// Combines three operations that currently require separate kernel launches:
+//   1. rmsnorm(x, alpha, eps)     — normalize activations
+//   2. scale: y = norm * alpha    — apply per-channel weight
+//   3. quantize_q8_1(y)           — quantize to Q8_1 for downstream MMQ
+//
+// The Q8_1 result is written directly, skipping the f32 intermediate.
+// An optional f32 output (dst_f32) is also written if non-null, for use
+// as the residual stream input to downstream layers.
+//
+// Launch geometry: same as rmsnorm — one row per warp, strided over cols.
+//   grid  = (nrows, 1, 1)
+//   block = (block_size, 1, 1) where block_size = min(ncols, BLOCK_SIZE)
+//
+// Q8_1 block layout: { half2 ds; int8_t qs[32]; } — 36 bytes per block.
+//   ds.x = d = max(|scaled|) / 127
+//   ds.y = sum(scaled[0..31])
+//   qs[i] = round(scaled[i] / d)
+//
+// The number of Q8_1 blocks per row = ncols / 32.
+//
+__device__ void rmsnorm_q8_fused(
+    const float * __restrict__ x,         // (nrows, ncols) input
+    const float * __restrict__ alpha,     // (ncols,) scale weights
+    void * __restrict__ dst_q8,           // Q8_1 output buffer
+    float * __restrict__ dst_f32,         // optional f32 output (or nullptr)
+    const int ncols,
+    const int block_size,
+    const float eps)
+{
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    // ---- Pass 1: compute sum of squares for rmsnorm ----
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[row * ncols + col];
+        tmp += xi * xi;
+    }
+
+    tmp = gfx906_warp_reduce_sum(tmp);
+    if (block_size > WARP_SIZE) {
+        __shared__ float s_sum[BLOCK_SIZE / WARP_SIZE];
+        int warp_id = tid / WARP_SIZE;
+        int lane_id = tid % WARP_SIZE;
+        if (lane_id == 0) s_sum[warp_id] = tmp;
+        __syncthreads();
+        int num_warps = block_size / WARP_SIZE;
+        tmp = (lane_id < num_warps) ? s_sum[lane_id] : 0.0f;
+        tmp = gfx906_warp_reduce_sum(tmp);
+    }
+
+    const float rms_scale = rsqrtf(tmp / ncols + eps);
+
+    // ---- Pass 2: scale + quantize Q8_1 ----
+    // Q8_1 blocks are 32 elements each. Each block needs:
+    //   - amax reduction over 32 elements (for the scale d)
+    //   - sum over 32 elements (for ds.y)
+    //   - quantize each element
+    //
+    // We process blocks collaboratively: threads within each 32-thread
+    // group handle one Q8_1 block.
+
+    const int blocks_per_row = ncols / 32;
+    // Use int8_t pointer for Q8_1 output (36 bytes per block)
+    int8_t * q8_base = (int8_t *)dst_q8 + (int64_t)row * blocks_per_row * 36;
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[row * ncols + col];
+        const float a = alpha[col];
+        const float scaled = xi * rms_scale * a;
+
+        // Write f32 output if requested
+        if (dst_f32 != nullptr) {
+            dst_f32[row * ncols + col] = scaled;
+        }
+
+        // Q8_1 quantization for this element
+        const int block_idx = col / 32;
+        const int elem_idx = col % 32;
+
+        // Reduce amax and sum within the 32-element Q8_1 block.
+        // Use half-warp shuffles (width=32) to avoid cross-block contamination.
+        float amax = fabsf(scaled);
+        float bsum = scaled;
+
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+            bsum += __shfl_xor(bsum, offset, 32);
+        }
+
+        const float d = amax / 127.0f;
+        const int8_t q = (amax == 0.0f) ? 0 : (int8_t)roundf(scaled / d);
+
+        // Write Q8_1 block: layout is { half2 ds (4 bytes); int8_t qs[32] }
+        // Block starts at q8_base + block_idx * 36
+        int8_t * block_ptr = q8_base + block_idx * 36;
+        block_ptr[4 + elem_idx] = q;  // qs starts at offset 4
+
+        // Only element 0 of each block writes the ds metadata
+        if (elem_idx == 0) {
+            half2 ds;
+            ds.x = __float2half(d);
+            ds.y = __float2half(bsum);
+            *reinterpret_cast<half2 *>(block_ptr) = ds;
+        }
+    }
+}
+
+extern "C" __global__ void rmsnorm_q8_fused_f32(
+    const float * __restrict__ x,
+    const float * __restrict__ alpha,
+    void * __restrict__ dst_q8,
+    float * __restrict__ dst_f32,
+    const int ncols,
+    const int block_size,
+    const float eps) {
+    rmsnorm_q8_fused(x, alpha, dst_q8, dst_f32, ncols, block_size, eps);
+}
 
 #define RMSNORM_OP(TYPENAME, FN_NAME) \
   extern "C" __global__ void FN_NAME(                                          \
