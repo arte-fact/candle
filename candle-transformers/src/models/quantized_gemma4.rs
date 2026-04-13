@@ -548,8 +548,35 @@ impl ModelWeights {
                 }
 
                 let per_layer_embed = if n_embd_per_layer > 0 {
-                    let inp_gate = lgg.try_qmatmul(&format!("{block_prefix}.inp_gate.weight"));
-                    let proj = lgg.try_qmatmul(&format!("{block_prefix}.proj.weight"));
+                    let mut inp_gate = lgg.try_qmatmul(&format!("{block_prefix}.inp_gate.weight"));
+                    let mut proj = lgg.try_qmatmul(&format!("{block_prefix}.proj.weight"));
+                    // E4B per_layer weights are stored as F16 in the GGUF →
+                    // `QMatMul::from_arc` dequantizes them at load and
+                    // forward dispatches to `Tensor::matmul` → rocBLAS,
+                    // which the G2 launch recorder doesn't see (rocBLAS
+                    // calls bypass `LaunchArgs::launch`). Force these
+                    // matmuls onto the MMVQ kernel chain by re-quantizing
+                    // to Q8_0 — that's what makes G2 replay actually
+                    // capture the per_layer_embed projections. Cost is
+                    // ~0.1% accuracy loss on per_layer (small weights),
+                    // which is negligible vs the model's own Q4_0 main
+                    // path. Opt-out via CANDLE_GEMMA4_PE_NO_REQUANT=1.
+                    if std::env::var("CANDLE_GEMMA4_PE_NO_REQUANT").is_err() {
+                        if let Some(ref mut m) = inp_gate {
+                            let _ = m.requantize_to(candle::quantized::GgmlDType::Q8_0);
+                        }
+                        if let Some(ref mut m) = proj {
+                            let _ = m.requantize_to(candle::quantized::GgmlDType::Q8_0);
+                        }
+                    }
+                    if std::env::var("CANDLE_GEMMA4_PE_DTYPE_DEBUG").is_ok() && il == 0 {
+                        eprintln!(
+                            "[PE-dtype L{}] inp_gate is_qtensor={:?} proj is_qtensor={:?}",
+                            il,
+                            inp_gate.as_ref().map(|m| m.is_qtensor()),
+                            proj.as_ref().map(|m| m.is_qtensor()),
+                        );
+                    }
                     let pn = lgg.try_rms_norm(
                         &format!("{block_prefix}.post_norm.weight"),
                         rms_norm_eps,
@@ -1017,6 +1044,46 @@ impl ModelWeights {
                                 plan.replay_count(), index_pos, head
                             );
                         }
+                        // K13 deeper diagnostic: peek at every captured op's
+                        // output buffer. Print only on replays 1 and 2 so we
+                        // can diff between them. Ops whose head is identical
+                        // across both replays despite different inputs are
+                        // the ones reading from stale state somewhere.
+                        if std::env::var("CANDLE_G2_PEEK_OPS").is_ok()
+                            && plan.replay_count() <= 2
+                        {
+                            let peeks = plan.peek_op_outputs(&dev_for_replay, 4);
+                            for (i, name, head) in peeks {
+                                eprintln!(
+                                    "[G2-peek r{}] op[{:>4}] {:>40} {}",
+                                    plan.replay_count(), i, name,
+                                    match head {
+                                        Some(v) => format!("head={:?}", v),
+                                        None => "(unknown output arg)".to_string(),
+                                    }
+                                );
+                            }
+                        }
+                        // Even deeper: dump per-op arg pointer lists once
+                        // (replay 1 only). Look for buffer-chain breaks
+                        // between consecutive ops.
+                        if std::env::var("CANDLE_G2_PEEK_ARGS").is_ok()
+                            && plan.replay_count() == 1
+                        {
+                            for (i, name, args, sizes) in plan.peek_op_args() {
+                                let arg_strs: Vec<String> = args.iter().zip(sizes.iter())
+                                    .map(|(v, sz)| if *sz == 8 {
+                                        format!("0x{:012x}", v)
+                                    } else {
+                                        format!("{}", *v as i64)
+                                    })
+                                    .collect();
+                                eprintln!(
+                                    "[G2-args] op[{:>4}] {:>40} args=[{}]",
+                                    i, name, arg_strs.join(", ")
+                                );
+                            }
+                        }
                         let g3_enabled = std::env::var("CANDLE_G3_GRAPH").is_ok();
                         let g3_after = std::env::var("CANDLE_G3_AFTER")
                             .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2);
@@ -1476,6 +1543,18 @@ impl ModelWeights {
             // -------- layer output scale (gemma4) --------
             if let Some(ref scale) = self.layers[il].layer_output_scale {
                 x = x.broadcast_mul(scale)?;
+            }
+
+            // K13 diagnostic: dump first 4 floats of layer output per call.
+            // Set CANDLE_LAYER_DUMP=1 to enable. Used to diff baseline+flash
+            // vs G2-replay forward at the same index_pos.
+            if std::env::var("CANDLE_LAYER_DUMP").is_ok() {
+                let head: Vec<f32> = x
+                    .narrow(x.rank() - 1, 0, 4.min(x.dim(x.rank()-1)?))?
+                    .flatten_all()?
+                    .to_device(&candle::Device::Cpu)?
+                    .to_vec1()?;
+                eprintln!("[LAYER idx={} L{}] head={:?}", index_pos, il, head);
             }
 
             layer_in = x;

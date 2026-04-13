@@ -900,6 +900,85 @@ impl DecodePlan {
         &self.ops
     }
 
+    /// Diagnostic: read the first `n_floats` 32-bit floats from each captured
+    /// op's *output* buffer and return one `(op_index, kernel_name, head)`
+    /// tuple per op. Returns `(idx, name, None)` for ops we don't know how
+    /// to interpret. Synchronizes the device to make sure all queued
+    /// kernels have finished before reading.
+    ///
+    /// Used by K13's "post-replay activation peek" — call this after
+    /// `replay()` and again after a second `replay()`, then diff: ops that
+    /// emit *byte-identical* heads across two replays despite the inputs
+    /// differing are the ones reading from stale state somewhere upstream.
+    ///
+    /// Output-arg-index map is built by hand from each kernel's signature.
+    /// Unknown kernels return `None` — extend the match below as needed.
+    /// Like [`peek_op_outputs`] but also returns each op's full arg-pointer
+    /// list (just the u64 values from `arg_values`, no dereference). Used
+    /// to verify that consecutive ops share the buffer chain — if op N's
+    /// dst-arg doesn't match op N+1's src-arg, the chain is broken.
+    pub fn peek_op_args(&self) -> Vec<(usize, String, Vec<u64>, Vec<usize>)> {
+        self.ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| (i, op.name.clone(), op.arg_values.clone(), op.arg_sizes.clone()))
+            .collect()
+    }
+
+    pub fn peek_op_outputs(&self, dev: &HipDevice, n_floats: usize)
+        -> Vec<(usize, String, Option<Vec<f32>>)>
+    {
+        // Make sure every queued launch has retired before we read.
+        let _ = dev.stream().synchronize();
+        let mut out = Vec::with_capacity(self.ops.len());
+        for (idx, op) in self.ops.iter().enumerate() {
+            let dst_arg: Option<usize> = match op.name.as_str() {
+                // Standard "src, dst, ...rest" pattern.
+                "rmsnorm_f32" | "rmsnorm_f16" | "rmsnorm_bf16"
+                | "rmsnorm_post_residual_f32"
+                | "rope_f32" | "rope_f16" | "rope_bf16"
+                | "ucopy_f32" | "ugelu_f32" | "usqr_f32" | "usqrt_f32"
+                | "utanh_f64"
+                | "affine_f32" | "affine_f64"
+                | "fast_sum_f32" | "fast_argmax_f32"
+                | "cast_f32_f64" | "cast_f64_f32"
+                | "quantize_q8_1"
+                | "copy2d_f32" => Some(1),
+                // Binary "lhs, rhs, dst, ...".
+                "bmul_f32" | "badd_f32" | "bdiv_f32" => Some(2),
+                // MMVQ: "vx, vy, dst, ncols, nrows, ...".
+                s if s.starts_with("mul_mat_vec_") => Some(2),
+                // Flash-attn ktvs: "q, k, v, mask, out, ...".
+                s if s.starts_with("flash_attn_v2_fwd_ktvs_") => Some(4),
+                // const_set: probably "dst, value, n" — output is dst[0].
+                "const_set_f32" => Some(0),
+                // rmsnorm_q8_fused: "x, alpha, dst_q8, dst_f32, ...".
+                "rmsnorm_q8_fused_f32" => Some(3),
+                _ => None,
+            };
+            let head: Option<Vec<f32>> = dst_arg.and_then(|j| {
+                let ptr_u64 = *op.arg_values.get(j)?;
+                if ptr_u64 == 0 { return None; }
+                let mut buf = vec![0f32; n_floats];
+                let bytes = n_floats * std::mem::size_of::<f32>();
+                let rc = unsafe {
+                    hipdarc::sys::hipMemcpy(
+                        buf.as_mut_ptr() as *mut _,
+                        ptr_u64 as *const _,
+                        bytes,
+                        hipdarc::sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+                    )
+                };
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    return None;
+                }
+                Some(buf)
+            });
+            out.push((idx, op.name.clone(), head));
+        }
+        out
+    }
+
     /// Get the dynamic arg indices for each op.
     pub fn dynamic_args(&self) -> &[Vec<usize>] {
         &self.dynamic_args

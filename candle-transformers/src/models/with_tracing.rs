@@ -152,6 +152,26 @@ impl QMatMul {
     pub fn is_qtensor(&self) -> bool {
         matches!(&self.inner, candle::quantized::QMatMul::QTensor(_))
     }
+
+    /// If the inner is a dequantized `Tensor` (loaded from F16/F32/BF16 in
+    /// the GGUF), re-quantize it to `dtype` and replace the inner with a
+    /// fresh `QTensor`. Used by G2-replay-friendly paths where dequantized
+    /// `Tensor::matmul` would dispatch to rocBLAS (uncaptured by the
+    /// launch recorder) — re-quantizing forces the forward through the
+    /// MMVQ kernel chain that IS captured.
+    ///
+    /// No-op when the inner is already a QTensor.
+    pub fn requantize_to(&mut self, dtype: candle::quantized::GgmlDType) -> Result<()> {
+        match &self.inner {
+            candle::quantized::QMatMul::QTensor(_) => Ok(()),
+            candle::quantized::QMatMul::Tensor(t)
+            | candle::quantized::QMatMul::TensorF16(t) => {
+                let qt = candle::quantized::QTensor::quantize(t, dtype)?;
+                self.inner = candle::quantized::QMatMul::QTensor(std::sync::Arc::new(qt));
+                Ok(())
+            }
+        }
+    }
 }
 
 impl Module for QMatMul {
