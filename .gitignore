@@ -51,3 +51,7 @@ bria.wav
 
 # Benchmark/test GGUF checkpoints — fetch with scripts/download-models.sh
 models/*.gguf
+vega-shader-instruction-set-architecture.pdf
+
+# Vega ISA PDFs — extracted text lives in docs/
+docs/vega-isa-*.txt

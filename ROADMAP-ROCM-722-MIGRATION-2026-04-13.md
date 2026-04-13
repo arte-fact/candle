@@ -39,6 +39,19 @@ dev environment to their stack is low-effort and high-leverage.
    **Phase O revival remains blocked until we dig into comgr JIT
    behavior on gfx906 + ROCm 7.1.1 specifically.**
 
+   **Further confirmed 2026-04-13 (Phase R planning)**: pulled mixa3607's
+   `tensile-files-7.2.1.tgz` (`https://static.arkprojects.space/
+   public-data/wiki/AMD-GFX906/rocm-tensile/tensile-files-7.2.1.tgz`,
+   39 MB, 156 gfx906 kernel files). Diff vs `/opt/rocm-7.1.1/lib/
+   rocblas/library/` (255 gfx906 files):
+     - 7.2.1 bundle → 7.1.1 install: **0 new files**
+     - 7.1.1 install → 7.2.1 bundle: 99 extra
+   So the pre-compiled kernel coverage on disk does not improve at all
+   by migrating. The only potential migration benefit left is speculative:
+   a newer `hipcc`/`comgr` might fix the DPP warp-reduce miscompile and
+   the K-quant warp-coop crash we observed on ROCm 7.1.1 (Phase J / B3).
+   That isn't demonstrable without actually migrating.
+
 2. **May naturally help Phase Q2 (kernel tuning).** The `gqa_decode_mv_d256`
    kernel we landed in Phase P Stage 1 (`ee83df34`) runs at **73 μs/call**
    vs turbo's `mul_mat_vec_f` at **~9 μs/call**. Our kernel isn't dramatically
@@ -47,6 +60,31 @@ dev environment to their stack is low-effort and high-leverage.
    a newer `hipcc` (LLVM-based) with more mature gfx906 codegen, particularly
    in the v_dot and LDS schedule passes. Not a guaranteed win but worth
    measuring before investing in manual kernel rewrites.
+
+## 2026-04-13 priority reassessment
+
+With justification #1 withdrawn twice (sgemv is runtime codegen, and the
+7.2.1 bundle brings no new pre-compiled kernels) and the remaining
+benefits purely speculative, this migration is **demoted from STEP 1 to
+a contingent follow-up**. The concrete Phase R (LDS `+1` padding) win is
+a better next move:
+
+| action | cost | concrete benefit |
+|---|---|---|
+| ROCm 7.2.1 migration (this doc) | ~1 day op + bench | speculative (DPP, hipcc codegen) |
+| **Phase R — LDS `+1` padding** | 2-4 h per kernel | 2× LDS bandwidth (skyne98 wiki) |
+| Phase Q2 — mat-vec kernel tuning | 1-2 days | 73 → ~30 μs per d=256 call |
+
+Proceed with Phase R + Q2 on the existing ROCm 7.1.1 stack first. Only
+return to this migration if one of:
+- Phase J DPP reductions become the bottleneck and we need to test if
+  newer hipcc fixes the MI50 miscompile.
+- We ship a Docker image / product bundle and need to align with the
+  community ROCm 7.2.1 default.
+- Third-party vLLM / PyTorch / ComfyUI integration forces the version.
+
+Until then, keep `/opt/rocm-7.1.1` as the build target. The `tensile-
+files-7.2.1.tgz` tarball was inspected but not installed.
 
 3. **Aligns with the community ecosystem.** mixa3607's ROCm 7.2.1 image is
    the current community default for gfx906 ML work. vLLM 0.19.1,
