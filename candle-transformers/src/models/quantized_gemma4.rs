@@ -178,6 +178,30 @@ pub struct ModelWeights {
     /// and the dominant decode cost on gemma4 (which slowed 31% on
     /// candle vs 3% on turbo at long-cache decode before this fix).
     kv_caches: Vec<Option<candle_nn::kv_cache::KvCache>>,
+    /// G2/G3 decode replay state. See `quantized_llama::DecodeState`.
+    /// Single-device only for now — multi-device pipeline-parallel layouts
+    /// fall through to the normal forward path.
+    #[cfg(feature = "hip")]
+    decode_state: DecodeState,
+}
+
+/// Mirror of `quantized_llama::DecodeState` — kept private to this module
+/// since it transitively references `decode_cache::{RecordedOp, DecodePlan,
+/// DecodeGraph}`. See the llama path for the protocol.
+#[cfg(feature = "hip")]
+enum DecodeState {
+    Init,
+    WarmUp,
+    Recorded1 {
+        ops: Vec<candle::hip_backend::decode_cache::RecordedOp>,
+        input_ptr: usize,
+    },
+    Replay(candle::hip_backend::decode_cache::DecodePlan),
+    Graph {
+        plan: candle::hip_backend::decode_cache::DecodePlan,
+        graph: candle::hip_backend::decode_cache::DecodeGraph,
+        captured_l_k: usize,
+    },
 }
 
 impl ModelWeights {
@@ -582,6 +606,8 @@ impl ModelWeights {
             final_logit_softcap,
             per_layer_embeddings,
             kv_caches,
+            #[cfg(feature = "hip")]
+            decode_state: DecodeState::Init,
         }
         .with_tok_embeddings(tok_embeddings))
     }
@@ -593,6 +619,23 @@ impl ModelWeights {
 
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (b_sz, seq_len) = x.dims2()?;
+
+        // ── G2/G3 eligibility check (single-device, no per-layer embed) ──
+        //
+        // Gemma4-E4B ships with `per_layer_embeddings` which adds a second
+        // CPU→GPU transfer that complicates external-anchor handling — defer
+        // that variant until the simpler dense path proves out. Multi-device
+        // (pipeline-parallel 31B) requires per-device recording which we
+        // don't have yet.
+        #[cfg(feature = "hip")]
+        let g2_eligible = seq_len == 1
+            && index_pos > 0
+            && self.per_layer_embeddings.is_none()
+            && {
+                let d0 = &self.layers[0].device;
+                self.layers.iter().all(|l| device_eq(&l.device, d0))
+            }
+            && std::env::var("CANDLE_G2_DISABLE").is_err();
 
         // Token embedding lookup (lives on CPU to avoid VRAM blow-up on the
         // larger 31B variants). Move the looked-up rows to the first layer's
@@ -607,6 +650,150 @@ impl ModelWeights {
         let first_layer_dev = self.layers[0].device.clone();
         let mut layer_in = layer_in_cpu.to_device(&first_layer_dev)?;
         layer_in = (layer_in * (self.embedding_length as f64).sqrt())?;
+
+        // Snapshot the GPU input used as the G2/G3 anchor — needed both
+        // for the fast-path memcpy below and for the post-forward state
+        // machine that records the second decode token.
+        #[cfg(feature = "hip")]
+        let layer_in_anchor: Option<Tensor> = if g2_eligible {
+            Some(layer_in.clone())
+        } else {
+            None
+        };
+
+        // ── G2/G3 fast path: replay captured kernel sequence ──
+        //
+        // `layer_in` (post CPU-embed + transfer + scale) is the GPU input
+        // that the captured ops read from. It's freshly allocated each
+        // call → patch the captured "external" arg slots to the new
+        // pointer (or memcpy the bytes into a stable anchor buffer, the
+        // same trick the llama path uses).
+        #[cfg(feature = "hip")]
+        if g2_eligible {
+            let layer_in_param = layer_in_anchor.as_ref().unwrap().clone();
+            match &mut self.decode_state {
+                DecodeState::Graph { plan, graph, captured_l_k } => {
+                    use candle::hip_backend::hipdarc;
+                    let current_t = index_pos + seq_len;
+                    let pad_default: usize = if std::env::var("CANDLE_G2_REPLAY").is_ok() { 256 } else { 1 };
+                    let pad_t = std::env::var("CANDLE_NKV_PAD")
+                        .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(pad_default);
+                    let live_l_k = if pad_t > 1 {
+                        ((current_t + pad_t - 1) / pad_t) * pad_t
+                    } else {
+                        current_t
+                    };
+                    if live_l_k != *captured_l_k {
+                        eprintln!("[G3-gemma4] pad boundary crossed (captured={} live={}), rebuilding",
+                            captured_l_k, live_l_k);
+                        self.decode_state = DecodeState::Init;
+                    } else {
+                        hipdarc::driver::decode_alloc_resume();
+                        let in_ptr_now = Self::hip_device_ptr(&layer_in_param)?;
+                        let anchor = plan.input_anchor_ptr;
+                        let nbytes = plan.input_anchor_bytes;
+                        let dev = Self::hip_device_from_tensor(&layer_in_param)?;
+                        if anchor != 0 && nbytes > 0 && in_ptr_now != anchor {
+                            let stream = dev.stream();
+                            unsafe {
+                                let rc = hipdarc::sys::hipMemcpyAsync(
+                                    anchor as hipdarc::sys::hipDeviceptr_t,
+                                    in_ptr_now as *const std::ffi::c_void,
+                                    nbytes,
+                                    hipdarc::sys::hipMemcpyKind::hipMemcpyDeviceToDevice,
+                                    stream.raw(),
+                                );
+                                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                                    candle::bail!("G3-gemma4 input memcpy failed: {:?}", rc);
+                                }
+                            }
+                        }
+                        plan.patch_all_externals(anchor);
+                        if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
+                            plan.advance_counters();
+                        }
+                        unsafe { graph.patch_and_launch(plan, &dev)?; }
+                        hipdarc::driver::decode_alloc_pause();
+                        hipdarc::driver::decode_alloc_reset();
+                        return plan.output_tensor(&dev);
+                    }
+                }
+                DecodeState::Replay(plan) => {
+                    let max_replays = std::env::var("CANDLE_G2_REPLAY_MAX")
+                        .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
+                    if std::env::var("CANDLE_G2_REPLAY").is_ok()
+                        && plan.replay_count() < max_replays
+                    {
+                        use candle::hip_backend::hipdarc;
+                        hipdarc::driver::decode_alloc_resume();
+                        let in_ptr_now = Self::hip_device_ptr(&layer_in_param)?;
+                        let anchor = plan.input_anchor_ptr;
+                        let nbytes = plan.input_anchor_bytes;
+                        let dev = Self::hip_device_from_tensor(&layer_in_param)?;
+                        if anchor != 0 && nbytes > 0 && in_ptr_now != anchor {
+                            let stream = dev.stream();
+                            unsafe {
+                                let rc = hipdarc::sys::hipMemcpyAsync(
+                                    anchor as hipdarc::sys::hipDeviceptr_t,
+                                    in_ptr_now as *const std::ffi::c_void,
+                                    nbytes,
+                                    hipdarc::sys::hipMemcpyKind::hipMemcpyDeviceToDevice,
+                                    stream.raw(),
+                                );
+                                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                                    candle::bail!("G2-gemma4 replay input memcpy failed: {:?}", rc);
+                                }
+                            }
+                        }
+                        plan.patch_all_externals(anchor);
+                        if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
+                            plan.advance_counters();
+                        }
+                        unsafe { plan.replay(&dev)?; }
+                        let g3_enabled = std::env::var("CANDLE_G3_GRAPH").is_ok();
+                        let g3_after = std::env::var("CANDLE_G3_AFTER")
+                            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2);
+                        let should_capture = g3_enabled && plan.replay_count() == g3_after;
+                        if should_capture {
+                            let current_t = index_pos + seq_len;
+                            let pad_t_env: usize = std::env::var("CANDLE_NKV_PAD")
+                                .ok().and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(if g3_enabled || std::env::var("CANDLE_G2_REPLAY").is_ok() { 256 } else { 1 });
+                            let live_l_k = if pad_t_env > 1 {
+                                ((current_t + pad_t_env - 1) / pad_t_env) * pad_t_env
+                            } else {
+                                current_t
+                            };
+                            eprintln!("[G3-gemma4] capturing graph after {} replays (L_k_padded={})",
+                                g3_after, live_l_k);
+                            hipdarc::driver::decode_alloc_pause();
+                            hipdarc::driver::decode_alloc_reset();
+                            let output = plan.output_tensor(&dev)?;
+                            let old = std::mem::replace(&mut self.decode_state, DecodeState::Init);
+                            if let DecodeState::Replay(plan) = old {
+                                match unsafe { candle::hip_backend::decode_cache::DecodeGraph::capture(&plan, &dev) } {
+                                    Ok(graph) => {
+                                        eprintln!("[G3-gemma4] graph captured successfully");
+                                        self.decode_state = DecodeState::Graph {
+                                            plan, graph, captured_l_k: live_l_k,
+                                        };
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[G3-gemma4] graph capture failed: {:?} — staying in Replay", e);
+                                        self.decode_state = DecodeState::Replay(plan);
+                                    }
+                                }
+                            }
+                            return Ok(output);
+                        }
+                        hipdarc::driver::decode_alloc_pause();
+                        hipdarc::driver::decode_alloc_reset();
+                        return plan.output_tensor(&dev);
+                    }
+                }
+                _ => {}
+            }
+        }
         if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
             let emb: Vec<f32> = layer_in.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
             eprintln!("[EMBED] first token (scaled): [{:.4}, {:.4}, {:.4}, {:.4}, {:.4}]", emb[0], emb[1], emb[2], emb[3], emb[4]);
@@ -1034,7 +1221,7 @@ impl ModelWeights {
             eprintln!("[FINAL] logits top5={top5:?} has_nan={}", l_cpu.iter().any(|v| v.is_nan()));
         }
 
-        if let Some(soft_cap) = self.final_logit_softcap {
+        let result = if let Some(soft_cap) = self.final_logit_softcap {
             // Compute softcap in f64 to preserve discrimination at high
             // logit magnitudes. At f32, tanh(x) for x > ~9 returns exactly
             // 1.0f, losing all contrast between top tokens. The 26B-A4B
@@ -1042,10 +1229,97 @@ impl ModelWeights {
             // embeddings with dim 2816) where f32 tanh saturates.
             let logits64 = logits.to_dtype(candle::DType::F64)?;
             let capped = ((&logits64 / soft_cap)?.tanh()? * soft_cap)?;
-            capped.to_dtype(candle::DType::F32)
+            capped.to_dtype(candle::DType::F32)?
         } else {
-            Ok(logits)
+            logits
+        };
+
+        // ── G2: Post-forward recording state machine ────────────────────
+        //
+        // Mirrors `quantized_llama::forward`. Anchors `layer_in_anchor`
+        // (post CPU-embed + transfer + scale) as the per-token external
+        // input — that's the GPU buffer that the captured kernels read.
+        #[cfg(feature = "hip")]
+        if g2_eligible {
+            use candle::hip_backend::decode_cache;
+            use candle::hip_backend::hipdarc::driver as hdrv;
+
+            let in_anchor = layer_in_anchor.as_ref().unwrap();
+            if decode_cache::is_recording() {
+                if let Some(recording) = decode_cache::stop_recording() {
+                    let in_ptr_now = Self::hip_device_ptr(in_anchor)?;
+                    match std::mem::replace(&mut self.decode_state, DecodeState::Init) {
+                        DecodeState::WarmUp => {
+                            hdrv::decode_alloc_start_replay();
+                            decode_cache::start_recording();
+                            eprintln!(
+                                "[G2-gemma4] token 3 recorded: {} ops, {} alloc entries, in_ptr=0x{:x}",
+                                recording.len(),
+                                hdrv::decode_alloc_entry_count(),
+                                in_ptr_now,
+                            );
+                            self.decode_state = DecodeState::Recorded1 {
+                                ops: recording,
+                                input_ptr: in_ptr_now,
+                            };
+                        }
+                        DecodeState::Recorded1 { ops: first, input_ptr: in_ptr_3 } => {
+                            let output_ptr = Self::hip_device_ptr(&result)?;
+                            let output_f32_count = result.elem_count();
+                            let output_shape = result.dims().to_vec();
+                            let externals = [in_ptr_3, in_ptr_now];
+                            let input_bytes = in_anchor.elem_count()
+                                * in_anchor.dtype().size_in_bytes();
+                            if let Some(mut plan) = decode_cache::DecodePlan::from_two_recordings_with_externals(
+                                &first,
+                                &recording,
+                                output_ptr,
+                                output_f32_count,
+                                output_shape,
+                                &externals,
+                            ) {
+                                plan.set_input_anchor_bytes(input_bytes);
+                                eprintln!(
+                                    "[G2-gemma4] input anchor: ptr=0x{:x} bytes={}",
+                                    plan.input_anchor_ptr, plan.input_anchor_bytes
+                                );
+                                eprintln!(
+                                    "[G2-gemma4] plan ready: {} ops, {} dynamic/{} fixed, {} external patches",
+                                    plan.len(),
+                                    plan.dynamic_arg_count(),
+                                    plan.fixed_arg_count(),
+                                    plan.external_patch_count(),
+                                );
+                                hdrv::decode_alloc_pause();
+                                hdrv::decode_alloc_reset();
+                                self.decode_state = DecodeState::Replay(plan);
+                            } else {
+                                eprintln!("[G2-gemma4] plan build failed — recordings diverged");
+                                hdrv::decode_alloc_stop();
+                                self.decode_state = DecodeState::Init;
+                            }
+                        }
+                        _ => {
+                            hdrv::decode_alloc_stop();
+                            self.decode_state = DecodeState::Init;
+                        }
+                    }
+                }
+            } else {
+                match &self.decode_state {
+                    DecodeState::Init => {
+                        self.decode_state = DecodeState::WarmUp;
+                    }
+                    DecodeState::WarmUp => {
+                        hdrv::decode_alloc_start_record();
+                        decode_cache::start_recording();
+                    }
+                    _ => {}
+                }
+            }
         }
+
+        Ok(result)
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -1053,6 +1327,36 @@ impl ModelWeights {
             if let Some(c) = slot.as_mut() {
                 c.reset();
             }
+        }
+        // Reset G2/G3 replay state too — KV cache invalidation makes any
+        // captured plan stale.
+        #[cfg(feature = "hip")]
+        {
+            self.decode_state = DecodeState::Init;
+        }
+    }
+
+    /// Extract the raw HIP device pointer from a tensor's storage. Used by
+    /// the G2/G3 replay path to anchor the per-token input tensor.
+    #[cfg(feature = "hip")]
+    fn hip_device_ptr(t: &Tensor) -> Result<usize> {
+        let (storage, layout) = t.storage_and_layout();
+        match &*storage {
+            candle::Storage::Hip(hip) => {
+                let base = hip.slice.device_ptr() as usize;
+                let offset_bytes = layout.start_offset() * t.dtype().size_in_bytes();
+                Ok(base + offset_bytes)
+            }
+            _ => candle::bail!("expected HIP storage for decode replay"),
+        }
+    }
+
+    /// Extract the HipDevice from a tensor.
+    #[cfg(feature = "hip")]
+    fn hip_device_from_tensor(t: &Tensor) -> Result<candle::hip_backend::HipDevice> {
+        match t.device() {
+            candle::Device::Hip(dev) => Ok(dev.clone()),
+            _ => candle::bail!("expected HIP device for decode replay"),
         }
     }
 }
