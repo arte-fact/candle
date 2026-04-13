@@ -1008,8 +1008,8 @@ fn pad_decode_size(size: usize) -> usize {
 }
 
 /// Decode allocator mode.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DecodeAllocMode {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecodeAllocMode {
     /// Recording: new allocs are appended to entries, returned with sentinel.
     Recording,
     /// Replaying: allocs are served from entries (if size matches).
@@ -1081,6 +1081,24 @@ pub fn decode_alloc_resume() {
     DECODE_ALLOC.with(|d| {
         if let Some(ref mut state) = *d.borrow_mut() {
             state.mode = DecodeAllocMode::Replaying;
+        }
+    });
+}
+
+/// Snapshot the current decode-alloc mode (or `None` if disabled).
+/// Pair with [`decode_alloc_set_mode`] to save/restore around a section
+/// that needs to temporarily change modes (e.g. pause inside a recording
+/// without losing the Recording state).
+pub fn decode_alloc_get_mode() -> Option<DecodeAllocMode> {
+    DECODE_ALLOC.with(|d| d.borrow().as_ref().map(|s| s.mode))
+}
+
+/// Restore a mode captured via [`decode_alloc_get_mode`]. No-op if the
+/// allocator has been stopped since the snapshot.
+pub fn decode_alloc_set_mode(mode: DecodeAllocMode) {
+    DECODE_ALLOC.with(|d| {
+        if let Some(ref mut state) = *d.borrow_mut() {
+            state.mode = mode;
         }
     });
 }

@@ -64,6 +64,60 @@ pub fn is_recording() -> bool {
     RECORDING.with(|r| r.borrow().is_some())
 }
 
+/// Run `f` with the current capture state suspended:
+///   - Kernel launches issued inside `f` are NOT added to the captured plan.
+///   - The decode_alloc pool is paused, so allocations made inside `f` go
+///     through the normal allocator (and therefore land at fresh device
+///     addresses on every call). That fresh-per-call address is what makes
+///     the args reading from `f`'s outputs show up as **External** patch
+///     slots when the captured plan is built.
+///
+/// Used by callers (gemma4 with `per_layer_embeddings`, and the CPU→GPU
+/// embed lookup itself) that need some HIP work to live *outside* the
+/// captured plan but still serve as a per-token external input to it.
+///
+/// Both states are restored after `f` returns.
+pub fn with_recording_paused<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    // Snapshot + clear the recording so launches during `f` aren't captured.
+    let saved: Option<Vec<RecordedOp>> = RECORDING.with(|r| r.borrow_mut().take());
+    let was_recording = saved.is_some();
+    if was_recording {
+        // Clear the launch-recorder hook too — otherwise hipdarc would
+        // still try to call into a stale closure.
+        set_launch_recorder(None);
+    }
+    // Pause the decode-alloc pool so allocations inside `f` route through
+    // the normal allocator (varying address per call). Snapshot the prior
+    // mode so it's restored exactly — `decode_alloc_resume` always sets
+    // Replaying which would corrupt a Recording mode.
+    let prior_mode = hipdarc::driver::decode_alloc_get_mode();
+    if prior_mode.is_some() {
+        hipdarc::driver::decode_alloc_pause();
+    }
+
+    let result = f();
+
+    // Restore decode-alloc state to whatever it was before.
+    if let Some(mode) = prior_mode {
+        hipdarc::driver::decode_alloc_set_mode(mode);
+    }
+    // Restore previous recording state.
+    if let Some(ops) = saved {
+        RECORDING.with(|r| {
+            *r.borrow_mut() = Some(ops);
+        });
+        let recorder: LaunchRecorderFn =
+            Box::new(|func, grid, block, shared, stream, args, sizes| {
+                maybe_record(func, grid, block, shared, stream, args, sizes);
+            });
+        set_launch_recorder(Some(recorder));
+    }
+    result
+}
+
 /// Called from LaunchArgs::launch() to record a kernel launch.
 /// Reads each arg according to its actual byte size (from the kernel's
 /// arg declaration). Avoids over-reading scalar int32 args into adjacent
@@ -136,6 +190,25 @@ pub struct PatchLoc {
     pub arg: usize,
 }
 
+/// One logical input tensor across two recordings. Used by callers
+/// (gemma4 with `per_layer_embeddings`) that have more than one freshly-
+/// allocated GPU input buffer per token. Each such input gets its own
+/// `InputAnchor` slot in the plan.
+#[derive(Debug, Clone, Copy)]
+pub struct ExternalInput {
+    pub first_ptr: usize,
+    pub second_ptr: usize,
+}
+
+/// Stable per-input anchor: a fixed device address that captured ops
+/// reference, and a byte size for the per-replay memcpy from the live
+/// per-token buffer into this anchor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InputAnchor {
+    pub ptr: usize,
+    pub bytes: usize,
+}
+
 /// A recorded decode forward pass, ready for replay.
 #[derive(Debug, Clone)]
 pub struct DecodePlan {
@@ -147,6 +220,12 @@ pub struct DecodePlan {
     /// Locations of external-patch args (input pointer, etc).
     /// Caller patches these explicitly before replay.
     external_patch_locs: Vec<PatchLoc>,
+    /// For each external_patch_locs entry, which logical input it belongs
+    /// to. Single-input plans (the common case) leave this empty and
+    /// callers use `patch_all_externals` / `input_anchor_ptr`. Multi-input
+    /// plans populate it 1-to-1 with `external_patch_locs` and the caller
+    /// uses `patch_external_input(idx, ptr)`.
+    external_input_ids: Vec<usize>,
     /// Total number of fixed (stable) args.
     fixed_count: usize,
     /// Device pointer of the output buffer (last op's result).
@@ -157,12 +236,17 @@ pub struct DecodePlan {
     output_shape: Vec<usize>,
     /// How many times replay has been called (for step limiting).
     replay_count: usize,
-    /// Input-tensor device pointer captured at recording time. At replay
-    /// time the caller memcpys the new token-id bytes into this address
-    /// so downstream ops see fresh indices without pointer patching.
+    /// Single-input back-compat anchor (== `input_anchors[0].ptr` when
+    /// the plan is built from `from_two_recordings_with_externals`).
+    /// Llama path reads this directly.
     pub input_anchor_ptr: usize,
-    /// Byte size of the input tensor to memcpy on each replay.
+    /// Single-input back-compat anchor bytes (== `input_anchors[0].bytes`).
     pub input_anchor_bytes: usize,
+    /// Per-input anchors. `len() == 0` for single-input plans (use the
+    /// `input_anchor_ptr` / `input_anchor_bytes` fields above instead).
+    /// `len() >= 1` for multi-input plans built via
+    /// `from_two_recordings_with_inputs`.
+    input_anchors: Vec<InputAnchor>,
 }
 
 impl DecodePlan {
@@ -317,6 +401,7 @@ impl DecodePlan {
             dynamic_args,
             dynamic_kinds,
             external_patch_locs,
+            external_input_ids: Vec::new(),
             fixed_count,
             output_ptr,
             output_f32_count,
@@ -324,6 +409,112 @@ impl DecodePlan {
             replay_count: 0,
             input_anchor_ptr,
             input_anchor_bytes: 0,
+            input_anchors: Vec::new(),
+        })
+    }
+
+    /// Multi-input variant: each `ExternalInput` describes one logical
+    /// input tensor (its address in the first and second recordings).
+    /// Args matching either of an input's pointers get tagged with that
+    /// input's index, so `patch_external_input(idx, new_ptr)` can patch
+    /// just the args belonging to one input.
+    ///
+    /// Falls back to the single-input behaviour when `inputs.len() == 1`
+    /// — same plan layout, but `input_anchors` is populated.
+    pub fn from_two_recordings_with_inputs(
+        first: &[RecordedOp],
+        second: &[RecordedOp],
+        output_ptr: usize,
+        output_f32_count: usize,
+        output_shape: Vec<usize>,
+        inputs: &[ExternalInput],
+    ) -> Option<Self> {
+        if first.len() != second.len() {
+            return None;
+        }
+
+        let ops = second.to_vec();
+        let mut dynamic_args = Vec::with_capacity(ops.len());
+        let mut dynamic_kinds = Vec::with_capacity(ops.len());
+        let mut external_patch_locs: Vec<PatchLoc> = Vec::new();
+        let mut external_input_ids: Vec<usize> = Vec::new();
+
+        for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+            if a.func != b.func || a.arg_values.len() != b.arg_values.len() {
+                return None;
+            }
+
+            let mut dyn_indices = Vec::new();
+            let mut dyn_kinds = Vec::new();
+            for (j, (va, vb)) in a.arg_values.iter().zip(b.arg_values.iter()).enumerate() {
+                if va != vb {
+                    // Determine which logical input (if any) this arg belongs
+                    // to. The first matching input wins — pointers are
+                    // assumed disjoint between inputs, which holds for
+                    // separate GPU allocations.
+                    let mut matched_input: Option<usize> = None;
+                    for (idx, inp) in inputs.iter().enumerate() {
+                        if inp.first_ptr as u64 == *va || inp.second_ptr as u64 == *vb
+                            || inp.first_ptr as u64 == *vb || inp.second_ptr as u64 == *va
+                        {
+                            matched_input = Some(idx);
+                            break;
+                        }
+                    }
+                    if let Some(input_idx) = matched_input {
+                        external_patch_locs.push(PatchLoc { op: i, arg: j });
+                        external_input_ids.push(input_idx);
+                        dyn_indices.push(j);
+                        dyn_kinds.push(DynArgKind::External);
+                    } else {
+                        let delta = *vb as i64 - *va as i64;
+                        dyn_indices.push(j);
+                        dyn_kinds.push(DynArgKind::Counter(delta));
+                    }
+                }
+            }
+            dynamic_args.push(dyn_indices);
+            dynamic_kinds.push(dyn_kinds);
+        }
+
+        let dynamic_count: usize = dynamic_args.iter().map(|d| d.len()).sum();
+        let total_args: usize = ops.iter().map(|o| o.arg_values.len()).sum();
+        let fixed_count = total_args - dynamic_count;
+
+        // Anchor the SECOND recording's pointer for each input — that's
+        // what the captured ops contain.
+        let input_anchors: Vec<InputAnchor> = inputs
+            .iter()
+            .map(|inp| InputAnchor { ptr: inp.second_ptr, bytes: 0 })
+            .collect();
+
+        // Per-input external-patch counts for the log line.
+        let mut per_input: Vec<usize> = vec![0; inputs.len()];
+        for &id in &external_input_ids {
+            per_input[id] += 1;
+        }
+
+        eprintln!(
+            "[G2] multi-input plan: {} ops, {} fixed/{} dynamic, externals/input={:?}",
+            ops.len(), fixed_count, dynamic_count, per_input
+        );
+
+        Some(Self {
+            ops,
+            dynamic_args,
+            dynamic_kinds,
+            external_patch_locs,
+            external_input_ids,
+            fixed_count,
+            output_ptr,
+            output_f32_count,
+            output_shape,
+            replay_count: 0,
+            // Back-compat: first input's pointer is also exposed as the
+            // legacy `input_anchor_ptr` for callers that haven't migrated.
+            input_anchor_ptr: input_anchors.first().map(|a| a.ptr).unwrap_or(0),
+            input_anchor_bytes: 0,
+            input_anchors,
         })
     }
 
@@ -331,6 +522,47 @@ impl DecodePlan {
     /// bytes from the new x into `input_anchor_ptr` on each replay.
     pub fn set_input_anchor_bytes(&mut self, bytes: usize) {
         self.input_anchor_bytes = bytes;
+        // Keep the multi-input mirror in sync so a multi-input plan with
+        // a single logical input can be patched via either API.
+        if let Some(a) = self.input_anchors.get_mut(0) {
+            a.bytes = bytes;
+        }
+    }
+
+    /// Multi-input variant: how many distinct logical inputs the plan
+    /// tracks. `0` for plans built via `from_two_recordings_with_externals`.
+    pub fn input_count(&self) -> usize {
+        self.input_anchors.len()
+    }
+
+    /// Per-input anchor (record-time pointer + bytes). Returns `None`
+    /// when `idx >= input_count()`.
+    pub fn input_anchor(&self, idx: usize) -> Option<InputAnchor> {
+        self.input_anchors.get(idx).copied()
+    }
+
+    /// Set the byte size for the `idx`-th input anchor. Caller must do
+    /// this once after constructing the plan; without it the per-replay
+    /// memcpy is skipped and the captured ops read stale data.
+    pub fn set_input_anchor_bytes_at(&mut self, idx: usize, bytes: usize) {
+        if let Some(a) = self.input_anchors.get_mut(idx) {
+            a.bytes = bytes;
+        }
+        // Keep the legacy single-input fields in sync for input 0.
+        if idx == 0 {
+            self.input_anchor_bytes = bytes;
+        }
+    }
+
+    /// Patch every external arg slot belonging to the `input_idx`-th
+    /// logical input. Used by multi-input plans where each input has its
+    /// own anchor address.
+    pub fn patch_external_input(&mut self, input_idx: usize, value: usize) {
+        for (loc, &id) in self.external_patch_locs.iter().zip(self.external_input_ids.iter()) {
+            if id == input_idx {
+                self.ops[loc.op].arg_values[loc.arg] = value as u64;
+            }
+        }
     }
 
     /// How many replay steps have been executed.
