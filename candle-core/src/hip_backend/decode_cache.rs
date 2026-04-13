@@ -23,6 +23,12 @@ use hipdarc::driver::{set_launch_recorder, LaunchRecorderFn};
 #[derive(Clone, Debug)]
 pub struct RecordedOp {
     pub func: hipdarc::sys::hipFunction_t,
+    /// Symbolic kernel name (e.g. `"rmsnorm_f32"`,
+    /// `"mul_mat_vec_q4_0_q8_1_cuda1"`,
+    /// `"masked_softmax_scale_f32"`). Captured from the
+    /// `HipFunction::name` at record time. Only used for diagnostics
+    /// — it does not influence replay correctness.
+    pub name: String,
     pub grid: (u32, u32, u32),
     pub block: (u32, u32, u32),
     pub shared_mem: u32,
@@ -53,9 +59,11 @@ pub fn start_recording() {
         *r.borrow_mut() = Some(Vec::with_capacity(512));
     });
 
-    let recorder: LaunchRecorderFn = Box::new(|func, grid, block, shared, stream, args, sizes| {
-        maybe_record(func, grid, block, shared, stream, args, sizes);
-    });
+    let recorder: LaunchRecorderFn = Box::new(
+        |func, name, grid, block, shared, stream, args, sizes| {
+            maybe_record(func, name, grid, block, shared, stream, args, sizes);
+        }
+    );
     set_launch_recorder(Some(recorder));
 }
 
@@ -111,10 +119,11 @@ where
         RECORDING.with(|r| {
             *r.borrow_mut() = Some(ops);
         });
-        let recorder: LaunchRecorderFn =
-            Box::new(|func, grid, block, shared, stream, args, sizes| {
-                maybe_record(func, grid, block, shared, stream, args, sizes);
-            });
+        let recorder: LaunchRecorderFn = Box::new(
+            |func, name, grid, block, shared, stream, args, sizes| {
+                maybe_record(func, name, grid, block, shared, stream, args, sizes);
+            }
+        );
         set_launch_recorder(Some(recorder));
     }
     result
@@ -126,6 +135,7 @@ where
 /// stack memory (the "fake 2^32 delta" bug).
 pub fn maybe_record(
     func: hipdarc::sys::hipFunction_t,
+    name: &str,
     grid: (u32, u32, u32),
     block: (u32, u32, u32),
     shared_mem: u32,
@@ -166,6 +176,7 @@ pub fn maybe_record(
             }
             ops.push(RecordedOp {
                 func,
+                name: name.to_string(),
                 grid,
                 block,
                 shared_mem,
@@ -474,9 +485,37 @@ impl DecodePlan {
             eprintln!("[G2-mi] largest |delta| (first 8):");
             for (op_i, arg_i, va, vb, sz) in by_abs.iter().take(8) {
                 let delta = *vb as i64 - *va as i64;
-                eprintln!("    op[{}] arg[{}] size={} {:#x} -> {:#x} (delta={}, kernel={:?})",
+                eprintln!("    op[{}] arg[{}] size={} {:#x} -> {:#x} (delta={}, kernel={})",
                     op_i, arg_i, sz, va, vb, delta,
-                    second[*op_i].func);
+                    second[*op_i].name);
+            }
+
+            // Per-kernel summary: count fixed vs dynamic args grouped by
+            // kernel name. Reveals which kernel families have
+            // unexpectedly few dynamic args (suggesting the captured
+            // plan misses a per-token state update).
+            let mut per_kernel: std::collections::BTreeMap<&str, (usize, usize, usize)> =
+                std::collections::BTreeMap::new();
+            for (op_i, op) in second.iter().enumerate() {
+                let entry = per_kernel.entry(op.name.as_str()).or_insert((0, 0, 0));
+                entry.0 += 1; // op count
+                entry.1 += op.arg_values.len(); // total args
+                let dyn_args = first[op_i]
+                    .arg_values
+                    .iter()
+                    .zip(op.arg_values.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                entry.2 += dyn_args;
+            }
+            eprintln!(
+                "[G2-mi] per-kernel arg breakdown (kernel: ops, total_args, dynamic_args):"
+            );
+            // Sort by total ops descending, then by name.
+            let mut kv: Vec<_> = per_kernel.iter().collect();
+            kv.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
+            for (name, (ops, args, dyns)) in kv.iter().take(40) {
+                eprintln!("    {:>4}× {:>4} args ({:>3} dyn)  {}", ops, args, dyns, name);
             }
         }
 

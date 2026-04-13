@@ -1387,7 +1387,7 @@ impl HipModule {
         unsafe {
             check_hip(sys::hipModuleGetFunction(&mut raw, self.raw, c_name.as_ptr()))?;
         }
-        Ok(HipFunction { raw })
+        Ok(HipFunction { raw, name: name.to_string() })
     }
 }
 
@@ -1410,6 +1410,18 @@ impl std::fmt::Debug for HipModule {
 /// A handle to a kernel function within a module.
 pub struct HipFunction {
     raw: sys::hipFunction_t,
+    /// Symbolic name (matches the `extern "C"` symbol the kernel was loaded
+    /// from). Used by the launch recorder to attach human-readable labels
+    /// to recorded ops so K10-style replay debugging doesn't have to
+    /// match raw `hipFunction_t` opaque pointers against module dumps.
+    name: String,
+}
+
+impl HipFunction {
+    /// Symbolic name of this kernel.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 unsafe impl Send for HipFunction {}
@@ -1417,7 +1429,7 @@ unsafe impl Sync for HipFunction {}
 
 impl std::fmt::Debug for HipFunction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HipFunction").finish()
+        f.debug_struct("HipFunction").field("name", &self.name).finish()
     }
 }
 
@@ -1510,11 +1522,15 @@ impl<'a> LaunchArgs<'a> {
         let sizes = self.arg_sizes;
 
         // G2: invoke the recording callback (if registered) to capture
-        // this kernel launch for decode op cache replay.
+        // this kernel launch for decode op cache replay. We pass the
+        // symbolic kernel name in addition to the raw handle so the
+        // recorder can attach human-readable labels to each captured
+        // op (essential for diagnosing replay-state bugs).
         LAUNCH_RECORDER.with(|rec| {
             if let Some(ref cb) = *rec.borrow() {
                 cb(
                     self.func.raw,
+                    self.func.name.as_str(),
                     cfg.grid_dim,
                     cfg.block_dim,
                     cfg.shared_mem_bytes,
@@ -1543,10 +1559,12 @@ impl<'a> LaunchArgs<'a> {
 
 /// G2: Thread-local kernel launch recorder callback.
 /// When set, every `LaunchArgs::launch()` call invokes this function
-/// with the kernel function handle, grid/block config, and arg pointers.
+/// with the kernel function handle, kernel name, grid/block config, and
+/// arg pointers.
 pub type LaunchRecorderFn = Box<
     dyn Fn(
         sys::hipFunction_t,
+        &str,
         (u32, u32, u32),
         (u32, u32, u32),
         u32,
