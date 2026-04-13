@@ -370,6 +370,16 @@ impl ModelWeights {
             let pl_embd = cpu_gg.try_dequantize("per_layer_token_embd.weight");
             let pl_proj = gg.try_qmatmul("per_layer_model_proj.weight");
             let pl_pn = gg.try_rms_norm("per_layer_proj_norm.weight", rms_norm_eps);
+            // NOTE: we deliberately do NOT requantize `pl_proj` (the
+            // global model_proj used in the prelude) even though it's an
+            // F16 weight. Tested empirically — switching it to Q8_0 makes
+            // the prelude's alloc pattern diverge from recording (extra
+            // quantize_q8_1 buffer per call), which throws the
+            // decode_alloc cursor out of sync with the captured plan and
+            // causes `hipErrorNotReady` mid-replay. The per-layer
+            // `inp_gate` / `proj` ARE requantized below — those are
+            // inside the captured layer loop where the alloc pattern is
+            // already part of the recording.
             match (pl_embd, pl_proj, pl_pn) {
                 (Some(embd), Some(proj), Some(pn)) => Some(PerLayerEmbeddings {
                     token_embd: embd,
