@@ -98,6 +98,87 @@ impl DenseMlp {
     }
 }
 
+impl DenseMlp {
+    /// Decode-path FFN forward with a pre-quantized Q8_1 input, skipping
+    /// the redundant `quantize_q8_1` launches on both `gate_up` and
+    /// `down` QMatMul dispatches. Caller is responsible for producing
+    /// `x_q8_view` via `rmsnorm_q8_fused` (or an equivalent). Returns
+    /// the raw FFN output — **no residual added**, so the caller is
+    /// free to run a post-FFN norm before the residual (e.g. Gemma4's
+    /// `post_ffn_norm.forward_post_residual`).
+    ///
+    /// `rhs_shape` is the shape the caller's pre-norm activation had —
+    /// the QMatMul needs it to set the output tensor shape.
+    ///
+    /// HIP-only. Both matmuls must be Q4_0 QTensors. Marginal ~1-2 t/s
+    /// decode win on gemma4-E4B from skipping 2 quantize_q8_1 launches
+    /// per layer per token (one for gate_up, one for down).
+    #[cfg(feature = "hip")]
+    pub fn forward_preq8_decode(
+        &self,
+        x_q8_view: &candle::hip_backend::hipdarc::driver::HipView<'_, u8>,
+        b_size: usize,
+        rhs_shape: &[usize],
+    ) -> Result<Tensor> {
+        let gate_up = self.gate_up.forward_preq8(x_q8_view, b_size, rhs_shape)?;
+
+        // Gate+up split → activation. For SiLU the fused kernel reads
+        // `gate_up` directly. For GELU there's no fused variant yet, so
+        // we materialize gate/up separately.
+        let activated = if matches!(self.activation, MlpActivation::Silu)
+            && gate_up.is_contiguous()
+            && gate_up.dtype() == candle::DType::F32
+        {
+            candle::hip_backend::silu_mul_split_last_fused(&gate_up)?
+        } else {
+            let gate = gate_up
+                .narrow(D::Minus1, 0, self.intermediate_size)?
+                .contiguous()?;
+            let up = gate_up
+                .narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?
+                .contiguous()?;
+            self.activation.apply_with_mul(&gate, &up)?
+        };
+
+        // Re-quantize the activation before the down matmul so the down
+        // call can also skip its internal quantize_q8_1.
+        use candle::quantized::hip as qhip;
+        let dev = match activated.device() {
+            Device::Hip(d) => d.clone(),
+            _ => candle::bail!("forward_preq8_decode: activated must be HIP"),
+        };
+        let activated_c = if activated.is_contiguous() {
+            activated.clone()
+        } else {
+            activated.contiguous()?
+        };
+        let (a_st, a_l) = activated_c.storage_and_layout();
+        let a_hip = match &*a_st {
+            candle::Storage::Hip(s) => s,
+            _ => candle::bail!("forward_preq8_decode: activated not HIP"),
+        };
+        let a_slice = a_hip.as_hip_slice::<f32>()?;
+        let (a_lo, a_hi) = a_l
+            .contiguous_offsets()
+            .ok_or_else(|| candle::Error::Msg("activated non-contig".into()))?;
+        let a_view = a_slice.slice(a_lo..a_hi);
+
+        let k = self.intermediate_size;
+        let ky = b_size; // number of rows (b*seq_len)
+        let kx_padded = qhip::pad(k, qhip::MATRIX_ROW_PADDING);
+        let q8_bytes = ky * (kx_padded / 32) * 36;
+        let mut h_q8_buf = unsafe { dev.alloc::<u8>(q8_bytes)? };
+        qhip::quantize_q8_1(&a_view, &mut h_q8_buf, k, ky, &dev)?;
+        drop(a_st);
+        let h_q8_view = h_q8_buf.slice(0..h_q8_buf.len());
+
+        // down matmul takes `rhs_shape` with last dim = intermediate_size.
+        let mut down_rhs_shape: Vec<usize> = rhs_shape.to_vec();
+        *down_rhs_shape.last_mut().unwrap() = self.intermediate_size;
+        self.down.forward_preq8(&h_q8_view, b_size, &down_rhs_shape)
+    }
+}
+
 impl Module for DenseMlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Single fused gate+up matmul. Output: (B, L, 2*intermediate)

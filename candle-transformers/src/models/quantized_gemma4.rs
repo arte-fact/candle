@@ -1616,8 +1616,49 @@ impl ModelWeights {
             } else {
                 // Dense-only path (E4B and similar).
                 let residual = x.clone();
-                let ffn_in = self.layers[il].ffn_norm.forward(&x)?;
-                let ffn_out = self.layers[il].mlp.forward(&ffn_in)?;
+                // HIP fused-decode FFN: combines `ffn_norm` + `quantize_q8_1`
+                // into `rmsnorm_q8_fused`, then reuses the Q8_1 buffer for
+                // both `gate_up.forward_preq8` and (after the activation)
+                // `down.forward_preq8`. Saves 2 quantize_q8_1 launches per
+                // layer per decode token. Opt-out via
+                // `CANDLE_GEMMA4_FFN_FUSED_OFF=1`.
+                let ffn_out: Option<Tensor> = {
+                    #[cfg(feature = "hip")]
+                    {
+                        let is_decode = seq_len == 1
+                            && matches!(x.device(), candle::Device::Hip(_))
+                            && x.dtype() == DType::F32
+                            && std::env::var("CANDLE_GEMMA4_FFN_FUSED_OFF").is_err();
+                        if is_decode {
+                            let (b_sz_ff, _, _) = x.dims3()?;
+                            let x_c = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
+                            match candle::hip_backend::rmsnorm_q8_fused(
+                                &x_c,
+                                self.layers[il].ffn_norm.weight(),
+                                self.layers[il].ffn_norm.eps_f32() as f64,
+                                false,
+                            ) {
+                                Ok((x_q8_buf, _)) => {
+                                    let x_q8_view = x_q8_buf.slice(0..x_q8_buf.len());
+                                    let rhs_shape = vec![b_sz_ff, 1usize, x.dim(candle::D::Minus1)?];
+                                    self.layers[il].mlp.forward_preq8_decode(
+                                        &x_q8_view, b_sz_ff, &rhs_shape,
+                                    ).ok()
+                                }
+                                Err(_) => None,
+                            }
+                        } else { None }
+                    }
+                    #[cfg(not(feature = "hip"))]
+                    { None }
+                };
+                let ffn_out = match ffn_out {
+                    Some(o) => o,
+                    None => {
+                        let ffn_in = self.layers[il].ffn_norm.forward(&x)?;
+                        self.layers[il].mlp.forward(&ffn_in)?
+                    }
+                };
                 if il == 0 && std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
                     let d_abs = ffn_out.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_vec0::<f32>().unwrap();
                     let r_abs = residual.abs().unwrap().mean_all().unwrap().to_device(&candle::Device::Cpu).unwrap().to_vec0::<f32>().unwrap();
