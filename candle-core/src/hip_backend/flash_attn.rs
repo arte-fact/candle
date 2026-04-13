@@ -1250,22 +1250,7 @@ pub fn gqa_attention_decode_gemv(
         }
     }
 
-    let dbg = std::env::var("CANDLE_DECODE_GEMV_DEBUG").is_ok();
-    if dbg {
-        eprintln!(
-            "[gemv] b={b} n_head={n_head} n_kv={n_kv} n_rep={n_rep} d={d} t_k={t_k} \
-             k_strides={:?} v_strides={:?} v_t_contig={v_t_contig}",
-            k_strides, v_strides
-        );
-    }
-
     let blas = dev.rocblas_handle()?;
-    if dbg { eprintln!("[gemv] got blas handle"); }
-    if dbg {
-        // Sync to flush any pending kernels before rocBLAS call.
-        let _ = dev.stream().synchronize();
-        eprintln!("[gemv] stream synced");
-    }
 
     // Per-head Q layout under reshape (B, n_kv, n_rep*L_q=n_rep, D):
     //   q[b][h_kv][r][d] = q_orig[b][h_kv*n_rep + r][0][d]
@@ -1296,39 +1281,24 @@ pub fn gqa_attention_decode_gemv(
         stride_y: (n_rep * t_k) as i64,
         batch_count: n_kv as i32,
     };
-    // TEMP: per-head loop instead of strided-batched to isolate.
-    let cfg_qk_one = StridedBatchedSgemvConfig {
-        trans: GemmOp::NoTrans,
-        m: t_k as i32,
-        n: d as i32,
-        lda: k_lda,
-        stride_a: 0,
-        incx: 1,
-        stride_x: 0,
-        incy: 1,
-        stride_y: 0,
-        batch_count: 1,
-    };
     for r in 0..n_rep {
-        for h in 0..n_kv {
-            let q_off = h * n_rep * d + r * d;
-            let y_off = h * n_rep * t_k + r * t_k;
-            let k_off = h * (k_head_stride as usize);
-            let k_p = (k_base.device_ptr() as *const f32).wrapping_add(k_off);
-            let q_p = (q_base.device_ptr() as *const f32).wrapping_add(q_off);
-            let y_p = (attn_view.device_ptr() as *mut f32).wrapping_add(y_off);
-            if dbg && r == 0 && h == 0 {
-                eprintln!("[gemv] K^T·Q first call k_p={:p} q_p={:p} y_p={:p}", k_p, q_p, y_p);
-            }
-            unsafe {
-                sgemv_strided_batched(blas, &cfg_qk_one, 1.0, k_p, q_p, 0.0, y_p)
-                    .map_err(|e| HipError::InternalError(
-                        Box::leak(format!("sgemv K^T·Q (r={r},h={h}) failed: {e:?}").into_boxed_str())
-                    ))?;
-            }
+        let q_off = r * d;
+        let y_off = r * t_k;
+        unsafe {
+            sgemv_strided_batched(
+                blas,
+                &cfg_qk,
+                1.0,
+                k_base.device_ptr() as *const f32,
+                (q_base.device_ptr() as *const f32).wrapping_add(q_off),
+                0.0,
+                (attn_view.device_ptr() as *mut f32).wrapping_add(y_off),
+            )
+            .map_err(|e| HipError::InternalError(
+                Box::leak(format!("sgemv K^T·Q failed: {e:?}").into_boxed_str())
+            ))?;
         }
     }
-    if dbg { eprintln!("[gemv] K^T·Q all done"); }
 
     // Step 2: softmax(scale * attn + mask). Reshape attn to (B, n_head, 1, t_k)
     // — zero-copy since memory layout matches.
@@ -1397,9 +1367,9 @@ pub fn gqa_attention_decode_gemv(
                 &cfg_av,
                 1.0,
                 v_base.device_ptr() as *const f32,
-                (att_base.device_ptr() as *const f32).add(x_off),
+                (att_base.device_ptr() as *const f32).wrapping_add(x_off),
                 0.0,
-                (out_view.device_ptr() as *mut f32).add(y_off),
+                (out_view.device_ptr() as *mut f32).wrapping_add(y_off),
             )
             .map_err(|e| HipError::InternalError(
                 Box::leak(format!("sgemv V^T·attn failed: {e:?}").into_boxed_str())

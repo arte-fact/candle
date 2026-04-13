@@ -258,7 +258,7 @@ pub(crate) fn gqa_attention_k_transposed(
             // The dispatch is gated OFF below. Set
             // `CANDLE_DECODE_GEMV_ON=1` to opt in (and reproduce the
             // segfault for further debugging).
-            #[cfg(any())] // disabled — see Phase O notes above
+            #[cfg(any())] // disabled — see Phase O notes above (rocBLAS sgemv segfault)
             {
                 let lk_iter = FLASH_L_K_ITER_OVERRIDE.with(|c| c.get());
                 if seq_len == 1

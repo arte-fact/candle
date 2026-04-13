@@ -284,10 +284,21 @@ pub enum rocblas_gemm_algo {
     rocblas_gemm_algo_standard = 0,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum rocblas_pointer_mode {
+    rocblas_pointer_mode_host = 0,
+    rocblas_pointer_mode_device = 1,
+}
+
 extern "C" {
     pub fn rocblas_create_handle(handle: *mut rocblas_handle) -> rocblas_status;
     pub fn rocblas_destroy_handle(handle: rocblas_handle) -> rocblas_status;
     pub fn rocblas_set_stream(handle: rocblas_handle, stream: hipStream_t) -> rocblas_status;
+    pub fn rocblas_set_pointer_mode(
+        handle: rocblas_handle,
+        mode: rocblas_pointer_mode,
+    ) -> rocblas_status;
 
     pub fn rocblas_gemm_strided_batched_ex(
         handle: rocblas_handle,

@@ -358,32 +358,51 @@ plumbing the per-kv-head dispatch loop.
 noise). No effect on llama / TinyLlama (those use D=64 / 128 with the
 existing fast path).
 
-**Status (2026-04-13)**: scaffolding committed but blocked.
+**Status (2026-04-13)**: scaffolding committed but blocked on rocBLAS
+sgemv runtime.
 - O1 (FFI binding) DONE. Added `rocblas_sgemv_strided_batched` in
   `hipdarc/src/sys.rs` and `sgemv_strided_batched` safe wrapper in
-  `hipdarc/src/rocblas.rs`. Builds clean against ROCm 7.1.1
-  librocblas.so.5 (symbol verified via `nm -D`).
-- O2 (dispatch) DONE shape-wise (`gqa_attention_decode_gemv` in
-  `flash_attn.rs`) but SEGFAULTS on first sgemv call. Bracketed
-  eprintln before/after the call confirm the binding entry is reached
-  and the "after" never fires. Tested with both `batch_count > 1` and
-  `batch_count == 1` (per-head loop) — same crash. Stream synced
-  before the call — same crash.
-- Suspected issues to investigate next:
-  1. rocBLAS pointer mode default vs. our host alpha/beta. Try
-     `rocblas_set_pointer_mode_host` explicitly in `RocBlas::new`.
-  2. lda alignment on MI50 — for short contexts m=t_k is small (~22)
-     but lda=max_T (4096). Try staging K into a contiguous (m, n)
-     buffer first to test if lda mismatch is the cause.
-  3. Parameter struct layout — diff our binding signature against
-     `<rocblas/rocblas-functions.h>` to verify type widths match.
-  4. Test with `rocblas-bench` standalone using the same dimensions to
-     confirm the rocBLAS install handles `m=22 lda=4096 batch=2` on
-     gfx906 — if rocblas-bench also crashes, the library / kernel
-     library is the issue (try ROCm 6.4 instead).
-- Dispatch in `attention.rs` is gated `#[cfg(any())]` — the path is
-  unreachable until O2 is unblocked. Set `CANDLE_DECODE_GEMV_ON=1` and
-  remove the cfg gate to reproduce.
+  `hipdarc/src/rocblas.rs`. Also added `rocblas_set_pointer_mode` and
+  set `pointer_mode_host` explicitly at `RocBlas::new` (defensive — no
+  observable change but it's correct hygiene). Builds clean against
+  ROCm 7.1.1 librocblas.so.5; symbol verified via `nm -D`.
+- O2 (dispatch) DONE shape-wise but SEGFAULTS on first sgemv call.
+  Even a TINY smoke-test sgemv (m=n=4, lda=4, batch=1, fresh tiny
+  buffers) crashes the same way. So the bug is NOT shape/stride
+  dependent.
+- **strace pinpoints the cause**: rocBLAS sgemv triggers runtime JIT
+  via comgr — the strace shows
+  `comgr-XXXX/output/hipfatbin-...gfx906:sramecc+:xnack-.o` files
+  being created as the call enters, and SIGSEGV (`SI_KERNEL`,
+  `si_addr=NULL`) immediately after. Best read: the gfx906-patched
+  rocBLAS install ships Tensile gemm kernels but its sgemv kernel
+  selection falls back to a comgr JIT path that crashes on this
+  ROCm 7.1.1 / gfx906 combo.
+- **Worked-around attempts**:
+  - Pointer mode = host (explicit): no effect.
+  - Stream sync before call: no effect.
+  - batch_count = 1 with per-head loop: same crash.
+  - Smoke test (m=n=4): also crashes.
+- **Possible future fixes**:
+  1. Phrase the gemv as a tiny gemm via existing
+     `rocblas_gemm_strided_batched_ex` (which works and uses Tensile
+     gfx906 kernels), with `n=1`. May or may not pick a fast Tensile
+     kernel — if Tensile lacks a `n=1` fast path it'll just be the
+     same as our current matmul-based path.
+  2. Switch to rocm-6.4 librocblas (also available on this system) —
+     untested whether 6.4's sgemv kernel selection takes a different
+     path.
+  3. Build a custom mat-vec kernel in HIP. Bypasses rocBLAS entirely.
+     This is what we tried with `flash_attn_decode_strided` D=256/512
+     extension — regressed because of K-storage uncoalescing. Would
+     need a kernel that loads K T-major (which our storage isn't).
+  4. Change KvCache K storage from `(B, H, D, max_T)` to
+     `(B, H, max_T, D)` — natural layout for GEMV. Big refactor,
+     touches every flash-attn caller.
+- **Dispatch is gated `#[cfg(any())]`** in `attention.rs` — path
+  unreachable, default decode unaffected (verified 53.7 t/s post-revert
+  on E4B Q4_0). Toggle via `CANDLE_DECODE_GEMV_ON=1` AND remove the
+  cfg gate to reproduce the segfault.
 
 ## Order of attack
 

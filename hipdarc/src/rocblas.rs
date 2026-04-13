@@ -26,6 +26,14 @@ impl RocBlas {
         unsafe {
             check_rocblas(sys::rocblas_create_handle(&mut handle))?;
             check_rocblas(sys::rocblas_set_stream(handle, stream.raw()))?;
+            // Force host-pointer mode for alpha/beta. Default is supposed to
+            // be host but explicit setting avoids surprises if a different
+            // rocBLAS build flips the default (and matches what Phase O's
+            // sgemv wrapper assumes — alpha/beta passed as &T host pointers).
+            check_rocblas(sys::rocblas_set_pointer_mode(
+                handle,
+                sys::rocblas_pointer_mode::rocblas_pointer_mode_host,
+            ))?;
         }
         Ok(Self { handle })
     }
