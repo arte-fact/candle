@@ -562,11 +562,22 @@ impl ModelWeights {
                     // which is negligible vs the model's own Q4_0 main
                     // path. Opt-out via CANDLE_GEMMA4_PE_NO_REQUANT=1.
                     if std::env::var("CANDLE_GEMMA4_PE_NO_REQUANT").is_err() {
+                        // Quantization choice for the requantize: default Q8_0
+                        // (best precision among Q-types). User can override
+                        // via CANDLE_GEMMA4_PE_REQUANT_DTYPE=q4_0|q4_1|q5_0|q8_0.
+                        let dtype = match std::env::var("CANDLE_GEMMA4_PE_REQUANT_DTYPE")
+                            .ok().as_deref()
+                        {
+                            Some("q4_0") => candle::quantized::GgmlDType::Q4_0,
+                            Some("q4_1") => candle::quantized::GgmlDType::Q4_1,
+                            Some("q5_0") => candle::quantized::GgmlDType::Q5_0,
+                            _ => candle::quantized::GgmlDType::Q8_0,
+                        };
                         if let Some(ref mut m) = inp_gate {
-                            let _ = m.requantize_to(candle::quantized::GgmlDType::Q8_0);
+                            let _ = m.requantize_to(dtype);
                         }
                         if let Some(ref mut m) = proj {
-                            let _ = m.requantize_to(candle::quantized::GgmlDType::Q8_0);
+                            let _ = m.requantize_to(dtype);
                         }
                     }
                     if std::env::var("CANDLE_GEMMA4_PE_DTYPE_DEBUG").is_ok() && il == 0 {
@@ -677,6 +688,10 @@ impl ModelWeights {
         #[cfg(feature = "hip")]
         if g2_in_replay {
             candle::hip_backend::hipdarc::driver::decode_alloc_resume();
+            if std::env::var("CANDLE_G2_ALLOC_TRACE").is_ok() {
+                eprintln!("[G2-alloc] forward start: mode={:?}",
+                    candle::hip_backend::hipdarc::driver::decode_alloc_get_mode());
+            }
         }
 
         // ── G2/G3 eligibility check ──
@@ -1043,6 +1058,21 @@ impl ModelWeights {
                                 "[G2-gemma4] replay#{} idx={} output head: {:?}",
                                 plan.replay_count(), index_pos, head
                             );
+                            // Also dump inp_per_layer first 4 if present —
+                            // verify the prelude is actually refreshing the
+                            // anchor the captured per-layer kernels read from.
+                            if let Some(ref ipl) = inp_per_layer_param {
+                                let ipl_head: Vec<f32> = ipl
+                                    .narrow(ipl.rank() - 1, 0, 4.min(ipl.dim(ipl.rank()-1)?))?
+                                    .flatten_all()?
+                                    .to_vec1()?;
+                                eprintln!(
+                                    "[G2-gemma4] replay#{} inp_per_layer ptr=0x{:x} head4={:?}",
+                                    plan.replay_count(),
+                                    Self::hip_device_ptr(ipl)?,
+                                    ipl_head
+                                );
+                            }
                         }
                         // K13 deeper diagnostic: peek at every captured op's
                         // output buffer. Print only on replays 1 and 2 so we
@@ -1664,7 +1694,12 @@ impl ModelWeights {
                                 let inputs: Vec<decode_cache::ExternalInput> = prev_ptrs
                                     .iter()
                                     .zip(cur_ptrs.iter())
-                                    .map(|(&a, &b)| decode_cache::ExternalInput { first_ptr: a, second_ptr: b })
+                                    .zip(cur_bytes.iter())
+                                    .map(|((&a, &b), &n)| decode_cache::ExternalInput {
+                                        first_ptr: a,
+                                        second_ptr: b,
+                                        bytes: n,
+                                    })
                                     .collect();
 
                                 if let Some(mut plan) = decode_cache::DecodePlan::from_two_recordings_with_inputs(

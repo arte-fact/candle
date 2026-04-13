@@ -217,10 +217,18 @@ pub struct PatchLoc {
 /// (gemma4 with `per_layer_embeddings`) that have more than one freshly-
 /// allocated GPU input buffer per token. Each such input gets its own
 /// `InputAnchor` slot in the plan.
+///
+/// `bytes` is the input buffer size — used to detect captured args
+/// that point into the *middle* of the input (e.g. gemma4's per_layer
+/// chain narrows `inp_per_layer` per layer with offset
+/// `il * n_embd_per_layer * 4`, so the layer-N kernel arg has value
+/// `inp_per_layer.ptr() + N*stride` rather than the base ptr). Set to
+/// 0 to disable mid-buffer detection (matches only the base ptr).
 #[derive(Debug, Clone, Copy)]
 pub struct ExternalInput {
     pub first_ptr: usize,
     pub second_ptr: usize,
+    pub bytes: usize,
 }
 
 /// Stable per-input anchor: a fixed device address that captured ops
@@ -249,6 +257,12 @@ pub struct DecodePlan {
     /// plans populate it 1-to-1 with `external_patch_locs` and the caller
     /// uses `patch_external_input(idx, ptr)`.
     external_input_ids: Vec<usize>,
+    /// For each external_patch_locs entry, the byte offset INTO that
+    /// input's buffer. 0 for args matching the input's base ptr exactly;
+    /// nonzero for args that point inside the buffer (e.g. per-layer
+    /// narrows of `inp_per_layer`). On patch the new value is
+    /// `fresh_ptr + offset`.
+    external_offsets: Vec<i64>,
     /// Total number of fixed (stable) args.
     fixed_count: usize,
     /// Device pointer of the output buffer (last op's result).
@@ -425,6 +439,7 @@ impl DecodePlan {
             dynamic_kinds,
             external_patch_locs,
             external_input_ids: Vec::new(),
+            external_offsets: Vec::new(),
             fixed_count,
             output_ptr,
             output_f32_count,
@@ -524,6 +539,39 @@ impl DecodePlan {
         let mut dynamic_kinds = Vec::with_capacity(ops.len());
         let mut external_patch_locs: Vec<PatchLoc> = Vec::new();
         let mut external_input_ids: Vec<usize> = Vec::new();
+        let mut external_offsets: Vec<i64> = Vec::new();
+
+        // Helper: classify a captured u64 arg value.
+        // Returns Some((input_idx, offset)) if the value points anywhere
+        // INSIDE one of the registered inputs' buffer ranges.
+        // - For exact base-ptr matches: offset = 0.
+        // - For mid-buffer pointers (per-layer narrows): 0 < offset < bytes.
+        // The check uses `inp.bytes` to bound the range; with bytes=0 the
+        // input only matches its base ptr exactly.
+        let classify = |v: u64| -> Option<(usize, i64)> {
+            for (idx, inp) in inputs.iter().enumerate() {
+                let v = v as usize;
+                // Try first-recording's pointer + bytes range.
+                if inp.first_ptr != 0 {
+                    let lo = inp.first_ptr;
+                    let hi = inp.first_ptr.saturating_add(inp.bytes.max(1));
+                    if v >= lo && v < hi {
+                        return Some((idx, (v as i64) - (lo as i64)));
+                    }
+                }
+                // Try second-recording's pointer + bytes range. Both may
+                // be the same when the alloc is stable; if different,
+                // both are valid origins.
+                if inp.second_ptr != 0 && inp.second_ptr != inp.first_ptr {
+                    let lo = inp.second_ptr;
+                    let hi = inp.second_ptr.saturating_add(inp.bytes.max(1));
+                    if v >= lo && v < hi {
+                        return Some((idx, (v as i64) - (lo as i64)));
+                    }
+                }
+            }
+            None
+        };
 
         for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
             if a.func != b.func || a.arg_values.len() != b.arg_values.len() {
@@ -533,31 +581,27 @@ impl DecodePlan {
             let mut dyn_indices = Vec::new();
             let mut dyn_kinds = Vec::new();
             for (j, (va, vb)) in a.arg_values.iter().zip(b.arg_values.iter()).enumerate() {
-                if va != vb {
-                    // Determine which logical input (if any) this arg belongs
-                    // to. The first matching input wins — pointers are
-                    // assumed disjoint between inputs, which holds for
-                    // separate GPU allocations.
-                    let mut matched_input: Option<usize> = None;
-                    for (idx, inp) in inputs.iter().enumerate() {
-                        if inp.first_ptr as u64 == *va || inp.second_ptr as u64 == *vb
-                            || inp.first_ptr as u64 == *vb || inp.second_ptr as u64 == *va
-                        {
-                            matched_input = Some(idx);
-                            break;
-                        }
-                    }
-                    if let Some(input_idx) = matched_input {
-                        external_patch_locs.push(PatchLoc { op: i, arg: j });
-                        external_input_ids.push(input_idx);
-                        dyn_indices.push(j);
-                        dyn_kinds.push(DynArgKind::External);
-                    } else {
-                        let delta = *vb as i64 - *va as i64;
-                        dyn_indices.push(j);
-                        dyn_kinds.push(DynArgKind::Counter(delta));
-                    }
+                // First, does this arg point into one of the external
+                // inputs (either at the base or somewhere in the middle
+                // via narrow)? IMPORTANT: do this on STABLE args (va==vb)
+                // too — an input that happens to land at the same
+                // decode_alloc pool slot in both recordings would be
+                // marked Fixed by a diff-only check, but on REPLAY the
+                // prelude allocator may serve a different slot, leaving
+                // the captured kernel reading stale memory.
+                let cls = classify(*va).or_else(|| classify(*vb));
+                if let Some((input_idx, offset)) = cls {
+                    external_patch_locs.push(PatchLoc { op: i, arg: j });
+                    external_input_ids.push(input_idx);
+                    external_offsets.push(offset);
+                    dyn_indices.push(j);
+                    dyn_kinds.push(DynArgKind::External);
+                } else if va != vb {
+                    let delta = *vb as i64 - *va as i64;
+                    dyn_indices.push(j);
+                    dyn_kinds.push(DynArgKind::Counter(delta));
                 }
+                // Otherwise: stable + no input match → Fixed.
             }
             dynamic_args.push(dyn_indices);
             dynamic_kinds.push(dyn_kinds);
@@ -591,6 +635,7 @@ impl DecodePlan {
             dynamic_kinds,
             external_patch_locs,
             external_input_ids,
+            external_offsets,
             fixed_count,
             output_ptr,
             output_f32_count,
@@ -641,12 +686,21 @@ impl DecodePlan {
     }
 
     /// Patch every external arg slot belonging to the `input_idx`-th
-    /// logical input. Used by multi-input plans where each input has its
-    /// own anchor address.
+    /// logical input. Each slot gets `value + offset` where `offset` is
+    /// the byte offset INTO the input that was captured at plan-build
+    /// time (0 for base-ptr matches; nonzero for narrows like gemma4's
+    /// `inp_per_layer.narrow(2, il, 1)` that point into the middle of
+    /// the input buffer).
     pub fn patch_external_input(&mut self, input_idx: usize, value: usize) {
-        for (loc, &id) in self.external_patch_locs.iter().zip(self.external_input_ids.iter()) {
+        let has_offsets = !self.external_offsets.is_empty();
+        for (i, (loc, &id)) in self.external_patch_locs.iter()
+            .zip(self.external_input_ids.iter())
+            .enumerate()
+        {
             if id == input_idx {
-                self.ops[loc.op].arg_values[loc.arg] = value as u64;
+                let offset = if has_offsets { self.external_offsets[i] } else { 0 };
+                self.ops[loc.op].arg_values[loc.arg] =
+                    ((value as i64) + offset) as u64;
             }
         }
     }
@@ -932,27 +986,52 @@ impl DecodePlan {
         let _ = dev.stream().synchronize();
         let mut out = Vec::with_capacity(self.ops.len());
         for (idx, op) in self.ops.iter().enumerate() {
+            // For most kernels the output address sits in `arg_values[i]`
+            // for some i. Indices were verified by reading each kernel's
+            // call site in candle-core/src/hip_backend/mod.rs.
             let dst_arg: Option<usize> = match op.name.as_str() {
-                // Standard "src, dst, ...rest" pattern.
-                "rmsnorm_f32" | "rmsnorm_f16" | "rmsnorm_bf16"
-                | "rmsnorm_post_residual_f32"
-                | "rope_f32" | "rope_f16" | "rope_bf16"
-                | "ucopy_f32" | "ugelu_f32" | "usqr_f32" | "usqrt_f32"
-                | "utanh_f64"
-                | "affine_f32" | "affine_f64"
-                | "fast_sum_f32" | "fast_argmax_f32"
-                | "cast_f32_f64" | "cast_f64_f32"
-                | "quantize_q8_1"
-                | "copy2d_f32" => Some(1),
-                // Binary "lhs, rhs, dst, ...".
-                "bmul_f32" | "badd_f32" | "bdiv_f32" => Some(2),
-                // MMVQ: "vx, vy, dst, ncols, nrows, ...".
-                s if s.starts_with("mul_mat_vec_") => Some(2),
-                // Flash-attn ktvs: "q, k, v, mask, out, ...".
-                s if s.starts_with("flash_attn_v2_fwd_ktvs_") => Some(4),
-                // const_set: probably "dst, value, n" — output is dst[0].
+                // RmsNorm template (RMSNORM_OP): args = (src, dst, alpha,
+                // n_cols, block_size, eps). Output = arg[1].
+                "rmsnorm_f32" | "rmsnorm_f16" | "rmsnorm_bf16" => Some(1),
+                // rmsnorm_post_residual: (x, residual, dst, alpha,
+                // n_cols, block_size, eps). Output = arg[2].
+                "rmsnorm_post_residual_f32" => Some(2),
+                // copy2d: (src, dst, d1, d2, src_s, dst_s). Output = arg[1].
+                "copy2d_f32" => Some(1),
+                // Generic unary on HIP (Map1): (el_count, dims_len, ds,
+                // src, dst). Output = arg[4].
+                "ucopy_f32" | "ugelu_f32" | "usqr_f32" | "usqrt_f32"
+                | "utanh_f64" => Some(4),
+                // Generic binary on HIP (Map2): (el_count, dims_len, ds,
+                // lhs, rhs, dst). Output = arg[5].
+                "bmul_f32" | "badd_f32" | "bdiv_f32" => Some(5),
+                // affine: (el_count, dims_len, ds, src, dst, mul, add).
+                // Output = arg[4].
+                "affine_f32" | "affine_f64" => Some(4),
+                // cast: same shape as unary. Output = arg[4].
+                "cast_f32_f64" | "cast_f64_f32" => Some(4),
+                // fast_sum / fast_argmax: typically (src, dst, ...).
+                // Conservative guess; not used downstream so output index
+                // is mostly irrelevant.
+                "fast_sum_f32" | "fast_argmax_f32" => Some(1),
+                // const_set: (dst, value, n). Output = arg[0].
                 "const_set_f32" => Some(0),
-                // rmsnorm_q8_fused: "x, alpha, dst_q8, dst_f32, ...".
+                // RoPE: (src, dst, cos, sin, ...). Output = arg[1].
+                "rope_f32" | "rope_f16" | "rope_bf16" => Some(1),
+                // quantize_q8_1: (src, dst_q8, k, b_size). Output = arg[1].
+                // Note: dst is Q8_1 packed bytes, not f32 — head will look
+                // weird (raw bytes interpreted as f32) but the *change*
+                // across replays is still meaningful.
+                "quantize_q8_1" => Some(1),
+                // MMVQ via Q8_1: (vx_weight, vy_q8_1, dst, ncols, nrows,
+                // nrows_y, nrows_dst). Output = arg[2].
+                s if s.starts_with("mul_mat_vec_") => Some(2),
+                // Flash-attn ktvs: (q, k, v, mask, out, B, H_q, H_kv,
+                // L_q, L_k, scale, n_rep, mask_b_stride, mask_lq_stride,
+                // v_head_stride, v_stride_j, v_stride_d). Output = arg[4].
+                s if s.starts_with("flash_attn_v2_fwd_ktvs_") => Some(4),
+                // rmsnorm_q8_fused: (x, alpha, dst_q8, dst_f32, n_cols,
+                // block_size, eps). Two outputs; pick the f32 one.
                 "rmsnorm_q8_fused_f32" => Some(3),
                 _ => None,
             };
