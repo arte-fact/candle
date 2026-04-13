@@ -404,6 +404,124 @@ sgemv runtime.
   on E4B Q4_0). Toggle via `CANDLE_DECODE_GEMV_ON=1` AND remove the
   cfg gate to reproduce the segfault.
 
+**Closed (2026-04-13, superseded by Phase P).** Pursuing the alts
+revealed Phase O's premise was wrong in the first place:
+
+1. **O-alt-2 (rocm-6.3.4 rebuild) — DONE, partial success.** Rebuilt
+   candle against `ROCM_PATH=/opt/rocm-6.3.4`. Binary links
+   `librocblas.so.4` (6.3.4 soname), runs with
+   `LD_LIBRARY_PATH=/opt/rocm-6.3.4/lib`. **rocBLAS sgemv does NOT
+   crash on 6.3.4** — the comgr-JIT bug is specific to rocm-7.1.1's
+   rocBLAS sgemv kernel selection. Measured on E4B Q4_0 (52-tok +
+   63 decoded):
+     rocm-6.3.4 baseline   : 36.68 t/s
+     rocm-6.3.4 + GEMV     : 40.93 t/s   (+11.6 % vs same-rocm
+                                          baseline — gemv IS faster
+                                          when available)
+     rocm-7.1.1 baseline   : 52.03 t/s
+   So gemv itself is correct and wins on its native rocm, but
+   rocm-6.3.4 loses 30 % on non-gemv kernels (different Tensile
+   gfx906 kernels, rocm-7.1.1 is better for everything else). Net
+   loss. Rolled back to rocm-7.1.1.
+
+2. **Went back to the turbo rocprofv3 trace and looked harder** at
+   what `mul_mat_vec_f<float,float,1,128,false,false>` actually IS:
+   found it in `ggml-cuda/mmvf.cu`. **Not a rocBLAS sgemv call** —
+   it's ggml-cuda's own hand-written HIP kernel. So the whole
+   "wrap rocBLAS sgemv" premise was a misread of the trace.
+
+3. **ggml-cuda's mmvf kernel semantics** (`mmvf.cu:8` onwards):
+   - Grid: `blockIdx.x = row` (one block per output row).
+   - Threads in block iterate the reduced axis coalesced — read
+     `float2` pairs with stride = `block_size` floats. Adjacent
+     threads read adjacent memory → full coalescing.
+   - This assumes the matrix is row-major with the reduced axis
+     **contiguous in memory**.
+
+4. **Turbo's K layout IS T-major (`(B, H_kv, T, D)`)** — D contiguous,
+   which makes the Q·K^T mat-vec coalesce naturally. Candle's K is
+   **D-major (`(B, H_kv, D, max_T)`)** — T contiguous, because we
+   went T-major-in-the-cache to skip a K^T transpose in flash-attn.
+   That decision was right for flash-attn-v2 but it's EXACTLY what
+   makes mul_mat_vec_f impossible for us. Every prior gfx906
+   mat-vec-style attempt on candle hit the same uncoalescing wall:
+   - O scaffolding (sgemv_strided_batched, d1307b92): segfaulted on
+     rocm-7.1.1 AND would have been uncoalesced anyway.
+   - K-stride dyn flash-attn (67a03ebf): regressed 46.6 → 42.6 t/s.
+   - Decode-strided D=256/512 kernel (4967ab3e): 195 μs/call vs
+     flash_attn_v2's 89 μs/call.
+
+5. **Turbo's measured attention-on-gfx906:**
+     `mul_mat_vec_f<float,float>` × 84 calls/tok = 0.76 ms/tok
+     `soft_max_f32`              × 42 calls/tok = 0.22 ms/tok
+     **total attention: 0.98 ms/tok**
+   vs candle's `flash_attn_v2_fwd_ktvs_d256 + d512` = **3.98 ms/tok**.
+   3 ms/tok of avoidable GPU work = **+9 t/s** on E4B decode if we
+   match turbo's approach.
+
+**→ All further work tracked under Phase P (below).**
+
+### Phase P — K layout flip to T-major (2026-04-13)
+
+**Goal:** close the 3 ms/tok attention gap to turbo on E4B decode by
+switching KvCache K storage from `(B, H_kv, D, max_T)` to
+`(B, H_kv, max_T, D)` so that mat-vec style attention (llama.cpp's
+`mul_mat_vec_f` pattern) becomes coalesced on our layout.
+
+**Design target:**
+- `attn = K · q^T` becomes one mat-vec per q_head: blockIdx.x = t
+  (output index in T), threads stride along D (coalesced since D is
+  now contiguous).
+- `o = attn^T · V` — V is already T-major `(B, H_kv, T, D)`, fits
+  natively.
+- Softmax stays as the existing fused kernel.
+
+**Scope (ranked by blast radius):**
+- **P1 — KvCache layout.** `candle-nn/src/kv_cache.rs`: flip what
+  `k_is_transposed=true` means (current: D-major / stored `D,T`;
+  new: T-major / stored `T,D`). Consider just removing the flag and
+  standardising on T-major.
+- **P2 — Flash-attn kernels.** `candle-hip-kernels/src/flash_attn.cu`,
+  `flash_attn_v2.cu`: every kernel with the `K_TRANS` template arm
+  reads `k_ptr[d * L_k + row]`. Under T-major K that becomes
+  `k_ptr[row * D + d]`. The kernels need to be updated OR they need
+  to start taking explicit k_stride args. Easiest: swap the
+  semantics of `K_TRANS=true` to mean (T, D) row-major, update the
+  indexing in the one template, recompile. Every other kernel with
+  custom K-access (`flash_attn_decode_strided_*`, `ktvs_*`,
+  `flash_attn_v2_fwd_kt_*`) needs the same treatment.
+- **P3 — Callers.** `quantized_gemma4.rs`, `quantized_llama.rs`,
+  `quantized_qwen35.rs` all narrow K from the cache before attention.
+  Today: `k_full.narrow(3, 0, l_k_padded)`. Under T-major K the
+  narrow axis changes to 2: `k_full.narrow(2, 0, l_k_padded)`.
+  Grep + fix mechanically.
+- **P4 — Mat-vec attention kernel.** New HIP kernel mirroring the
+  `mul_mat_vec_f<float,float,1,128,false,false>` template but
+  taking explicit K strides (so it works even during the transition
+  while some callers still pass D-major K). Grid = (T, H_q, B),
+  block_size=128 (2 warps), threads coalesced along D. The
+  post-softmax `O = attn · V` is a second mat-vec; the V path works
+  natively since V is already T-major.
+- **P5 — Dispatch.** `gqa_attention_k_transposed` picks mat-vec for
+  `seq_len==1 && head_dim ≥ 128` ahead of flash_attn_v2_ktvs.
+
+**Effort estimate:** 2 days including full regression bench
+(TinyLlama, Qwen3.5-9B, Gemma4-E4B / 31B / 26B-MoE) to make sure no
+caller silently relies on the old D-major K.
+
+**Risks:**
+- Flash-attn-v2 prefill performance might regress if the new K
+  indexing is less friendly to the LDS-tile load pattern. Prefill
+  is already a separate bottleneck (Phase N); acceptable if decode
+  wins dominate.
+- G2/G3 captured plans will need re-recording across the layout
+  change — straightforward but means re-verifying Phase K
+  correctness afterwards.
+
+**Expected result:** E4B decode 52 → ~60-65 t/s (close most of the
+gap to turbo's 75 t/s; residual gap is MMVQ tuning per Phase L and
+CPU overhead).
+
 ## Order of attack
 
 ```
