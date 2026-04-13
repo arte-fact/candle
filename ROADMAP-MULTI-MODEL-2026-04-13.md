@@ -285,6 +285,106 @@ board. Mostly Phase I covers this (MMQ). Also:
 
 **Effort:** 1 day after Phase H.
 
+### Phase O — rocBLAS GEMV attention for Gemma4-E4B decode (2026-04-13)
+
+**Target:** close the 3.4 ms/tok attention gap to llama.cpp-turbo on E4B
+decode. Per-kernel comparison via rocprofv3:
+
+| Op | turbo (E4B Q4_0 decode, ms/tok) | candle (post-Phase L dyn-lk) |
+|---|---|---|
+| Attention (gemv + softmax) | **0.6** | **3.98** (flash_attn_v2 d256 + d512) |
+
+That's the single biggest remaining gap. Closing it would push candle
+E4B decode from ~52 t/s toward turbo's 75 t/s.
+
+**Why our flash-attn loses:** the v2 LDS-tiled kernel runs at 89 μs/call
+for D=256. For L_q=1 decode with GQA n_rep=2, BR=4 warps cooperate to
+load a BC=16 K-tile into LDS — but only 2 of those BR warps have a
+real Q-row (n_head=2 per kv_head), so half the LDS cooperative-load
+work is wasted. Plus the cross-warp `__syncthreads` after each tile
+serialises against the inner softmax pass.
+
+**Why a naive 1-warp-per-q_head GEMV ALSO loses** (tried 2026-04-13,
+commit `4967ab3e`): KvCache K is `(B, H_kv, D, max_T)` D-major. The
+GEMV pattern `K[lane * max_T + j]` (each lane owns one of D
+elements, iterates over j) makes adjacent lanes read max_T=4096
+floats apart — fully uncoalesced. Regression: 50.3 → 43.1 t/s.
+
+**Plan — wrap rocBLAS gemv directly:**
+
+- **O1** — Add `hipblasSgemv` wrapper to `hipdarc/src/rocblas.rs`. This
+  bypasses rocBLAS's gemm-based attention dispatch (which the Tensile
+  picker won't touch for our (1×D)·(D×T) shape — it falls back to a
+  generic gemm internally). Direct gemv lets rocBLAS pick its hand-
+  tuned MI50 gemv kernel, which IS what turbo's `mul_mat_vec_f<float,
+  float, ...>` is calling under the hood (their llama.cpp hipBLAS
+  build redirects `mul_mat_vec_f` to `hipblasSgemv` for f32×f32).
+
+- **O2** — In `gqa_attention_k_transposed`, when `seq_len == 1` and
+  D∈{128,256,512}, use the gemv path instead of flash_attn_v2:
+  ```
+  // For each kv_head h:
+  //   attn = K[h, :, :].T @ Q_grouped[h, :, :]  → shape (n_rep, T)
+  //   attn = scale * attn + mask
+  //   attn = softmax(attn)
+  //   out[h, :, :] = V[h, :, :] @ attn          → shape (n_rep, D)
+  ```
+  Each "matmul" is 2 gemv calls per kv_head (one for K, one for V).
+  For E4B SWA d256: n_kv_head ~16, so ~32 gemv calls/layer ×
+  42 layers = 1344 gemv calls/token. At ~0.4 μs each = 0.55 ms/tok —
+  matches turbo's number.
+
+- **O3** — Reuse the existing `masked_softmax_scale_fused` kernel for
+  the softmax step (already optimal).
+
+- **O4** — Verify rocBLAS gemv is captured by the G2 plan recorder
+  (`hipblasSgemv` dispatches to a HIP launch under the hood — should
+  be visible). If not, gate this path off when `CANDLE_G2_REPLAY=1`
+  and keep the v2 dyn-lk kernel for replay.
+
+**Effort:** 2-3 days. Most of it is the hipdarc gemv binding +
+plumbing the per-kv-head dispatch loop.
+
+**Risks:**
+- rocBLAS `hipblasSgemv` may itself dispatch through Tensile gemm and
+  not actually use the fast hand-tuned kernel — verify with rocprofv3
+  that the kernel name matches turbo's `mul_mat_vec_f<float,float,...>`.
+- Per-call CPU overhead from issuing many gemv launches (1344/tok)
+  may eat the win. If so, batch via `hipblasSgemvBatched`.
+- Won't help D=64/128 (those already use a fast `flash_attn_decode_*`
+  path) — only Gemma4-E4B's wide-head SWA layers benefit.
+
+**Expected outcome:** E4B decode 52 → ~70 t/s (matches turbo within
+noise). No effect on llama / TinyLlama (those use D=64 / 128 with the
+existing fast path).
+
+**Status (2026-04-13)**: scaffolding committed but blocked.
+- O1 (FFI binding) DONE. Added `rocblas_sgemv_strided_batched` in
+  `hipdarc/src/sys.rs` and `sgemv_strided_batched` safe wrapper in
+  `hipdarc/src/rocblas.rs`. Builds clean against ROCm 7.1.1
+  librocblas.so.5 (symbol verified via `nm -D`).
+- O2 (dispatch) DONE shape-wise (`gqa_attention_decode_gemv` in
+  `flash_attn.rs`) but SEGFAULTS on first sgemv call. Bracketed
+  eprintln before/after the call confirm the binding entry is reached
+  and the "after" never fires. Tested with both `batch_count > 1` and
+  `batch_count == 1` (per-head loop) — same crash. Stream synced
+  before the call — same crash.
+- Suspected issues to investigate next:
+  1. rocBLAS pointer mode default vs. our host alpha/beta. Try
+     `rocblas_set_pointer_mode_host` explicitly in `RocBlas::new`.
+  2. lda alignment on MI50 — for short contexts m=t_k is small (~22)
+     but lda=max_T (4096). Try staging K into a contiguous (m, n)
+     buffer first to test if lda mismatch is the cause.
+  3. Parameter struct layout — diff our binding signature against
+     `<rocblas/rocblas-functions.h>` to verify type widths match.
+  4. Test with `rocblas-bench` standalone using the same dimensions to
+     confirm the rocBLAS install handles `m=22 lda=4096 batch=2` on
+     gfx906 — if rocblas-bench also crashes, the library / kernel
+     library is the issue (try ROCm 6.4 instead).
+- Dispatch in `attention.rs` is gated `#[cfg(any())]` — the path is
+  unreachable until O2 is unblocked. Set `CANDLE_DECODE_GEMV_ON=1` and
+  remove the cfg gate to reproduce.
+
 ## Order of attack
 
 ```

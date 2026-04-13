@@ -114,6 +114,62 @@ pub struct StridedBatchedGemmConfig {
     pub compute_type: GemmDataType,
 }
 
+/// Configuration for a strided-batched f32 GEMV call.
+///
+/// Computes `y[i] = alpha * op(A[i]) * x[i] + beta * y[i]` for i in
+/// 0..batch_count, where A[i] = A_base + i*stride_a (etc.).
+///
+/// Used by the gemma4-E4B decode attention path: per kv_head, we run
+/// one gemv for K^T·Q (shape (T,D)·(D,n_rep)) and a second for V·attn
+/// (shape (D,T)·(T,n_rep)). batch_count = n_kv_head per layer.
+#[derive(Debug, Clone)]
+pub struct StridedBatchedSgemvConfig {
+    pub trans: GemmOp,
+    pub m: i32,
+    pub n: i32,
+    pub lda: i32,
+    pub stride_a: i64,
+    pub incx: i32,
+    pub stride_x: i64,
+    pub incy: i32,
+    pub stride_y: i64,
+    pub batch_count: i32,
+}
+
+/// Execute a strided-batched single-precision GEMV.
+///
+/// # Safety
+/// Device pointers `a`, `x`, `y` must be valid and correctly sized. `alpha`
+/// and `beta` are host-side f32 scalars (rocBLAS host-pointer mode).
+pub unsafe fn sgemv_strided_batched(
+    blas: &RocBlas,
+    cfg: &StridedBatchedSgemvConfig,
+    alpha: f32,
+    a: *const f32,
+    x: *const f32,
+    beta: f32,
+    y: *mut f32,
+) -> Result<(), RocblasError> {
+    check_rocblas(sys::rocblas_sgemv_strided_batched(
+        blas.handle,
+        cfg.trans.to_raw(),
+        cfg.m,
+        cfg.n,
+        &alpha as *const f32,
+        a,
+        cfg.lda,
+        cfg.stride_a,
+        x,
+        cfg.incx,
+        cfg.stride_x,
+        &beta as *const f32,
+        y,
+        cfg.incy,
+        cfg.stride_y,
+        cfg.batch_count,
+    ))
+}
+
 /// Execute a strided-batched GEMM: C = alpha * op(A) * op(B) + beta * C.
 ///
 /// # Safety

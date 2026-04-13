@@ -18,7 +18,7 @@ mod gated_delta_net;
 mod utils;
 pub use device::{HipDevice, DeviceId};
 pub use error::{HipError, WrapErr};
-pub use flash_attn::{flash_attn_decode_strided, flash_attn_decode_strided_split_k, flash_attn_fused, flash_attn_v2_fused, flash_attn_v2_kt_fused, flash_attn_v2_kt_strided_v, flash_attn_v2_kt_strided_v_dyn};
+pub use flash_attn::{flash_attn_decode_strided, flash_attn_decode_strided_split_k, flash_attn_fused, flash_attn_v2_fused, flash_attn_v2_kt_fused, flash_attn_v2_kt_strided_v, flash_attn_v2_kt_strided_v_dyn, gqa_attention_decode_gemv};
 pub use fused_pointwise::{
     fused_ffn_decode_q4_0, l2_norm_fused, masked_softmax_scale_fused,
     rms_norm_post_residual_fused, rmsnorm_q8_fused,

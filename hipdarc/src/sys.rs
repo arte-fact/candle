@@ -320,6 +320,29 @@ extern "C" {
         solution_index: i32,
         flags: u32,
     ) -> rocblas_status;
+
+    /// Strided-batched single-precision matrix-vector multiply.
+    /// `y[batch] = alpha * op(A[batch]) * x[batch] + beta * y[batch]`
+    /// where each A is (m, n), x is length n (or m if transposed), y is
+    /// length m (or n if transposed). Strides advance the batch.
+    pub fn rocblas_sgemv_strided_batched(
+        handle: rocblas_handle,
+        trans: rocblas_operation,
+        m: c_int,
+        n: c_int,
+        alpha: *const f32,
+        a: *const f32,
+        lda: c_int,
+        stride_a: i64,
+        x: *const f32,
+        incx: c_int,
+        stride_x: i64,
+        beta: *const f32,
+        y: *mut f32,
+        incy: c_int,
+        stride_y: i64,
+        batch_count: c_int,
+    ) -> rocblas_status;
 }
 
 // ---------------------------------------------------------------------------

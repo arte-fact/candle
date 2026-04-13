@@ -1136,3 +1136,287 @@ pub fn flash_attn_v2_kt_strided_v(
         <Shape as From<(usize,usize,usize,usize)>>::from((b,nh,lq,d)),
         BackpropOp::none(), false))
 }
+
+/// Decode-only L_q=1 attention via rocBLAS strided-batched sgemv. Mirrors
+/// the kernel turbo's llama.cpp dispatch (`mul_mat_vec_f<float,float,...>`)
+/// uses for E4B-style wide-head decode (D=256/512). For each `q_row`
+/// (n_rep entries per kv_head), one batched sgemv per direction:
+///
+/// 1. attn[h, r, :]  = K[h]^T · q[h, r, :]  (m=t_k, n=D, NoTrans)
+/// 2. softmax(scale * attn + mask)
+/// 3. o[h, r, :]     = V[h]^T · attn[h, r, :]  (m=t_k, n=D, Trans)
+///
+/// Shapes:
+/// - `q`:    (B, n_head,    L_q=1, D) contiguous f32
+/// - `k_t`:  (B, n_kv_head, D, T_pad) — narrow'd KvCache view
+///   (strides `(H*D*max_T, D*max_T, max_T, 1)`)
+/// - `v`:    (B, n_kv_head, T_pad, D) — narrow'd KvCache transpose view
+///   (strides `(H*D*max_T, D*max_T, 1, max_T)`)
+/// - `mask`: optional `(1, 1, 1, T_mask)` f32 with `T_mask >= t_k`
+///
+/// `t_k` is the actual attended length (≤ T_pad). The kernel reads K[..., 0..t_k]
+/// and V[0..t_k, ...] only.
+///
+/// Returns `(B, n_head, L_q=1, D)`.
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_decode_gemv(
+    q: &Tensor,
+    k_t: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+    scale: f64,
+    t_k: usize,
+) -> Result<Tensor> {
+    use hipdarc::rocblas::{sgemv_strided_batched, GemmOp, StridedBatchedSgemvConfig};
+
+    let dev = match q.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("gqa_attention_decode_gemv: q must be HIP"),
+    };
+    let (b, n_head, l_q, d) = q.dims4()?;
+    if l_q != 1 {
+        crate::bail!("gqa_attention_decode_gemv: requires L_q=1, got {l_q}");
+    }
+    if q.dtype() != DType::F32 {
+        crate::bail!("gqa_attention_decode_gemv: q must be f32");
+    }
+    if !q.is_contiguous() {
+        crate::bail!("gqa_attention_decode_gemv: q must be contiguous");
+    }
+
+    let n_kv = k_t.dim(1)?;
+    if n_head % n_kv != 0 {
+        crate::bail!("gqa_attention_decode_gemv: n_head % n_kv != 0");
+    }
+    let n_rep = n_head / n_kv;
+
+    let kd = k_t.dim(2)?;
+    if kd != d {
+        crate::bail!("gqa_attention_decode_gemv: K dim2 ({kd}) != q dim3 ({d})");
+    }
+
+    // K strides: (H*D*max_T, D*max_T, max_T, 1) — see callsite docs.
+    // We need head stride and dim-D stride; the kernel reads K[d * max_T + j].
+    let k_strides = k_t.layout().stride();
+    let k_head_stride = k_strides[1] as i64;
+    let k_lda = k_strides[2] as i32; // = max_T
+
+    // V layout depends on the cache: gemma4 keeps V canonical (T_pad, D)
+    // row-major, so strides are (H*D*T_pad, D*T_pad, D, 1). Some other
+    // models pre-transpose V to (D, T_pad) — strides (..., 1, T_pad).
+    // Detect by checking which of stride[2]/stride[3] is == 1 (the
+    // contiguous dim).
+    let v_strides = v.layout().stride();
+    let v_head_stride = v_strides[1] as i64;
+    let v_t_contig = v_strides[2] == 1; // V is (D, T_pad) with T-axis contiguous
+    let v_lda = if v_t_contig {
+        v_strides[3] as i32 // T_pad
+    } else {
+        v_strides[2] as i32 // D, V is (T_pad, D) D-axis contiguous
+    };
+
+    // Storage + base pointers for Q/K/V.
+    let (q_st, q_l) = q.storage_and_layout();
+    let (k_st, k_l) = k_t.storage_and_layout();
+    let (v_st, v_l) = v.storage_and_layout();
+
+    let q_hip = match &*q_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gqa_attention_decode_gemv: q storage not HIP"),
+    };
+    let k_hip = match &*k_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gqa_attention_decode_gemv: k storage not HIP"),
+    };
+    let v_hip = match &*v_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gqa_attention_decode_gemv: v storage not HIP"),
+    };
+    let q_slice = q_hip.as_hip_slice::<f32>()?;
+    let k_slice = k_hip.as_hip_slice::<f32>()?;
+    let v_slice = v_hip.as_hip_slice::<f32>()?;
+
+    let q_base = q_slice.slice(q_l.start_offset()..q_slice.len());
+    let k_base = k_slice.slice(k_l.start_offset()..k_slice.len());
+    let v_base = v_slice.slice(v_l.start_offset()..v_slice.len());
+
+    // Mask handling — only used in step 2's masked_softmax_scale_fused.
+    // Validate shape compat now so we bail before allocating.
+    if let Some(m) = mask {
+        let md = m.dims();
+        let last = *md.last().unwrap();
+        if last < t_k {
+            crate::bail!("gqa_attention_decode_gemv: mask last ({last}) < t_k ({t_k})");
+        }
+    }
+
+    let dbg = std::env::var("CANDLE_DECODE_GEMV_DEBUG").is_ok();
+    if dbg {
+        eprintln!(
+            "[gemv] b={b} n_head={n_head} n_kv={n_kv} n_rep={n_rep} d={d} t_k={t_k} \
+             k_strides={:?} v_strides={:?} v_t_contig={v_t_contig}",
+            k_strides, v_strides
+        );
+    }
+
+    let blas = dev.rocblas_handle()?;
+    if dbg { eprintln!("[gemv] got blas handle"); }
+    if dbg {
+        // Sync to flush any pending kernels before rocBLAS call.
+        let _ = dev.stream().synchronize();
+        eprintln!("[gemv] stream synced");
+    }
+
+    // Per-head Q layout under reshape (B, n_kv, n_rep*L_q=n_rep, D):
+    //   q[b][h_kv][r][d] = q_orig[b][h_kv*n_rep + r][0][d]
+    // Q is contiguous so memory is unchanged: stride is (H_kv*n_rep*D, n_rep*D, D, 1).
+    // For sgemv batched on h_kv with fixed r:
+    //   per-batch x base = q_base + h_kv * (n_rep*D) + r * D
+    //   stride_x (per batch step) = n_rep * D
+    let q_per_row_stride = (n_rep * d) as i64;
+
+    // Allocate attn_weights buffer (B, H_kv, n_rep, t_k) contiguous f32.
+    let attn_total_elts = b * n_kv * n_rep * t_k;
+    let attn_buf = unsafe { dev.alloc::<f32>(attn_total_elts)? };
+    let attn_view = attn_buf.slice(0..attn_buf.len());
+
+    // Step 1: attn[h, r, :] = K[h]^T · q[h, r, :]
+    // rocBLAS NoTrans on A=K_h (rocblas-view (T, D), lda=max_T) gives
+    // y = A · x : T-vector. We want this for each (h, r). Stride between
+    // batches (varying h, fixed r) for output: per-h stride = n_rep * t_k.
+    let cfg_qk = StridedBatchedSgemvConfig {
+        trans: GemmOp::NoTrans,
+        m: t_k as i32,
+        n: d as i32,
+        lda: k_lda,
+        stride_a: k_head_stride,
+        incx: 1,
+        stride_x: q_per_row_stride,
+        incy: 1,
+        stride_y: (n_rep * t_k) as i64,
+        batch_count: n_kv as i32,
+    };
+    // TEMP: per-head loop instead of strided-batched to isolate.
+    let cfg_qk_one = StridedBatchedSgemvConfig {
+        trans: GemmOp::NoTrans,
+        m: t_k as i32,
+        n: d as i32,
+        lda: k_lda,
+        stride_a: 0,
+        incx: 1,
+        stride_x: 0,
+        incy: 1,
+        stride_y: 0,
+        batch_count: 1,
+    };
+    for r in 0..n_rep {
+        for h in 0..n_kv {
+            let q_off = h * n_rep * d + r * d;
+            let y_off = h * n_rep * t_k + r * t_k;
+            let k_off = h * (k_head_stride as usize);
+            let k_p = (k_base.device_ptr() as *const f32).wrapping_add(k_off);
+            let q_p = (q_base.device_ptr() as *const f32).wrapping_add(q_off);
+            let y_p = (attn_view.device_ptr() as *mut f32).wrapping_add(y_off);
+            if dbg && r == 0 && h == 0 {
+                eprintln!("[gemv] K^T·Q first call k_p={:p} q_p={:p} y_p={:p}", k_p, q_p, y_p);
+            }
+            unsafe {
+                sgemv_strided_batched(blas, &cfg_qk_one, 1.0, k_p, q_p, 0.0, y_p)
+                    .map_err(|e| HipError::InternalError(
+                        Box::leak(format!("sgemv K^T·Q (r={r},h={h}) failed: {e:?}").into_boxed_str())
+                    ))?;
+            }
+        }
+    }
+    if dbg { eprintln!("[gemv] K^T·Q all done"); }
+
+    // Step 2: softmax(scale * attn + mask). Reshape attn to (B, n_head, 1, t_k)
+    // — zero-copy since memory layout matches.
+    let attn_storage = HipStorage::wrap_hip_slice(attn_buf, dev.clone());
+    let attn_tensor = Tensor::from_storage(
+        Storage::Hip(attn_storage),
+        <Shape as From<(usize, usize, usize, usize)>>::from((b, n_head, 1usize, t_k)),
+        BackpropOp::none(),
+        false,
+    );
+    let attn_softmaxed = super::masked_softmax_scale_fused(&attn_tensor, mask, scale)?;
+
+    // Step 3: o[h, r, :] = V[h]^T · attn[h, r, :]
+    // Output layout (B, H_kv, n_rep, D) contiguous → reshape (B, n_head, 1, D).
+    let out_total_elts = b * n_kv * n_rep * d;
+    let out_buf = unsafe { dev.alloc::<f32>(out_total_elts)? };
+    let out_view = out_buf.slice(0..out_buf.len());
+
+    // Re-borrow attn after softmax (it may be a fresh tensor).
+    let (att_st, att_l) = attn_softmaxed.storage_and_layout();
+    let att_hip = match &*att_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gqa_attention_decode_gemv: softmax storage not HIP"),
+    };
+    let att_slice = att_hip.as_hip_slice::<f32>()?;
+    let att_base = att_slice.slice(att_l.start_offset()..att_slice.len());
+
+    // For V step: O = V^T · attn (D-vec).
+    // - If V is (T_pad, D) canonical (D-contig): A_rocblas = V^T view via
+    //   col-major with lda=D, op=NoTrans, m=D, n=t_k.
+    // - If V is (D, T_pad) pre-transposed (T-contig): A_rocblas = V via
+    //   col-major with lda=T_pad, op=Trans, m=t_k, n=D.
+    let cfg_av = if v_t_contig {
+        StridedBatchedSgemvConfig {
+            trans: GemmOp::Trans,
+            m: t_k as i32,
+            n: d as i32,
+            lda: v_lda,
+            stride_a: v_head_stride,
+            incx: 1,
+            stride_x: (n_rep * t_k) as i64,
+            incy: 1,
+            stride_y: (n_rep * d) as i64,
+            batch_count: n_kv as i32,
+        }
+    } else {
+        StridedBatchedSgemvConfig {
+            trans: GemmOp::NoTrans,
+            m: d as i32,
+            n: t_k as i32,
+            lda: v_lda,
+            stride_a: v_head_stride,
+            incx: 1,
+            stride_x: (n_rep * t_k) as i64,
+            incy: 1,
+            stride_y: (n_rep * d) as i64,
+            batch_count: n_kv as i32,
+        }
+    };
+    for r in 0..n_rep {
+        let x_off = r * t_k;
+        let y_off = r * d;
+        unsafe {
+            sgemv_strided_batched(
+                blas,
+                &cfg_av,
+                1.0,
+                v_base.device_ptr() as *const f32,
+                (att_base.device_ptr() as *const f32).add(x_off),
+                0.0,
+                (out_view.device_ptr() as *mut f32).add(y_off),
+            )
+            .map_err(|e| HipError::InternalError(
+                Box::leak(format!("sgemv V^T·attn failed: {e:?}").into_boxed_str())
+            ))?;
+        }
+    }
+
+    drop(q_st);
+    drop(k_st);
+    drop(v_st);
+    drop(att_st);
+
+    let out_storage = HipStorage::wrap_hip_slice(out_buf, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        <Shape as From<(usize, usize, usize, usize)>>::from((b, n_head, 1usize, d)),
+        BackpropOp::none(),
+        false,
+    ))
+}

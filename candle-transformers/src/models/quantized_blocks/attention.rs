@@ -238,6 +238,42 @@ pub(crate) fn gqa_attention_k_transposed(
                 Some(m) => Some(if m.is_contiguous() { m.clone() } else { m.contiguous()? }),
             };
 
+            // Phase O — rocBLAS GEMV-based decode attention (L_q=1, D≥128).
+            // Implementation in `candle::hip_backend::gqa_attention_decode_gemv`
+            // dispatches K^T·Q and V·attn through `rocblas_sgemv_strided_batched`,
+            // aiming to match llama.cpp-turbo's `mul_mat_vec_f<float,float,...>`
+            // path (turbo runs E4B SWA attention at ~0.6 ms/tok, candle's v2
+            // LDS-tiled kernel at ~4 ms/tok).
+            //
+            // Status (2026-04-13): WIP. The wired path SEGFAULTS inside
+            // `rocblas_sgemv_strided_batched` on first call (verified via
+            // bracketed eprintln before/after; the "after" never fires).
+            // FFI binding + safe wrapper compile and link clean against
+            // ROCm 7.1.1 librocblas.so.5 (`rocblas_sgemv_strided_batched`
+            // symbol verified via `nm -D`). Suspected causes:
+            //   - rocBLAS pointer mode default vs. host alpha/beta
+            //   - lda alignment requirement on MI50 (lda=4096 is large
+            //     vs m=22 for short t_k)
+            //   - parameter ordering / type packing in the FFI binding
+            // The dispatch is gated OFF below. Set
+            // `CANDLE_DECODE_GEMV_ON=1` to opt in (and reproduce the
+            // segfault for further debugging).
+            #[cfg(any())] // disabled — see Phase O notes above
+            {
+                let lk_iter = FLASH_L_K_ITER_OVERRIDE.with(|c| c.get());
+                if seq_len == 1
+                    && lk_iter.is_none()
+                    && matches!(head_dim, 128 | 256 | 512)
+                    && std::env::var("CANDLE_DECODE_GEMV_ON").is_ok()
+                {
+                    if let Ok(o) = candle::hip_backend::gqa_attention_decode_gemv(
+                        &q_c, k_t, v, mask_c.as_ref(), attn_scale, t_k,
+                    ) {
+                        return Ok(o);
+                    }
+                }
+            }
+
             // Note (2026-04-13): tried routing D=256/512 L_q=1 decode to
             // `flash_attn_decode_strided` (1-warp-per-q_head GEMV-style)
             // hoping to mirror turbo's ~0.6 ms/tok gemv+softmax dispatch.
