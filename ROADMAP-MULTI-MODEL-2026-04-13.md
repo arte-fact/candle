@@ -114,14 +114,47 @@ first, otherwise G2 replay divergence returns).
     per device boundary. Multi-device 31B G2 plan now builds cleanly
     (2109 ops, 5 anchors) without the `hipErrorInvalidImage` crash.
 
-**Remaining (K10):** both E4B single-GPU and 31B multi-GPU fail at the
-first replay with a `" I I I I"` loop + rocBLAS error. `layer_in` is
-verified refreshed each replay
-(`CANDLE_G2_REPLAY_TRACE=1`); captured plan has 432 (E4B) / 720 (31B)
-Counter args that should advance positions; but `lm_head` emits a
-stale token. Likely a Counter arg miscategorized as Fixed (KV cache
-slice_set offset?), or one of the per-layer ops reads from a stale
-intermediate buffer. Not a multi-device issue.
+**Remaining (K10):** both E4B single-GPU and 31B multi-GPU fail at
+first replay with a `" I I I I"` loop + rocBLAS error. Detailed
+diagnostics (commit d7a47c35):
+
+  - `layer_in`, `inp_per_layer`, and SWA mask are all verified refreshed
+    per call — prelude memcpys hit the sentinel-anchored pool slots
+    that the captured kernels read from.
+  - `advance_counters` mutates all 432 (E4B) / 720 (31B) Counter args.
+    Delta histogram shows the strides we'd expect: 110× delta=512
+    (RoPE cos/sin advance per token at head_dim/2 stride), 42× 1024
+    and 4× 2048 (K-cache slice_set per-token pointer advances), 84×
+    delta=1 (position counters).
+  - Yet `lm_head` emits **byte-identical logits across all 4 replays**:
+
+        replay#1 idx=14 head: [-23.92, -10.76, -21.68, …]
+        replay#2 idx=15 head: [-23.92, -10.76, -21.68, …]
+        replay#3 idx=16 head: [-23.92, -10.76, -21.68, …]
+        replay#4 idx=17 head: [-23.92, -10.76, -21.68, …]
+
+    Some critical kernel arg that the lm_head output transitively
+    depends on isn't in the dynamic set, so the captured chain is a
+    constant function of the current cache state.
+
+  Two prime suspects:
+    1. The attention K-pointer arg in the rocBLAS `Cijk_*` batched-gemm
+       kernel may be captured as `cache_base + recorded_offset` rather
+       than just `cache_base + 0`. The K narrow always spans
+       `(0..pad_t)`, so the slice_set Counter advance updates the
+       cache content at position N+1, but if the gemm reads
+       `cache_base + N*stride` (recorded), it won't see the new K at
+       position N+1. The right Counter delta would then need to apply
+       to the gemm K-arg, not just to slice_set's dst.
+    2. rocBLAS may cache solution-internal state across calls — the
+       captured `Cijk_*` launches don't go through the rocBLAS handle
+       on replay (we relaunch the kernel directly), but the trailing
+       `rocBLAS error during freeing of allocated memory` suggests
+       handle-side state corruption.
+
+  Concrete debug step: dump per-op arg layout (name + size + role) at
+  recording time, then cross-reference the static-vs-dynamic
+  classification against expectations. Saved as a follow-up task.
 
 Default path (G2 disabled) verified intact — Gemma4-E4B Q4_0 still
 emits `"Hello! How can I help you today?"` at the baseline 47 t/s
