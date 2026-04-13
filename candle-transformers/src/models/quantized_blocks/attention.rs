@@ -178,14 +178,30 @@ pub(crate) fn gqa_attention_k_transposed(
         // v2's LDS-tiled kernel is typically faster than rocBLAS for
         // narrow L_k (<=128 observed), but rocBLAS wins for wider T —
         // v2's BC=64 outer loop isn't unrolled and occupancy is limited.
-        // When G2 replay is active, we pad L_k to 256 so rocBLAS becomes
-        // the decisive winner; turn v2 off entirely in that mode.
-        let v2_threshold: usize = if std::env::var("CANDLE_G2_REPLAY").is_ok() {
-            0 // skip v2 → always rocBLAS
-        } else {
-            std::env::var("CANDLE_FLASH_V2_MAX_LK")
-                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(512)
-        };
+        //
+        // Llama path with G2 replay padded L_k to 256 and used rocBLAS
+        // (which on the llama path is itself recordable via its own
+        // captured kernels — proven to work for that family). For
+        // gemma4, rocBLAS is invoked through the strided-batched-ex C
+        // API which does NOT go through `LaunchArgs::launch`, so the
+        // G2 launch_recorder hook never sees the attention gemms — the
+        // captured plan replays only the surrounding kernels (norm,
+        // proj, RoPE, slice_set, softmax, …) while the gemms stay at
+        // recording-time output, freezing every replay's logits.
+        // Force flash-attn-v2 when `CANDLE_G2_REPLAY=1` so the
+        // attention kernels DO get captured. The user can opt back to
+        // the rocBLAS path with `CANDLE_FLASH_V2_MAX_LK=0`.
+        let v2_threshold: usize = std::env::var("CANDLE_FLASH_V2_MAX_LK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(if std::env::var("CANDLE_G2_REPLAY").is_ok() {
+                // High enough to cover any single-batch padded L_k we'd
+                // realistically G2-replay (n_kv pad defaults to 256;
+                // 4096 covers up to 4k context replays).
+                4096
+            } else {
+                512
+            });
         if !strided_off
             && !v.is_contiguous()
             && t_k <= v2_threshold
