@@ -61,10 +61,36 @@ pub fn causal_mask(
     dtype: DType,
     device: &Device,
 ) -> Result<Tensor> {
-    let total = seq_len + offset;
+    causal_mask_padded(batch, seq_len, offset, sliding_window, dtype, device, 0)
+}
+
+/// Like [`causal_mask`] but pads the result's last dim out to at least
+/// `pad_to` columns. Positions beyond `seq_len + offset` are filled with
+/// -inf so the masked softmax ignores them.
+///
+/// Returns a mask of shape (batch, 1, seq_len, max(seq_len + offset, pad_to)).
+///
+/// Used by the G2 decode replay path (gemma4): the captured plan needs
+/// the mask `last_dim` to be stable across replays even though
+/// `seq_len + offset` grows by 1 per token until it exceeds the pad
+/// threshold.
+pub fn causal_mask_padded(
+    batch: usize,
+    seq_len: usize,
+    offset: usize,
+    sliding_window: Option<usize>,
+    dtype: DType,
+    device: &Device,
+    pad_to: usize,
+) -> Result<Tensor> {
+    let live = seq_len + offset;
+    let total = live.max(pad_to);
     let mask: Vec<f32> = (0..seq_len)
         .flat_map(|i| {
             (0..total).map(move |j| {
+                if j >= live {
+                    return f32::NEG_INFINITY;
+                }
                 let causal_ok = j <= i + offset;
                 let sw_ok = match sliding_window {
                     Some(w) => (i + offset) as i64 - j as i64 <= w as i64,

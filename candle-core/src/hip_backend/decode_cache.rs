@@ -89,21 +89,17 @@ where
         // still try to call into a stale closure.
         set_launch_recorder(None);
     }
-    // Pause the decode-alloc pool so allocations inside `f` route through
-    // the normal allocator (varying address per call). Snapshot the prior
-    // mode so it's restored exactly — `decode_alloc_resume` always sets
-    // Replaying which would corrupt a Recording mode.
-    let prior_mode = hipdarc::driver::decode_alloc_get_mode();
-    if prior_mode.is_some() {
-        hipdarc::driver::decode_alloc_pause();
-    }
-
+    // NOTE: do NOT pause decode_alloc here. We want allocations inside
+    // `f` to keep using whatever pool slot they got at recording time
+    // (sentinel-anchored, alive across replays). The captured kernels
+    // downstream of `f` reference those slots; if we paused decode_alloc
+    // and the alloc went through the normal pool, the buffer would be
+    // freed at end-of-call and the captured kernels would read stale
+    // memory on the next replay. Keeping decode_alloc active means the
+    // result tensors live at the SAME address across recordings AND
+    // replays, and the per-call memcpys (CPU→GPU lookups, mask content)
+    // refresh the data in-place.
     let result = f();
-
-    // Restore decode-alloc state to whatever it was before.
-    if let Some(mode) = prior_mode {
-        hipdarc::driver::decode_alloc_set_mode(mode);
-    }
     // Restore previous recording state.
     if let Some(ops) = saved {
         RECORDING.with(|r| {

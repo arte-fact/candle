@@ -32,7 +32,7 @@ pub mod delta_net;
 pub use gguf_config::*;
 pub use gguf_loader::Gguf;
 pub use rope::RotaryEmbedding;
-pub use norms::{causal_mask, v_norm, GemmaRmsNorm};
+pub use norms::{causal_mask, causal_mask_padded, v_norm, GemmaRmsNorm};
 pub use attention::{StandardAttention, StandardAttentionOpts, AttnNorm, GatedAttention};
 pub use ffn::{DenseMlp, MlpActivation, MoeExperts};
 pub use delta_net::{DeltaNetLayer, GdnState, GdnDimensions};

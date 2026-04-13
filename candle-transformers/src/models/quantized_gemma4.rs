@@ -626,6 +626,23 @@ impl ModelWeights {
     pub fn forward(&mut self, x: &Tensor, index_pos: usize) -> Result<Tensor> {
         let (b_sz, seq_len) = x.dims2()?;
 
+        // If we're in Replay/Graph state, resume decode_alloc BEFORE the
+        // prelude so the prelude's allocations (layer_in, inp_per_layer,
+        // SWA mask) return the same pool slots they got at recording
+        // time. The CPU→GPU memcpys inside those builders refresh the
+        // *content* of those slots; the captured replay kernels then
+        // read fresh data from a stable address — no External patching
+        // needed for slots that were stable across the two recordings.
+        #[cfg(feature = "hip")]
+        let g2_in_replay = matches!(
+            self.decode_state,
+            DecodeState::Replay(_) | DecodeState::Graph { .. }
+        );
+        #[cfg(feature = "hip")]
+        if g2_in_replay {
+            candle::hip_backend::hipdarc::driver::decode_alloc_resume();
+        }
+
         // ── G2/G3 eligibility check ──
         //
         // Gated by `CANDLE_G2_REPLAY=1` so the default forward path skips
@@ -782,6 +799,101 @@ impl ModelWeights {
             None
         };
 
+        // ── SWA mask precompute (G2 path only) ──
+        //
+        // The captured plan needs the mask `last_dim` to be stable across
+        // recordings AND across replays — otherwise the kernel's recorded
+        // arg `nrows_y = mask.last_dim` mismatches at runtime. We pad the
+        // mask out to the same value `pad_t` that the K cache will be
+        // padded to in the layer loop below, so both are at a fixed
+        // size for the whole 256-token replay window.
+        //
+        // `with_recording_paused` keeps the mask compute outside the
+        // captured plan and forces the result tensor into the normal
+        // pool (per-call address → marked External when its address
+        // shows up in captured args).
+        #[cfg(feature = "hip")]
+        let g2_pad_t: usize = if g2_eligible {
+            std::env::var("CANDLE_NKV_PAD")
+                .ok().and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(256)
+        } else {
+            1
+        };
+        #[cfg(feature = "hip")]
+        let swa_masks: std::collections::HashMap<(String, usize), Tensor> = if g2_eligible {
+            use std::collections::HashSet;
+            let mut want: HashSet<(String, usize)> = HashSet::new();
+            for l in &self.layers {
+                if let Some(sw) = l.sliding_window_size {
+                    want.insert((format!("{:?}", l.device.location()), sw));
+                }
+            }
+            if want.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                let current_t = index_pos + seq_len;
+                let pad_total = if g2_pad_t > 1 {
+                    ((current_t + g2_pad_t - 1) / g2_pad_t) * g2_pad_t
+                } else {
+                    current_t
+                };
+                candle::hip_backend::decode_cache::with_recording_paused(|| -> Result<_> {
+                    let mut out = std::collections::HashMap::new();
+                    for l in &self.layers {
+                        let sw = match l.sliding_window_size {
+                            Some(s) => s,
+                            None => continue,
+                        };
+                        let key = (format!("{:?}", l.device.location()), sw);
+                        if out.contains_key(&key) {
+                            continue;
+                        }
+                        let m = causal_mask_padded(
+                            b_sz,
+                            seq_len,
+                            index_pos,
+                            Some(sw),
+                            layer_in.dtype(),
+                            &l.device,
+                            pad_total,
+                        )?;
+                        out.insert(key, m);
+                    }
+                    Ok(out)
+                })?
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Deterministic anchor ordering for the post-forward state machine.
+        #[cfg(feature = "hip")]
+        let swa_mask_anchors: Vec<((String, usize), Tensor)> = if g2_eligible {
+            let mut v: Vec<_> = swa_masks
+                .iter()
+                .map(|(k, t)| (k.clone(), t.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        } else {
+            Vec::new()
+        };
+
+        // Diagnostic: dump the address + first values of each anchored
+        // input on replay calls to verify that decode_alloc is returning
+        // the same slot AND that the prelude's memcpy refreshed the data.
+        #[cfg(feature = "hip")]
+        if g2_eligible && g2_in_replay && std::env::var("CANDLE_G2_REPLAY_TRACE").is_ok() {
+            let head: Vec<f32> = layer_in.narrow(1, 0, 1)?.flatten_all()?
+                .to_device(&candle::Device::Cpu)?.to_vec1()?;
+            let head4: Vec<f32> = head.iter().take(4).copied().collect();
+            eprintln!(
+                "[G2-gemma4] replay layer_in ptr=0x{:x} first4={:?}",
+                Self::hip_device_ptr(&layer_in)?, head4
+            );
+        }
+
         // ── G2/G3 fast path: replay captured kernel sequence ──
         //
         // `layer_in` (post CPU-embed + transfer + scale) is anchor #0,
@@ -795,10 +907,17 @@ impl ModelWeights {
             let inp_per_layer_param = inp_per_layer_anchor.clone();
             // Build the per-call (input_idx, fresh_ptr) list once and reuse
             // it for both Replay and Graph branches.
+            //   #0 = layer_in
+            //   #1 = inp_per_layer (E4B only)
+            //   #2.. = SWA masks (one per device + sliding-window pair)
             let fresh_inputs: Vec<(usize, usize)> = {
                 let mut v = vec![(0usize, Self::hip_device_ptr(&layer_in_param)?)];
                 if let Some(ref ipl) = inp_per_layer_param {
                     v.push((1, Self::hip_device_ptr(ipl)?));
+                }
+                let mask_idx_base = v.len();
+                for (i, (_key, t)) in swa_mask_anchors.iter().enumerate() {
+                    v.push((mask_idx_base + i, Self::hip_device_ptr(t)?));
                 }
                 v
             };
@@ -921,6 +1040,8 @@ impl ModelWeights {
 
         // (per-layer embedding compute hoisted up before the G2 fast path)
 
+        // (SWA mask precompute hoisted up before the G2 fast path)
+
         // ----- transformer block loop --------------------------------------
         for il in 0..self.layers.len() {
             let (has_kv, kv_source_idx, layer_device, sliding_window_size) = {
@@ -940,6 +1061,31 @@ impl ModelWeights {
             // attention is correct without it. For sliding layers we MUST build
             // a mask even at decode, otherwise the query attends to keys older
             // than the window — see llama.cpp `gemma4-iswa.cpp` SWA mask path.
+            //
+            // G2 path: reuse the precomputed mask from `swa_masks` so the
+            // captured kernel reads from a single anchored buffer (instead
+            // of 32 freshly-allocated ones per token).
+            #[cfg(feature = "hip")]
+            let attention_mask = if g2_eligible {
+                if let Some(sw) = sliding_window_size {
+                    let key = (format!("{:?}", layer_device.location()), sw);
+                    swa_masks.get(&key).cloned()
+                } else {
+                    None
+                }
+            } else if seq_len == 1 && sliding_window_size.is_none() {
+                None
+            } else {
+                Some(causal_mask(
+                    b_sz,
+                    seq_len,
+                    index_pos,
+                    sliding_window_size,
+                    layer_in.dtype(),
+                    &layer_device,
+                )?)
+            };
+            #[cfg(not(feature = "hip"))]
             let attention_mask = if seq_len == 1 && sliding_window_size.is_none() {
                 None
             } else {
@@ -1010,10 +1156,15 @@ impl ModelWeights {
             // (transferring across devices if needed).
             //
             // H1: pad attention sequence length to a multiple of
-            // CANDLE_NKV_PAD (off by default, 256 works well on llama path
-            // when combined with G2 replay; Gemma4 doesn't yet have the G2
-            // state machine, so padding alone is a net loss here — keep
-            // opt-in until Phase K).
+            // CANDLE_NKV_PAD (default 256 when G2 is enabled — keeps the
+            // captured plan's K-cache args at a stable shape across the
+            // 256-token replay window; off otherwise to avoid the extra
+            // -inf padding work when not replaying).
+            #[cfg(feature = "hip")]
+            let pad_t = std::env::var("CANDLE_NKV_PAD")
+                .ok().and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(if g2_eligible { 256 } else { 1 });
+            #[cfg(not(feature = "hip"))]
             let pad_t = std::env::var("CANDLE_NKV_PAD")
                 .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
             let (_b_sz_q, _, seq_len_q, _) = q_precomputed_shape_or_none(&shared_qkv, &x_norm)?;
@@ -1345,27 +1496,22 @@ impl ModelWeights {
             let inp_per_layer_anchor_ref = inp_per_layer_anchor.as_ref();
             if decode_cache::is_recording() {
                 if let Some(recording) = decode_cache::stop_recording() {
-                    // Snapshot per-input pointers at this token.
-                    let in_ptr_now = Self::hip_device_ptr(in_anchor)?;
-                    let ipl_ptr_now: usize = match inp_per_layer_anchor_ref {
-                        Some(t) => Self::hip_device_ptr(t)?,
-                        None => 0,
-                    };
-                    let cur_ptrs: Vec<usize> = if ipl_ptr_now != 0 {
-                        vec![in_ptr_now, ipl_ptr_now]
-                    } else {
-                        vec![in_ptr_now]
-                    };
-                    let in_bytes = in_anchor.elem_count() * in_anchor.dtype().size_in_bytes();
-                    let ipl_bytes: usize = match inp_per_layer_anchor_ref {
-                        Some(t) => t.elem_count() * t.dtype().size_in_bytes(),
-                        None => 0,
-                    };
-                    let cur_bytes: Vec<usize> = if ipl_bytes != 0 {
-                        vec![in_bytes, ipl_bytes]
-                    } else {
-                        vec![in_bytes]
-                    };
+                    // Snapshot per-input pointers + sizes for this token.
+                    // Order matches `fresh_inputs` in the fast path:
+                    //   #0 layer_in
+                    //   #1 inp_per_layer (E4B)
+                    //   #2.. SWA masks
+                    let mut cur_ptrs: Vec<usize> = vec![Self::hip_device_ptr(in_anchor)?];
+                    let mut cur_bytes: Vec<usize> =
+                        vec![in_anchor.elem_count() * in_anchor.dtype().size_in_bytes()];
+                    if let Some(t) = inp_per_layer_anchor_ref {
+                        cur_ptrs.push(Self::hip_device_ptr(t)?);
+                        cur_bytes.push(t.elem_count() * t.dtype().size_in_bytes());
+                    }
+                    for (_key, t) in &swa_mask_anchors {
+                        cur_ptrs.push(Self::hip_device_ptr(t)?);
+                        cur_bytes.push(t.elem_count() * t.dtype().size_in_bytes());
+                    }
 
                     match std::mem::replace(&mut self.decode_state, DecodeState::Init) {
                         DecodeState::WarmUp => {
