@@ -114,9 +114,26 @@ first, otherwise G2 replay divergence returns).
     per device boundary. Multi-device 31B G2 plan now builds cleanly
     (2109 ops, 5 anchors) without the `hipErrorInvalidImage` crash.
 
-**Remaining (K10):** both E4B single-GPU and 31B multi-GPU fail at
-first replay with a `" I I I I"` loop + rocBLAS error. Detailed
-diagnostics (commit d7a47c35):
+**K11 (commit b38aab1b)** plumbed kernel names through the recorder
+and added per-kernel arg breakdown to the multi-input debug. That
+immediately localized the K10 bug — the captured plan had ZERO
+`rocblas_*` ops because `rocblas_gemm_strided_batched_ex` bypasses
+`LaunchArgs::launch` (the only recorder hook). Gemma4's attention
+gemms were running but invisible to G2.
+
+**K12a (commit 3f315625)** — when `CANDLE_G2_REPLAY=1`, force
+`gqa_attention_k_transposed` to use flash-attn-v2 instead of rocBLAS.
+Flash-attn IS recordable (it goes through `LaunchArgs::launch`).
+Replay output starts evolving per call.
+
+**K12b (commit d66df38e)** — added `flash_attn_v2_fwd_ktvs_d512_f32`
+for Gemma4-E4B's global-layer head_dim=512 (BC=8, 32 KiB LDS).
+The captured plan now contains 100% of attention compute (35×
+d=256 SWA + 7× d=512 global, no masked_softmax fallback).
+
+**Remaining:** replay output still incorrect (" I" instead of " help"
+at index_pos=14) despite full kernel coverage and per-call output
+evolution. Detailed diagnostics from earlier:
 
   - `layer_in`, `inp_per_layer`, and SWA mask are all verified refreshed
     per call — prelude memcpys hit the sentinel-anchored pool slots
