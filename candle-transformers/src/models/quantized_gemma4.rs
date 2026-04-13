@@ -1419,6 +1419,21 @@ impl ModelWeights {
             // Attack C: K is pre-transposed in the cache.
             // D2: if shared_qkv provided Q already, use it directly to skip
             // the redundant wq.forward(x_norm) + quantize_q8_1.
+            //
+            // G2 dynamic-L_k: when the KV cache is padded for replay
+            // stability (pad_info present, seq_len_q=1), set the
+            // per-call override so the flash-attn dispatch iterates
+            // only `t_cur` positions instead of `l_k_padded`. The
+            // override is a thread-local Cell so it vanishes right
+            // after the attention call below.
+            let dyn_lk_guard = if let Some((t_cur_dyn, _)) = pad_info {
+                if std::env::var("CANDLE_G2_DYN_LK").ok().as_deref() != Some("0") {
+                    crate::models::quantized_blocks::attention::set_flash_l_k_iter_override(
+                        Some(t_cur_dyn),
+                    );
+                    true
+                } else { false }
+            } else { false };
             let attn = if let Some((ref q_precomputed, _, _)) = shared_qkv {
                 let (b_sz, seq_len, _) = x_norm.dims3()?;
                 let attn_output = gqa_attention_k_transposed(
@@ -1435,6 +1450,9 @@ impl ModelWeights {
                     index_pos,
                 )?
             };
+            if dyn_lk_guard {
+                crate::models::quantized_blocks::attention::set_flash_l_k_iter_override(None);
+            }
             if il == 0 && std::env::var("CANDLE_GEMMA4_DUMP_L0").is_ok() {
                 let ao: Vec<f32> = attn.narrow(1, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
                 eprintln!("[L0 attn_out] first tok [0..5]: {:.6?} abs_mean={:.4}", &ao[..5], ao.iter().map(|v| v.abs()).sum::<f32>() / ao.len() as f32);

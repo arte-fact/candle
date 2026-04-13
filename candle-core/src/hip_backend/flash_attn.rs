@@ -923,6 +923,107 @@ pub fn flash_attn_decode_strided_split_k(
     ))
 }
 
+/// Flash attention v2 with K-transposed AND strided V, with a runtime-
+/// patchable "real L_k" that cuts iteration below the allocated K extent.
+///
+/// `l_k_alloc` is the K buffer's dim(3) — used for K's stride along D and
+/// for the mask row stride. `l_k_iter` is how many sequence positions to
+/// actually attend to. Under G2 replay, `l_k_alloc` is kept at the
+/// captured padded value (stable across replays) while `l_k_iter` is
+/// classified as a Counter(+1) arg by the plan — one kernel arg ticks
+/// forward per decode token.
+///
+/// When `l_k_iter == l_k_alloc`, the behavior matches
+/// `flash_attn_v2_kt_strided_v`.
+pub fn flash_attn_v2_kt_strided_v_dyn(
+    q: &Tensor, k_t: &Tensor, v: &Tensor, mask: Option<&Tensor>,
+    scale: f64, l_k_alloc: usize, l_k_iter: usize,
+) -> Result<Tensor> {
+    let dev = match q.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("flash_attn_v2_kt_strided_v_dyn: q must be HIP"),
+    };
+    let (b, nh, lq, d) = q.dims4()?;
+    let nkv = k_t.dim(1)?;
+    if nh % nkv != 0 { crate::bail!("nh%nkv!=0"); }
+    let nrep = nh / nkv;
+    if l_k_iter > l_k_alloc {
+        crate::bail!("l_k_iter ({l_k_iter}) > l_k_alloc ({l_k_alloc})");
+    }
+
+    let kn = match d {
+        64 => "flash_attn_v2_fwd_ktvs_dyn_d64_f32",
+        128 => "flash_attn_v2_fwd_ktvs_dyn_d128_f32",
+        256 => "flash_attn_v2_fwd_ktvs_dyn_d256_f32",
+        512 => "flash_attn_v2_fwd_ktvs_dyn_d512_f32",
+        _ => crate::bail!("unsupported D={d}"),
+    };
+
+    let (mbs, mls): (i32, i32) = match mask {
+        None => (0, 0),
+        Some(m) => {
+            if m.dtype() != DType::F32 || !m.is_contiguous() {
+                crate::bail!("mask bad");
+            }
+            let md = m.dims();
+            let last = *md.last().unwrap();
+            if last < l_k_iter { crate::bail!("mask last<l_k_iter"); }
+            let sl = if md.len() >= 2 { md[md.len()-2] } else { 1 };
+            let mb = if md.len() >= 4 { md[0] } else { 1 };
+            (if mb==b { (sl*last) as i32 } else { 0 }, if sl==lq { last as i32 } else { 0 })
+        }
+    };
+
+    let (qs, ql) = q.storage_and_layout();
+    let (ks, kl) = k_t.storage_and_layout();
+    let (vs, vl) = v.storage_and_layout();
+    let mo = mask.map(|m| m.storage_and_layout());
+
+    macro_rules! hv { ($s:expr,$l:expr) => {{
+        let h = match &*$s { Storage::Hip(s)=>s, _=>panic!("!hip") };
+        let sl = h.as_hip_slice::<f32>()?;
+        let off = $l.start_offset(); sl.slice(off..sl.len())
+    }}; }
+    let qv=hv!(qs,ql); let kv=hv!(ks,kl); let vv=hv!(vs,vl);
+    let mv = mo.as_ref().map(|(st,l)| {
+        let h=match &**st { Storage::Hip(s)=>s, _=>panic!("!hip") };
+        let sl=h.as_hip_slice::<f32>().unwrap();
+        let off=l.start_offset(); sl.slice(off..sl.len())
+    });
+
+    let v_strides = vl.stride();
+    let v_head_stride = v_strides[1] as i32;
+    let v_stride_j = v_strides[2] as i32;
+    let v_stride_d = v_strides[3] as i32;
+
+    let out = unsafe { dev.alloc::<f32>(b*nh*lq*d)? };
+    let func = dev.get_or_load_func(kn, &kernels::FLASH_ATTN_V2)?;
+
+    let gx = ((lq as u32)+FLASH_V2_BR-1)/FLASH_V2_BR;
+    let cfg = LaunchConfig {
+        grid_dim:(gx, nh as u32, b as u32),
+        block_dim:(WARP_SIZE, FLASH_V2_BR, 1),
+        shared_mem_bytes:0,
+    };
+    let mut bld = func.builder();
+    bld.arg(&qv); bld.arg(&kv); bld.arg(&vv);
+    match mv.as_ref() { Some(v)=>{bld.arg(v);} None=>{bld.arg(&hipdarc::driver::NullDevicePtr::default());} }
+    bld.arg(&out);
+    let(ba,nha,nka,lqa,lka_alloc)=(b as i32,nh as i32,nkv as i32,lq as i32,l_k_alloc as i32);
+    let(sa,nra)=(scale as f32,nrep as i32);
+    let lka_iter = l_k_iter as i32;
+    bld.arg(&ba);bld.arg(&nha);bld.arg(&nka);bld.arg(&lqa);bld.arg(&lka_alloc);
+    bld.arg(&sa);bld.arg(&nra);bld.arg(&mbs);bld.arg(&mls);
+    bld.arg(&v_head_stride);bld.arg(&v_stride_j);bld.arg(&v_stride_d);
+    bld.arg(&lka_iter);
+    unsafe { bld.launch(cfg) }.w()?;
+    drop(qs);drop(ks);drop(vs);drop(mo);
+    let os = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(Storage::Hip(os),
+        <Shape as From<(usize,usize,usize,usize)>>::from((b,nh,lq,d)),
+        BackpropOp::none(), false))
+}
+
 /// Flash attention v2 with K-transposed AND strided V.
 /// K is (B, H_kv, D, L_k) contiguous. V is (B, H_kv, T, D) non-contiguous
 /// from KvCache narrow+transpose with strides (H*D*maxT, D*maxT, 1, maxT).
@@ -948,6 +1049,12 @@ pub fn flash_attn_v2_kt_strided_v(
         _ => crate::bail!("unsupported D={d}"),
     };
 
+    // Mask shape: typically (1,1,L_q,L_k_pad) where L_k_pad may be >= l_k.
+    // For G2 dynamic-l_k (the captured plan advances l_k each replay while
+    // mask stays allocated at L_k_pad), `last >= l_k` — the kernel iterates
+    // [0..l_k) in the K dim and only touches mask entries up to l_k, so
+    // L_k_pad > l_k is safe as long as the per-row stride reflects the
+    // allocation, not the loop bound.
     let (mbs, mls): (i32, i32) = match mask {
         None => (0, 0),
         Some(m) => {
@@ -956,10 +1063,10 @@ pub fn flash_attn_v2_kt_strided_v(
             }
             let md = m.dims();
             let last = *md.last().unwrap();
-            if last != l_k { crate::bail!("mask last!=lk"); }
+            if last < l_k { crate::bail!("mask last<lk"); }
             let sl = if md.len() >= 2 { md[md.len()-2] } else { 1 };
             let mb = if md.len() >= 4 { md[0] } else { 1 };
-            (if mb==b { (sl*l_k) as i32 } else { 0 }, if sl==lq { l_k as i32 } else { 0 })
+            (if mb==b { (sl*last) as i32 } else { 0 }, if sl==lq { last as i32 } else { 0 })
         }
     };
 

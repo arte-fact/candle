@@ -59,6 +59,16 @@ static __device__ __forceinline__ float v2_warp_reduce_sum(float x) {
 // v_stride_j / v_stride_d: strides for V access. If both are 0, use standard layout.
 //   Standard V (L_k, D): v[j*D + d]       → v_stride_j=D, v_stride_d=1
 //   Transposed V (D, T): v[d*max_T + j]   → v_stride_j=1, v_stride_d=max_T
+// L_k is the allocated/stride size along the K sequence dim (used for
+// K's stride when K_TRANS=true, for the kv_offset base, and as the upper
+// bound on mask row indexing). L_k_iter is the number of REAL K/V entries
+// to attend to — the kernel iterates chunks [0 .. L_k_iter) and writes
+// -INFINITY for rows >= L_k_iter. When L_k_iter == L_k (the default),
+// behavior is identical to the pre-change kernel. When L_k_iter < L_k
+// (G2 dynamic l_k: the K buffer is padded to L_k for stable replay while
+// only the first L_k_iter positions carry real token state), the kernel
+// skips the padded tail entirely — cutting flash-attn work from O(L_k_pad)
+// to O(L_k_real) each decode step.
 template <int D, int BR, int BC, bool K_TRANS = false>
 static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     const float * __restrict__ q,     // (B, H_q, L_q, D) contiguous
@@ -69,7 +79,8 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     int B, int H_q, int H_kv, int L_q, int L_k,
     float scale, int n_rep,
     int mask_b_stride, int mask_lq_stride,
-    int v_head_stride = 0, int v_stride_j = 0, int v_stride_d = 0)
+    int v_head_stride = 0, int v_stride_j = 0, int v_stride_d = 0,
+    int L_k_iter = -1)
 {
     static_assert(D == 64 || D == 128 || D == 256 || D == 512,
                   "only D=64, D=128, D=256, D=512 supported");
@@ -152,7 +163,8 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     constexpr int LOADS_PER_THREAD =
         (TILE_ELEMS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
 
-    const int n_chunks = (L_k + BC - 1) / BC;
+    const int L_k_effective = (L_k_iter >= 0) ? L_k_iter : L_k;
+    const int n_chunks = (L_k_effective + BC - 1) / BC;
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
         const int k_start = chunk * BC;
 
@@ -165,7 +177,7 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
                 const int j = idx / D;
                 const int d = idx % D;
                 const int row = k_start + j;
-                const bool valid = (row < L_k);
+                const bool valid = (row < L_k_effective);
                 // K layout: standard (L_k, D) → k[row*D + d]
                 //           transposed (D, L_k) → k[d*L_k + row]
                 if (K_TRANS) {
@@ -196,13 +208,13 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
                 float s_j = v2_warp_reduce_sum(partial) * scale;
 
                 // Additive mask.
-                if (mask_row != nullptr && row < L_k) {
+                if (mask_row != nullptr && row < L_k_effective) {
                     s_j += mask_row[row];
                 }
                 // Out-of-bounds K rows contribute nothing (K/V tile
-                // has zero padding for row >= L_k, but mask isn't
-                // indexable there).
-                if (row >= L_k) {
+                // has zero padding for row >= L_k_effective, but mask
+                // isn't indexable beyond the true attended range).
+                if (row >= L_k_effective) {
                     s_j = -INFINITY;
                 }
 
@@ -401,4 +413,80 @@ extern "C" __global__ void __launch_bounds__(256, 1) flash_attn_v2_fwd_ktvs_d512
         q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
         scale, n_rep, mask_b_stride, mask_lq_stride,
         v_head_stride, v_stride_j, v_stride_d);
+}
+
+// ---- Dynamic-L_k_iter variants for G2 replay. ----
+// Same strided-V ktvs kernels as above, but accept an extra L_k_iter
+// parameter naming how many real K positions to process. The K buffer
+// is still sized to L_k (so its stride along D stays stable across
+// replays), but iteration stops at L_k_iter. Under G2 replay,
+// L_k_iter is captured as a per-token Counter arg (+1 per decode
+// step), so the replayed plan processes O(real_l_k) entries instead
+// of O(pad).
+extern "C" __global__ void __launch_bounds__(256, 2)
+flash_attn_v2_fwd_ktvs_dyn_d64_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+{
+    flash_attn_fwd_v2_impl<64, 4, 64, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2)
+flash_attn_v2_fwd_ktvs_dyn_d128_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+{
+    flash_attn_fwd_v2_impl<128, 4, 32, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 2)
+flash_attn_v2_fwd_ktvs_dyn_d256_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+{
+    flash_attn_fwd_v2_impl<256, 4, 16, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+flash_attn_v2_fwd_ktvs_dyn_d512_f32(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_q, int L_k,
+    float scale, int n_rep, int mask_b_stride, int mask_lq_stride,
+    int v_head_stride, int v_stride_j, int v_stride_d, int L_k_iter)
+{
+    flash_attn_fwd_v2_impl<512, 4, 8, true>(
+        q, k, v, mask, out, B, H_q, H_kv, L_q, L_k,
+        scale, n_rep, mask_b_stride, mask_lq_stride,
+        v_head_stride, v_stride_j, v_stride_d, L_k_iter);
 }

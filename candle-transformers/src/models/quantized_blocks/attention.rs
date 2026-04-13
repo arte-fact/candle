@@ -23,6 +23,20 @@ use std::sync::Arc;
 /// bucket exactly once).
 const KV_CACHE_INITIAL: usize = 4096;
 
+// G2 replay dynamic-L_k override. When a caller sets this before entering
+// `gqa_attention_k_transposed`, the dispatcher uses the kernel variant
+// that iterates up to `l_k_iter` instead of the full `k_t.dim(3)`. The
+// kv buffer's stride-along-D still reflects the full (padded) size, so
+// the captured plan's K/V pointers and strides stay stable across
+// replays while `l_k_iter` advances +1 per decode token (Counter arg).
+thread_local! {
+    static FLASH_L_K_ITER_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+pub(crate) fn set_flash_l_k_iter_override(v: Option<usize>) {
+    FLASH_L_K_ITER_OVERRIDE.with(|c| c.set(v));
+}
+
 /// Run scaled-dot-product attention with GQA sharing done via zero-copy
 /// reshape of Q, not a physical broadcast of K/V.
 ///
@@ -230,6 +244,19 @@ pub(crate) fn gqa_attention_k_transposed(
             // a stable kernel set (rocBLAS Tensile picks different kernels
             // as GEMM dims grow past thresholds, breaking graph replay).
             let kt_c = if k_t.is_contiguous() { k_t.clone() } else { k_t.contiguous()? };
+            // G2 dynamic L_k: when the caller (gemma4 decode under replay)
+            // narrows the KV cache to the padded `l_k_alloc` for stable
+            // replay but only wants to attend to the `l_k_iter` real
+            // positions, dispatch to the kernel variant that iterates
+            // [0 .. l_k_iter) while keeping strides based on `l_k_alloc`.
+            let lk_iter = FLASH_L_K_ITER_OVERRIDE.with(|c| c.get());
+            if let Some(l_k_iter) = lk_iter {
+                if let Ok(o) = candle::hip_backend::flash_attn_v2_kt_strided_v_dyn(
+                    &q_c, &kt_c, v, mask_c.as_ref(), attn_scale, t_k, l_k_iter,
+                ) {
+                    return Ok(o);
+                }
+            }
             if let Ok(o) = candle::hip_backend::flash_attn_v2_kt_strided_v(
                 &q_c, &kt_c, v, mask_c.as_ref(), attn_scale, t_k,
             ) {

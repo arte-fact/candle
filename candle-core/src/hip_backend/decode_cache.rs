@@ -783,6 +783,12 @@ impl DecodePlan {
         let mut op_times: std::collections::HashMap<String, (u128, usize)> =
             std::collections::HashMap::new();
 
+        // Reuse one heap-allocated arg_ptrs buffer across all 1557
+        // launches instead of `.collect()`-ing a fresh Vec per op.
+        // Saves ~12k tiny Vec allocations per replay.
+        let max_args = self.ops.iter().map(|op| op.arg_values.len()).max().unwrap_or(0);
+        let mut arg_ptrs: Vec<*mut c_void> = Vec::with_capacity(max_args);
+
         for (idx, op) in self.ops.iter().enumerate() {
             if op.device_ordinal != current_dev {
                 let rc = hipdarc::sys::hipSetDevice(op.device_ordinal);
@@ -795,11 +801,10 @@ impl DecodePlan {
                 current_dev = op.device_ordinal;
             }
 
-            let mut arg_ptrs: Vec<*mut c_void> = op
-                .arg_values
-                .iter()
-                .map(|v| v as *const u64 as *mut c_void)
-                .collect();
+            // Reuse `arg_ptrs` instead of collecting a fresh Vec per op.
+            arg_ptrs.clear();
+            arg_ptrs.extend(op.arg_values.iter()
+                .map(|v| v as *const u64 as *mut c_void));
 
             let _t0 = if op_profile { Some(std::time::Instant::now()) } else { None };
             let rc = hipdarc::sys::hipModuleLaunchKernel(
