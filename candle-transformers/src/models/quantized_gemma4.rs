@@ -729,14 +729,12 @@ impl ModelWeights {
             // (transferring across devices if needed).
             //
             // H1: pad attention sequence length to a multiple of
-            // CANDLE_NKV_PAD (default 256) so kernel args stay constant
-            // across a 256-token decode window. Same trick as
-            // quantized_llama.rs. Uses the full cache buffer narrowed to
-            // the padded length — unwritten positions are zero, and we
-            // build a -inf mask for positions [T_cur, L_k_padded).
-            let pad_default: usize = if std::env::var("CANDLE_G2_REPLAY").is_ok() { 256 } else { 1 };
+            // CANDLE_NKV_PAD (off by default, 256 works well on llama path
+            // when combined with G2 replay; Gemma4 doesn't yet have the G2
+            // state machine, so padding alone is a net loss here — keep
+            // opt-in until Phase K).
             let pad_t = std::env::var("CANDLE_NKV_PAD")
-                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(pad_default);
+                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
             let (_b_sz_q, _, seq_len_q, _) = q_precomputed_shape_or_none(&shared_qkv, &x_norm)?;
             let (k_use, v_use, pad_info) = {
                 let src = if has_kv { il } else { kv_source_idx };
