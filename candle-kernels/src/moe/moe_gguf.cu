@@ -158,7 +158,7 @@ extern "C" void moe_gemm_gguf(
     int size_m,         // M (num tokens to process)
     int size_n,         // N (output dim)
     int size_k,         // K (input dim)
-    int quant_type,     // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
+    int quant_type,     // Q8_0: 0, Q4K: 1, Q2K: 2, Q3K: 3, Q5K: 4, Q6K: 5, Q4_0: 6, Q4_1: 7
     cudaStream_t stream
 ) {
     const int QUANTIZE_BLOCK_SIZE = CUDA_QUANTIZE_BLOCK_SIZE;
@@ -207,6 +207,16 @@ extern "C" void moe_gemm_gguf(
         case 5: // Q6K
         {
             LAUNCH_MOE_GGUF(QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1);
+            break;
+        }
+        case 6: // Q4_0
+        {
+            LAUNCH_MOE_GGUF(QK4_0, QI4_0, block_q4_0, VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1);
+            break;
+        }
+        case 7: // Q4_1
+        {
+            LAUNCH_MOE_GGUF(QK4_1, QI4_1, block_q4_1, VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1);
             break;
         }
         default:

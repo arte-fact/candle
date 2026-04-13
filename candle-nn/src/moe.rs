@@ -205,7 +205,7 @@ pub fn moe_gemm_gguf(
         );
         let dev = input.device().as_cuda_device()?;
 
-        // Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5
+        // Q8_0: 0, Q4K: 1, Q2K: 2, Q3K: 3, Q5K: 4, Q6K: 5, Q4_0: 6, Q4_1: 7
         let gguf_dtype = match weights.dtype() {
             GgmlDType::Q8_0 => 0,
             GgmlDType::Q4K => 1,
@@ -213,9 +213,11 @@ pub fn moe_gemm_gguf(
             GgmlDType::Q3K => 3,
             GgmlDType::Q5K => 4,
             GgmlDType::Q6K => 5,
+            GgmlDType::Q4_0 => 6,
+            GgmlDType::Q4_1 => 7,
             _ => {
                 candle::bail!(
-                    "moe_gemm_gguf `ISQ` only accept q2k, q3k, q4k, q5k, q6k or q8_0 weights!"
+                    "moe_gemm_gguf `ISQ` only accepts q2k, q3k, q4k, q5k, q6k, q8_0, q4_0 or q4_1 weights!"
                 )
             }
         };

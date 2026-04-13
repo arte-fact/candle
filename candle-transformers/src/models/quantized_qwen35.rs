@@ -113,9 +113,18 @@ impl ModelWeights {
             }
         }
 
-        // Parallel per-layer load. Each rayon worker gets its own cheap
-        // Gguf clone retargeted to that layer's device.
-        let layers: Vec<Layer> = (0..block_count)
+        // Per-layer load. Empirically 2 rayon workers per device is the
+        // sweet spot for H→D bandwidth-bound loads: 1 worker can't overlap
+        // CPU prep with PCIe DMA, but >2 just contends on cudarc's
+        // per-context lock (measured 13+ s of futex wait at 6 workers
+        // loading Qwen3.5-27B Q4_1 on a single 3090).
+        let n_upload_threads = (devices.len() * 2).max(2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_upload_threads)
+            .build()
+            .map_err(|e| candle::Error::Msg(format!("rayon pool build: {e}")))?;
+        let layers: Vec<Layer> = pool.install(|| {
+            (0..block_count)
             .into_par_iter()
             .map(|il| -> Result<Layer> {
                 let prefix = format!("blk.{il}");
@@ -147,7 +156,8 @@ impl ModelWeights {
                     device: layer_device,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        })?;
 
         // Output norm + lm_head on the device of the last layer.
         let last_dev = devices[layer_to_device[block_count - 1]].clone();

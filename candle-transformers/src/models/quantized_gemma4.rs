@@ -420,10 +420,19 @@ impl ModelWeights {
                 let layer_freq_factors: Option<&[f32]> =
                     if !is_sliding { rope_freqs.as_deref() } else { None };
 
+                // CANDLE_MAX_CONTEXT (env var) caps the precomputed rotary
+                // sin/cos table to avoid reserving VRAM for a full 128k
+                // context when benchmarking at much shorter lengths. Gemma-4
+                // 31B with 62 layers otherwise burns ~4 GiB on RoPE tables
+                // alone (131072 × head_dim × 4 bytes × n_layers).
+                let rope_cap = std::env::var("CANDLE_MAX_CONTEXT")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(MAX_SEQ_LEN);
                 let rotary = Arc::new(RotaryEmbedding::new_with_freq_factors(
                     layer_rope_freq as f64,
                     rotated_dim,
-                    MAX_SEQ_LEN.min(cfg.max_seq_len()),
+                    rope_cap.min(cfg.max_seq_len()),
                     layer_freq_factors,
                     DType::F32,
                     &layer_device,

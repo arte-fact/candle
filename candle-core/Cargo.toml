@@ -75,6 +75,10 @@ name = "cuda_basics"
 required-features = ["cuda"]
 
 [[example]]
+name = "cuda_mxfp4_correctness"
+required-features = ["cuda"]
+
+[[example]]
 name = "hip_basics"
 required-features = ["hip"]
 

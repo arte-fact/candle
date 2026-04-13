@@ -95,6 +95,49 @@ __forceinline__ __device__ void dequantize_block_warp(
             dequantize_block_q6_K<T>(quant_in, dequant_out);
             break;
         }
+        case 6: { // q4_0, 32 lanes
+            // Block: half d (2B), uint8_t qs[16] (16B packing 32 4-bit nibbles).
+            // Output layout matches `dequantize_block_q4_0`: lo nibbles of qs[j]
+            // go to out[j], hi nibbles go to out[j+16]; dm = -8*d.
+            int laneId = threadIdx.x;
+            const half* d_ptr = (const half*)quant_in;
+            const uint8_t* qs = quant_in + 2;
+
+            half d_val = (laneId == 0) ? *d_ptr : (half)0.0f;
+            d_val = __shfl_sync(0xFFFFFFFF, d_val, 0);
+            float d_f = __half2float(d_val);
+
+            if (laneId < QK4_0) {
+                int j = laneId & 15;
+                int hi = (laneId >> 4) & 1;
+                int q = hi ? (qs[j] >> 4) : (qs[j] & 0xF);
+                dequant_out[laneId] = T( d_f * (float)(q - 8) );
+            }
+            break;
+        }
+        case 7: { // q4_1, 32 lanes
+            // Block: half2 dm (d.x=scale, d.y=bias, 4B), uint8_t qs[16].
+            // Output layout: out[j] = d*lo(qs[j]) + m; out[j+16] = d*hi(qs[j]) + m.
+            int laneId = threadIdx.x;
+            const half* d_ptr = (const half*)quant_in;
+            const half* m_ptr = (const half*)(quant_in + 2);
+            const uint8_t* qs = quant_in + 4;
+
+            half d_val = (laneId == 0) ? *d_ptr : (half)0.0f;
+            half m_val = (laneId == 0) ? *m_ptr : (half)0.0f;
+            d_val = __shfl_sync(0xFFFFFFFF, d_val, 0);
+            m_val = __shfl_sync(0xFFFFFFFF, m_val, 0);
+            float d_f = __half2float(d_val);
+            float m_f = __half2float(m_val);
+
+            if (laneId < QK4_1) {
+                int j = laneId & 15;
+                int hi = (laneId >> 4) & 1;
+                int q = hi ? (qs[j] >> 4) : (qs[j] & 0xF);
+                dequant_out[laneId] = T( d_f * (float)q + m_f );
+            }
+            break;
+        }
         default:
             break;
     }
@@ -348,6 +391,22 @@ __global__ void moe_gemm_gguf_prefill_kernel(
             sorted_token_ids, expert_offsets, topk_weights,\
             output, num_experts, topk, size_m, size_n, size_k, gguf_type\
         );\
+    } else if (gguf_type == 6) { \
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK4_0, block_q4_0, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, expert_offsets, topk_weights,\
+            output, num_experts, topk, size_m, size_n, size_k, gguf_type\
+        );\
+    } else if (gguf_type == 7) { \
+        dim3 block(32, WARPS_PER_BLOCK, 1);\
+        moe_gemm_gguf_prefill_kernel<DTYPE, QK4_1, block_q4_1, 32><<<grid, block, smem_bytes, stream>>>(\
+            reinterpret_cast<const DTYPE*>(input),\
+            reinterpret_cast<const uint8_t*>(weights),\
+            sorted_token_ids, expert_offsets, topk_weights,\
+            output, num_experts, topk, size_m, size_n, size_k, gguf_type\
+        );\
     }
 
 
@@ -364,7 +423,7 @@ extern "C" void moe_gemm_gguf_prefill(
     int size_n,
     int size_k,
     int input_dtype,      // 0 = half, 1 = bfloat16
-    int gguf_type, //Q8_0: 0, Q4K: 1, Q2K: 2, Q3k: 3,  Q5K: 4, Q6K: 5,
+    int gguf_type, //Q8_0: 0, Q4K: 1, Q2K: 2, Q3K: 3, Q5K: 4, Q6K: 5, Q4_0: 6, Q4_1: 7
     cudaStream_t stream
 ) {
     int32_t* expert_counts;
@@ -373,10 +432,10 @@ extern "C" void moe_gemm_gguf_prefill(
     int32_t* expert_offsets;
     cudaMallocAsync(&expert_offsets, (num_experts + 1) * sizeof(int32_t), stream);
     calculate_expert_offsets(expert_ids, size_m, expert_counts, expert_offsets, num_experts, stream);
-    
+
     int grid_n = CEILDIV(size_n, N_BLK);
     dim3 grid(num_experts, grid_n, 1);
-    
+
     size_t qk = QK_K;
     size_t block_size_bytes = sizeof(block_q6_K);
     if (gguf_type == 0) { //Q8_0: 0,
@@ -390,6 +449,12 @@ extern "C" void moe_gemm_gguf_prefill(
         block_size_bytes = sizeof(block_q3_K);
     } else if (gguf_type == 4) {//Q5K: 4,
         block_size_bytes = sizeof(block_q5_K);
+    } else if (gguf_type == 6) {// Q4_0: 6,
+        block_size_bytes = sizeof(block_q4_0);
+        qk = QK4_0;
+    } else if (gguf_type == 7) {// Q4_1: 7,
+        block_size_bytes = sizeof(block_q4_1);
+        qk = QK4_1;
     }
 
     // 1. A tile: [M_BLK, qk] (dequantized)

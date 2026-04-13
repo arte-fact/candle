@@ -1191,6 +1191,7 @@ impl QHipStorage {
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
             GgmlDType::Mxfp4 => deq::<crate::quantized::BlockMxfp4>(&buffer, block_len, &mut out),
+            GgmlDType::Iq4Xs => deq::<crate::quantized::BlockIq4Xs>(&buffer, block_len, &mut out),
         }
 
         self.device

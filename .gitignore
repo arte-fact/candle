@@ -48,3 +48,6 @@ bria.mp3
 bria.safetensors
 bria.wav
 .rocprofv3/
+
+# Benchmark/test GGUF checkpoints — fetch with scripts/download-models.sh
+models/*.gguf

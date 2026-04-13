@@ -129,6 +129,7 @@ fn dequantize_f32(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f32", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f32", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f32", true, 32, nb),
+        GgmlDType::Mxfp4 => ("dequantize_block_mxfp4_f32", false, 32, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -189,6 +190,7 @@ fn dequantize_f16(
         GgmlDType::Q5K => ("dequantize_block_q5_K_f16", true, 64, nb),
         GgmlDType::Q6K => ("dequantize_block_q6_K_f16", true, 64, nb),
         GgmlDType::Q8K => ("dequantize_block_q8_K_f16", true, 32, nb),
+        GgmlDType::Mxfp4 => ("dequantize_block_mxfp4_f16", false, 32, nb),
         _ => crate::bail!("unsupported dtype for dequantize {dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_kernels::QUANTIZED)?;
@@ -549,6 +551,40 @@ impl QCudaStorage {
         &self.device
     }
 
+    /// Keep BF16 weights on GPU without upcasting to F32. Returns an owned
+    /// `CudaStorage<BF16>` by transmuting the device byte buffer to
+    /// `CudaSlice<bf16>` and cloning into a fresh allocation. ~2 ms/GiB D2D
+    /// on an RTX 3090 — a one-time cost, vs. the ~15 s CPU roundtrip that
+    /// also doubles VRAM.
+    pub fn as_bf16_storage(&self, elem_count: usize) -> Result<CudaStorage> {
+        if self.dtype != GgmlDType::BF16 {
+            crate::bail!("as_bf16_storage: dtype must be BF16, got {:?}", self.dtype);
+        }
+        let n_bytes = elem_count * std::mem::size_of::<half::bf16>();
+        if n_bytes > self.data.len {
+            crate::bail!(
+                "as_bf16_storage: elem_count ({elem_count}) exceeds buffer bytes ({})",
+                self.data.len
+            );
+        }
+        // SAFETY: `inner` stores raw BF16 bytes (candle wrote BF16 data into
+        // the u8 buffer at load time). Reinterpreting as CudaView<bf16> of the
+        // matching length is safe since bf16 is 2-byte aligned and the buffer
+        // has padded length >= `n_bytes`.
+        let view: CudaView<half::bf16> = unsafe {
+            self.data
+                .inner
+                .slice(..n_bytes)
+                .transmute::<half::bf16>(elem_count)
+                .ok_or_else(|| {
+                    crate::Error::Msg("as_bf16_storage: CudaSlice::transmute failed".into())
+                })?
+        };
+        let stream = self.device.cuda_stream();
+        let owned: CudaSlice<half::bf16> = stream.clone_dtod(&view).w()?;
+        Ok(CudaStorage::wrap_cuda_slice(owned, self.device.clone()))
+    }
+
     pub fn dequantize(&self, elem_count: usize) -> Result<CudaStorage> {
         fn deq<T: GgmlType>(buffer: &[u8], n: usize, dst: &mut [f32]) {
             let slice = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const T, n) };
@@ -569,6 +605,7 @@ impl QCudaStorage {
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
                 | GgmlDType::Q8K
+                | GgmlDType::Mxfp4
         );
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
@@ -596,6 +633,8 @@ impl QCudaStorage {
             GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
             GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
             GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
+            GgmlDType::Mxfp4 => deq::<crate::quantized::BlockMxfp4>(&buffer, block_len, &mut out),
+            GgmlDType::Iq4Xs => deq::<crate::quantized::BlockIq4Xs>(&buffer, block_len, &mut out),
         }
 
         self.device
@@ -839,6 +878,260 @@ impl QCudaStorage {
     }
 }
 
+// Thread-local *double-buffered* pinned staging for H→D copies during
+// weight loading. Two buffers ping-pong: while buffer A is draining its
+// async H→D, buffer B fills the next tensor. The CudaEvent recorded after
+// each memcpy_htod is checked the next time that buffer is reused — only
+// then do we sync, so successive uploads overlap with their CPU-side prep.
+//
+// With one buffer (single-buffered) we had to call `stream.synchronize()`
+// after every copy to avoid overwriting the buffer while the GPU was
+// still reading from it; that cost ~5–8 s on an 851-tensor load. The
+// ping-pong eliminates that hot stall — each sync hits an event that's
+// already complete (its copy finished while the other buffer was working).
+struct PinnedSlot {
+    buf: Option<cudarc::driver::PinnedHostSlice<u8>>,
+    in_flight: Option<cudarc::driver::CudaEvent>,
+}
+thread_local! {
+    static PINNED_BUFS: std::cell::RefCell<Option<[PinnedSlot; 2]>>
+        = const { std::cell::RefCell::new(None) };
+    static NEXT_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Pick the next ping-pong slot, sync any in-flight H→D from it, and
+/// (re)allocate the pinned buffer if it can't fit `n_bytes`. Returns the
+/// chosen index on success, `None` if pinned alloc failed (caller falls
+/// back to pageable). Caller must, in a subsequent `PINNED_BUFS.with`
+/// borrow, fill the buffer, queue the H→D, and record the new event into
+/// `PinnedSlot::in_flight`.
+fn next_pinned_slot(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    n_bytes: usize,
+) -> Result<Option<usize>> {
+    let idx = NEXT_IDX.with(|c| {
+        let i = c.get();
+        c.set((i + 1) % 2);
+        i
+    });
+    PINNED_BUFS.with(|cell| -> Result<Option<usize>> {
+        let mut slot_array = cell.borrow_mut();
+        if slot_array.is_none() {
+            *slot_array = Some([
+                PinnedSlot { buf: None, in_flight: None },
+                PinnedSlot { buf: None, in_flight: None },
+            ]);
+        }
+        let slot = &mut slot_array.as_mut().unwrap()[idx];
+        // Drain any prior H→D from this buffer before we overwrite it.
+        // Reused event — re-record on next memcpy via cuEventRecord.
+        if let Some(ev) = slot.in_flight.as_ref() {
+            ev.synchronize().w()?;
+        }
+        let need_realloc = slot.buf.as_ref().map_or(true, |b| b.len() < n_bytes);
+        if need_realloc {
+            let new_cap = match &slot.buf {
+                Some(b) => std::cmp::max(n_bytes, b.len() + b.len() / 2),
+                None => n_bytes,
+            };
+            slot.buf = None;
+            match unsafe { stream.context().alloc_pinned::<u8>(new_cap) } {
+                Ok(b) => slot.buf = Some(b),
+                Err(_) => return Ok(None),
+            }
+        }
+        Ok(Some(idx))
+    })
+}
+
+/// Record/re-record the event on this slot's stream so the next reuse
+/// will wait on it. Allocates the event lazily on first use, then reuses
+/// (cuEventRecord re-captures the stream's current point each call).
+///
+/// Default flags = `DISABLE_TIMING` only, so `synchronize` busy-spins
+/// rather than OS-sleeps. For loads where the event is almost always
+/// already complete by the next reuse (CPU prep takes longer than H→D
+/// drain), spinning is faster than the BLOCKING_SYNC wakeup path.
+fn record_in_flight_event(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    idx: usize,
+) -> Result<()> {
+    PINNED_BUFS.with(|cell| -> Result<()> {
+        let mut slots = cell.borrow_mut();
+        let arr = slots.as_mut().expect("slot array initialized in next_pinned_slot");
+        let slot = &mut arr[idx];
+        // Reuse this slot's existing event if any; otherwise allocate one
+        // for the lifetime of this thread.
+        if slot.in_flight.is_none() {
+            slot.in_flight = Some(stream.context().new_event(None).w()?);
+        }
+        slot.in_flight.as_ref().unwrap().record(stream).w()?;
+        Ok(())
+    })
+}
+
+/// Stage `data` through one of the two ping-pong pinned buffers and enqueue
+/// an async `memcpy_htod` to `dst[0..data.len())`. Returns `Ok(Some(()))` on
+/// the pinned fast path, `Ok(None)` if pinned alloc isn't available.
+///
+/// Per-call sync is replaced with per-buffer event sync inside
+/// `next_pinned_slot`: on average the event has already completed when we
+/// next pick that buffer, so the wait is free.
+fn pinned_staged_copy(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    data: &[u8],
+    dst: &mut cudarc::driver::CudaSlice<u8>,
+) -> Result<Option<()>> {
+    let n = data.len();
+    if n == 0 {
+        return Ok(Some(()));
+    }
+    let idx = match next_pinned_slot(stream, n)? {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    PINNED_BUFS.with(|cell| -> Result<()> {
+        let mut slots = cell.borrow_mut();
+        let slot = &mut slots.as_mut().unwrap()[idx];
+        let pinned = slot.buf.as_mut().expect("just allocated");
+        // SAFETY: pinned alive, len() ≥ n, exclusively borrowed via RefCell.
+        let pinned_dst = unsafe { std::slice::from_raw_parts_mut(pinned.as_mut_ptr().w()?, n) };
+        pinned_dst.copy_from_slice(data);
+        let pinned_src: &[u8] =
+            unsafe { std::slice::from_raw_parts(pinned.as_ptr().w()?, n) };
+        let mut dst_view = dst.slice_mut(..n);
+        stream.memcpy_htod(pinned_src, &mut dst_view).w()?;
+        Ok(())
+    })?;
+    record_in_flight_event(stream, idx)?;
+    Ok(Some(()))
+}
+
+/// Concat-load: pread N segments directly into a single pinned staging
+/// buffer, then one async H→D copy of the concatenated bytes. Used by
+/// `qmatmul_concat_rows` to fuse QKV / gate+up loads — saves an extra
+/// CPU-side Vec assembly that would otherwise dominate load time for
+/// transformer models where every layer has fused projections.
+pub fn load_quantized_concat_from_blob(
+    device: &CudaDevice,
+    blob: &super::gguf_file::GgufBlob,
+    segments: &[(u64, usize)],
+    total_bytes: usize,
+    dtype: GgmlDType,
+    block_size: usize,
+    type_size: usize,
+) -> Result<super::QStorage> {
+    let padded_len = total_bytes + MATRIX_ROW_PADDING * type_size / block_size;
+    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    let stream = device.cuda_stream();
+
+    let idx = next_pinned_slot(&stream, total_bytes)?;
+    let used_pinned = if let Some(idx) = idx {
+        PINNED_BUFS.with(|cell| -> Result<()> {
+            let mut slots = cell.borrow_mut();
+            let slot = &mut slots.as_mut().unwrap()[idx];
+            let pinned = slot.buf.as_mut().expect("just allocated");
+            let pinned_dst = unsafe {
+                std::slice::from_raw_parts_mut(pinned.as_mut_ptr().w()?, total_bytes)
+            };
+            let mut cursor = 0usize;
+            for &(off, n) in segments {
+                blob.read_into(off, &mut pinned_dst[cursor..cursor + n])?;
+                cursor += n;
+            }
+            let pinned_src: &[u8] =
+                unsafe { std::slice::from_raw_parts(pinned.as_ptr().w()?, total_bytes) };
+            let mut dst_view = inner.slice_mut(..total_bytes);
+            stream.memcpy_htod(pinned_src, &mut dst_view).w()?;
+            Ok(())
+        })?;
+        record_in_flight_event(&stream, idx)?;
+        true
+    } else {
+        false
+    };
+    if !used_pinned {
+        let mut combined: Vec<u8> = Vec::with_capacity(total_bytes);
+        for &(off, n) in segments {
+            let raw = blob.read_to_vec(off, n)?;
+            combined.extend_from_slice(&raw);
+        }
+        device.memcpy_htod(combined.as_slice(), &mut inner.slice_mut(..total_bytes))?;
+    }
+    if padded_len > total_bytes {
+        let mut tail = inner.slice_mut(total_bytes..padded_len);
+        stream.memset_zeros(&mut tail).w()?;
+    }
+    Ok(QStorage::Cuda(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner,
+            len: total_bytes,
+        },
+        device: device.clone(),
+        dtype,
+    }))
+}
+
+/// Fused read-and-upload path: pread directly from `blob` at `offset` into
+/// the thread-local pinned staging buffer, then async H→D copy. Skips the
+/// intermediate `Vec<u8>` that `GgufBlob::read_to_vec` would allocate, which
+/// strace shows accounts for ~20 s of pread time on a 17 GB Q4_1 load (one
+/// linear copy from page cache into a fresh anonymous Vec per tensor).
+pub fn load_quantized_from_blob(
+    device: &CudaDevice,
+    blob: &super::gguf_file::GgufBlob,
+    offset: u64,
+    n_bytes: usize,
+    dtype: GgmlDType,
+    block_size: usize,
+    type_size: usize,
+) -> Result<super::QStorage> {
+    let padded_len = n_bytes + MATRIX_ROW_PADDING * type_size / block_size;
+    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    let stream = device.cuda_stream();
+
+    // Ping-pong pinned: pick a buffer (sync prior in-flight H→D from this
+    // slot if any), pread into it, queue async H→D, record event for the
+    // next reuse to wait on. The other buffer drains in parallel.
+    let idx = next_pinned_slot(&stream, n_bytes)?;
+    let used_pinned = if let Some(idx) = idx {
+        PINNED_BUFS.with(|cell| -> Result<()> {
+            let mut slots = cell.borrow_mut();
+            let slot = &mut slots.as_mut().unwrap()[idx];
+            let pinned = slot.buf.as_mut().expect("just allocated");
+            // SAFETY: just-allocated, exclusively owned via RefCell, len ≥ n_bytes.
+            let pinned_dst =
+                unsafe { std::slice::from_raw_parts_mut(pinned.as_mut_ptr().w()?, n_bytes) };
+            blob.read_into(offset, pinned_dst)?;
+            let pinned_src: &[u8] =
+                unsafe { std::slice::from_raw_parts(pinned.as_ptr().w()?, n_bytes) };
+            let mut dst_view = inner.slice_mut(..n_bytes);
+            stream.memcpy_htod(pinned_src, &mut dst_view).w()?;
+            Ok(())
+        })?;
+        record_in_flight_event(&stream, idx)?;
+        true
+    } else {
+        false
+    };
+    if !used_pinned {
+        let raw = blob.read_to_vec(offset, n_bytes)?;
+        device.memcpy_htod(raw.as_slice(), &mut inner.slice_mut(..n_bytes))?;
+    }
+    if padded_len > n_bytes {
+        let mut tail = inner.slice_mut(n_bytes..padded_len);
+        stream.memset_zeros(&mut tail).w()?;
+    }
+    Ok(QStorage::Cuda(QCudaStorage {
+        data: PaddedCudaSlice {
+            inner,
+            len: n_bytes,
+        },
+        device: device.clone(),
+        dtype,
+    }))
+}
+
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &CudaDevice,
     data: &[T],
@@ -848,8 +1141,35 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     };
     let dtype = T::DTYPE;
     let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
-    let mut inner = device.alloc_zeros::<u8>(padded_len)?;
-    device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
+    // Skip the full-buffer zero-fill that `alloc_zeros` does — we overwrite
+    // `[0..data.len())` with the tensor bytes immediately, and only the
+    // small `[data.len()..padded_len)` tail needs to be zero-initialized for
+    // kernels that read a rounded-up row stride. For 851 tensors this saves
+    // ~450 ms of pointless `cudaMemset` on a 17 GB Q4_1 load.
+    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    // Pinned-staging fast path with a thread-local reusable buffer.
+    //
+    // `cudaMemcpyHtoDAsync` from pageable host memory bounces through a
+    // driver-managed pinned pool that's both small and serialized on a
+    // context lock — measured at ~0.5 GB/s for a 17 GB Qwen3.5-27B load.
+    // Copying first into our own pinned buffer lets the H→D leg DMA at
+    // full PCIe bandwidth.
+    //
+    // Per-call `cuMemHostAlloc` is too expensive to amortize (851 × ~10 ms
+    // adds 8 s of pure overhead). A thread-local buffer that grows to the
+    // largest tensor seen reuses the same pinned region for the whole load.
+    // Each rayon worker has its own buffer so concurrent uploads don't
+    // contend on a mutex.
+    let stream = device.cuda_stream();
+    if pinned_staged_copy(&stream, data, &mut inner)?.is_none() {
+        // Pinned staging unavailable (driver out of pinned host memory):
+        // fall back to the slow pageable path so loads still complete.
+        device.memcpy_htod(data, &mut inner.slice_mut(..data.len()))?;
+    }
+    if padded_len > data.len() {
+        let mut tail = inner.slice_mut(data.len()..padded_len);
+        stream.memset_zeros(&mut tail).w()?;
+    }
     Ok(QStorage::Cuda(QCudaStorage {
         data: PaddedCudaSlice {
             inner,

@@ -155,13 +155,41 @@ impl Gguf {
 
         if all_same_dtype {
             // Fast path: all constituents share the same GGML dtype.
-            // Read each constituent's raw bytes from the blob and append.
             let dtype = first_dtype;
             let block_size = dtype.block_size();
             let type_size = dtype.type_size();
-            let mut combined: Vec<u8> = Vec::with_capacity(
-                (total_out * in_features / block_size) * type_size,
-            );
+            let total_bytes = (total_out * in_features / block_size) * type_size;
+            let combined_dims = vec![total_out, in_features];
+
+            #[cfg(feature = "cuda")]
+            {
+                if let candle::Device::Cuda(cuda_dev) = &self.device {
+                    let segments: Vec<(u64, usize)> = infos
+                        .iter()
+                        .map(|info| {
+                            let elems = info.shape.elem_count();
+                            let bytes = elems / block_size * type_size;
+                            let abs = self.ct.tensor_data_offset + info.offset;
+                            (abs, bytes)
+                        })
+                        .collect();
+                    let qstorage = candle::quantized::cuda::load_quantized_concat_from_blob(
+                        cuda_dev,
+                        &self.blob,
+                        &segments,
+                        total_bytes,
+                        dtype,
+                        block_size,
+                        type_size,
+                    )?;
+                    let qt = candle::quantized::QTensor::new(qstorage, combined_dims)?;
+                    return QMatMul::from_weights(qt.into());
+                }
+            }
+
+            // Non-CUDA fallback: read each constituent's raw bytes and
+            // concatenate on host.
+            let mut combined: Vec<u8> = Vec::with_capacity(total_bytes);
             for info in &infos {
                 let elems = info.shape.elem_count();
                 if elems % block_size != 0 {
@@ -174,8 +202,6 @@ impl Gguf {
                 let raw = self.blob.read_to_vec(abs_offset, bytes)?;
                 combined.extend_from_slice(&raw);
             }
-
-            let combined_dims = vec![total_out, in_features];
             let qt = candle::quantized::ggml_file::qtensor_from_ggml(
                 dtype,
                 &combined,

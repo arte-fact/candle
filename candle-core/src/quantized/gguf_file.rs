@@ -508,6 +508,22 @@ impl Content {
         }
         let size_in_bytes = tensor_elems / block_size * tensor_info.ggml_dtype.type_size();
         let abs_offset = self.tensor_data_offset + tensor_info.offset;
+
+        #[cfg(feature = "cuda")]
+        {
+            if let Device::Cuda(cuda_dev) = device {
+                let qstorage = super::cuda::load_quantized_from_blob(
+                    cuda_dev,
+                    blob,
+                    abs_offset,
+                    size_in_bytes,
+                    tensor_info.ggml_dtype,
+                    block_size,
+                    tensor_info.ggml_dtype.type_size(),
+                )?;
+                return QTensor::new(qstorage, tensor_info.shape.clone());
+            }
+        }
         let raw_data = blob.read_to_vec(abs_offset, size_in_bytes)?;
         super::ggml_file::qtensor_from_ggml(
             tensor_info.ggml_dtype,
@@ -839,7 +855,20 @@ impl GgufBlob {
                 self.total_len
             );
         }
-        let mut out = vec![0u8; len];
+        // Allocate uninitialized capacity instead of `vec![0u8; len]`. The
+        // pread below fully overwrites every byte; the kernel-side zero-fill
+        // that `vec![0; N]` triggers on each fresh anonymous mmap costs an
+        // extra linear write pass over every tensor at load time. For a
+        // 17 GB GGUF that's ~17 GB of pointless dirtying — visible as ~5 M
+        // minor page faults and ~15 s of `sys` time in the strace.
+        //
+        // SAFETY: we set_len only after `read_exact_at` has written
+        // `written..written+want` bytes for the full range; the resulting
+        // `Vec<u8>` is fully initialized before being returned. If a read
+        // errors, `out` (still len=0) drops without ever exposing uninit
+        // bytes.
+        let mut out: Vec<u8> = Vec::with_capacity(len);
+        let raw: *mut u8 = out.as_mut_ptr();
         let mut written = 0usize;
         let mut cursor = offset;
         while written < len {
@@ -853,13 +882,59 @@ impl GgufBlob {
             let local = cursor - part.virtual_start;
             let avail = (part.len - local) as usize;
             let want = (len - written).min(avail);
+            // SAFETY: the slice is inside the capacity allocated above and
+            // does not alias with `out` (which we never read from while
+            // `raw` is live).
+            let dst = unsafe { std::slice::from_raw_parts_mut(raw.add(written), want) };
             part.file
-                .read_exact_at(&mut out[written..written + want], local)
+                .read_exact_at(dst, local)
                 .map_err(crate::Error::Io)?;
             written += want;
             cursor += want as u64;
         }
+        // SAFETY: the loop above wrote exactly `len` bytes contiguously
+        // starting at `raw`.
+        unsafe { out.set_len(len) };
         Ok(out)
+    }
+
+    /// Read `dst.len()` bytes starting at virtual `offset` into `dst`.
+    /// Caller-supplied buffer — used by the CUDA load path to pread
+    /// directly into a pinned host staging buffer, skipping the
+    /// intermediate `Vec<u8>` allocation that `read_to_vec` does.
+    pub fn read_into(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let len = dst.len();
+        if (offset as usize)
+            .checked_add(len)
+            .map(|end| end as u64 > self.total_len)
+            .unwrap_or(true)
+        {
+            crate::bail!(
+                "GgufBlob: read [{offset}..{}) out of bounds (total {})",
+                offset as usize + len,
+                self.total_len
+            );
+        }
+        let mut written = 0usize;
+        let mut cursor = offset;
+        while written < len {
+            let idx = self
+                .parts
+                .iter()
+                .position(|p| cursor < p.virtual_start + p.len)
+                .ok_or_else(|| crate::Error::Msg("GgufBlob: read past end".into()))?;
+            let part = &self.parts[idx];
+            let local = cursor - part.virtual_start;
+            let avail = (part.len - local) as usize;
+            let want = (len - written).min(avail);
+            part.file
+                .read_exact_at(&mut dst[written..written + want], local)
+                .map_err(crate::Error::Io)?;
+            written += want;
+            cursor += want as u64;
+        }
+        Ok(())
     }
 }
 

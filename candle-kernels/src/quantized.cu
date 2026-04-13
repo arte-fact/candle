@@ -344,6 +344,13 @@ typedef struct {
 } block_q8_1;
 static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_fp16_t) + QK8_0, "wrong q8_1 block size/padding");
 
+#define QK_MXFP4 32
+typedef struct {
+    uint8_t e;                    // E8M0 shared exponent
+    uint8_t qs[QK_MXFP4 / 2];     // 32 packed e2m1 quants (2 per byte)
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == 1 + QK_MXFP4 / 2, "wrong mxfp4 block size/padding");
+
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
 typedef void (*allocate_tiles_cuda_t)(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc);
 typedef void (*load_tiles_cuda_t)(
@@ -1128,6 +1135,50 @@ static __device__ void dequantize_block_q5_1(const void * __restrict__ vx, dst_t
   return dequantize_block<QK5_1, QR5_1, dequantize_q5_1>(vx, yy, nb32);
 }
 
+// ggml_e8m0_to_fp32_half: decode E8M0 shared exponent with implicit *0.5
+// (matches `ggml-impl.h:471` and the Rust `e8m0_to_fp32_half` helper).
+static __device__ __forceinline__ float e8m0_to_fp32_half(uint8_t x) {
+    uint32_t bits;
+    if (x < 2) {
+        bits = 0x00200000u << x;
+    } else {
+        bits = ((uint32_t)x - 1u) << 23;
+    }
+    return __int_as_float((int)bits);
+}
+
+// 16 e2m1 values pre-multiplied by 2 to absorb the implicit 0.5 scale factor.
+static __device__ const int8_t kvalues_mxfp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+};
+
+template<typename dst_t>
+static __device__ void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
+
+    const int64_t i = blockIdx.x;
+
+    // assume 32 threads
+    const int tid = threadIdx.x;
+    const int il  = tid/8;
+    const int ir  = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+
+    dst_t * y = yy + 256*i + 32*ir + 4*il;
+
+    const block_mxfp4 * x = (const block_mxfp4 *)vx + ib;
+    const float d = e8m0_to_fp32_half(x->e);
+
+    const uint8_t * q = x->qs + 4*il;
+
+    for (int l = 0; l < 4; ++l) {
+        y[l+ 0] = (dst_t)(d * (float)kvalues_mxfp4[q[l] & 0x0F]);
+        y[l+16] = (dst_t)(d * (float)kvalues_mxfp4[q[l] >>  4]);
+    }
+}
+
 #define DEQUANTIZE_K(QNAME) \
 extern "C" __global__ void dequantize_block_##QNAME##_f32(const void * __restrict__ vx, float * __restrict__ y) { \
   dequantize_block_##QNAME(vx, y); \
@@ -1155,6 +1206,7 @@ DEQUANTIZE(q4_1)
 DEQUANTIZE(q5_0)
 DEQUANTIZE(q5_1)
 DEQUANTIZE(q8_0)
+DEQUANTIZE(mxfp4)
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static __device__ void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows) {

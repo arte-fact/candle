@@ -116,6 +116,7 @@ impl QStorage {
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
                 GgmlDType::Mxfp4 => metal::load_quantized(d, as_t_slice::<BlockMxfp4>(data)),
+                GgmlDType::Iq4Xs => metal::load_quantized(d, as_t_slice::<BlockIq4Xs>(data)),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -134,6 +135,7 @@ impl QStorage {
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
                 GgmlDType::Mxfp4 => cuda::load_quantized(d, as_t_slice::<BlockMxfp4>(data)),
+                GgmlDType::Iq4Xs => cuda::load_quantized(d, as_t_slice::<BlockIq4Xs>(data)),
             },
             Device::Hip(d) => match dtype {
                 GgmlDType::F32 => hip::load_quantized(d, as_t_slice::<f32>(data)),
@@ -152,6 +154,7 @@ impl QStorage {
                 GgmlDType::Q8K => hip::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => hip::load_quantized(d, as_t_slice::<bf16>(data)),
                 GgmlDType::Mxfp4 => hip::load_quantized(d, as_t_slice::<BlockMxfp4>(data)),
+                GgmlDType::Iq4Xs => hip::load_quantized(d, as_t_slice::<BlockIq4Xs>(data)),
             },
         }
     }
@@ -322,6 +325,11 @@ pub enum GgmlDType {
     /// gpt-oss / Phi 4 family models. candle currently only supports loading
     /// MXFP4 weights — they're always dequantized to F32 before matmul.
     Mxfp4,
+    /// IQ4_XS — 4-bit importance-matrix K-quant (ggml type 23).
+    /// Used by Unsloth "UD" dynamic quants (e.g. Devstral UD-Q4_K_XL) for a
+    /// subset of weight tensors. Loaded via CPU dequantization to F32; no
+    /// native MMVQ kernel yet.
+    Iq4Xs,
 }
 
 impl GgmlDType {
@@ -345,6 +353,8 @@ impl GgmlDType {
             30 => Self::BF16,
             // MXFP4 — see ggml-turbo `GGML_TYPE_MXFP4 = 39`.
             39 => Self::Mxfp4,
+            // IQ4_XS — llama.cpp `GGML_TYPE_IQ4_XS = 23`.
+            23 => Self::Iq4Xs,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -369,6 +379,7 @@ impl GgmlDType {
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
             Self::Mxfp4 => 39,
+            Self::Iq4Xs => 23,
         }
     }
 
@@ -391,6 +402,7 @@ impl GgmlDType {
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
             Self::Mxfp4 => Box::new(vec![BlockMxfp4::zeros(); elem_count / BlockMxfp4::BLCK_SIZE]),
+            Self::Iq4Xs => Box::new(vec![BlockIq4Xs::zeros(); elem_count / BlockIq4Xs::BLCK_SIZE]),
         }
     }
 
@@ -412,6 +424,7 @@ impl GgmlDType {
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
             Self::Mxfp4 => Box::new(as_t_slice::<BlockMxfp4>(data).to_vec()),
+            Self::Iq4Xs => Box::new(as_t_slice::<BlockIq4Xs>(data).to_vec()),
         }
     }
 
@@ -435,6 +448,7 @@ impl GgmlDType {
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
             Self::Mxfp4 => std::mem::size_of::<BlockMxfp4>(),
+            Self::Iq4Xs => std::mem::size_of::<BlockIq4Xs>(),
         }
     }
 
@@ -451,6 +465,7 @@ impl GgmlDType {
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
             Self::Mxfp4 => k_quants::QK_MXFP4,
+            Self::Iq4Xs => k_quants::QK_K,
         }
     }
 }
@@ -689,6 +704,34 @@ impl QTensor {
         crate::tensor::from_storage(storage, self.shape.clone(), none, false).to_device(device)
     }
 
+    /// For BF16 weights, return a `Tensor<BF16>` that shares bytes with the
+    /// GGUF storage (via a fresh D2D copy). Used by `QMatMul::from_arc` to
+    /// avoid the F32-upcast doubling that makes BF16 models OOM on modest
+    /// GPUs. CUDA-only for now; Hip/Metal/Cpu fall back to full dequantize.
+    pub fn as_bf16_tensor(&self, device: &Device) -> Result<Tensor> {
+        if self.dtype() != GgmlDType::BF16 {
+            crate::bail!("as_bf16_tensor: QTensor must be BF16, got {:?}", self.dtype());
+        }
+        let elem_count = self.shape.elem_count();
+        match &self.storage {
+            QStorage::Cuda(cuda_s) => {
+                let storage = cuda_s.as_bf16_storage(elem_count)?;
+                let none = crate::op::BackpropOp::none();
+                crate::tensor::from_storage(
+                    Storage::Cuda(storage),
+                    self.shape.clone(),
+                    none,
+                    false,
+                )
+                .to_device(device)
+            }
+            _ => {
+                // Fallback: full dequantize (upcast to F32) then cast back to BF16.
+                self.dequantize(device)?.to_dtype(crate::DType::BF16)
+            }
+        }
+    }
+
     pub fn dequantize_f16(&self, device: &Device) -> Result<Tensor> {
         match &self.storage {
             QStorage::Cuda(s) => {
@@ -877,6 +920,15 @@ thread_local! {
 
 impl QMatMul {
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
+        let device = qtensor.device();
+        // NOTE: a BF16 fast path exists via `QTensor::as_bf16_tensor` but is
+        // not wired in by default. The D2D transmute+copy peaks at 2×
+        // (allocation alive alongside the source QStorage), so on 24 GiB
+        // cards Qwen3.5-9B-BF16 still OOMs. A future loader refactor that
+        // loads BF16 GGUF tensors as native `Tensor<BF16>` (bypassing
+        // QStorage entirely) avoids the peak. Also, `Self::Tensor` matmul
+        // expects dtypes to match; models that mix BF16 weights with F32
+        // activations (e.g. gemma-4 norms) need the F32 force-dequant path.
         let dequantize = match qtensor.dtype() {
             // F32/F16/BF16: trivially dequantize.
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
@@ -884,13 +936,17 @@ impl QMatMul {
             // to F32 at load time and let `Self::Tensor` handle the matmul via
             // the regular F32 path.
             GgmlDType::Mxfp4 => true,
+            // IQ4_XS: no native GPU matmul kernel; dequantize to F32 at load.
+            // Used by Unsloth "UD" dynamic quants for ~5 % of tensors — the
+            // per-model dequant cost is small (e.g. Devstral: 20/363 tensors).
+            GgmlDType::Iq4Xs => true,
             _ => DEQUANTIZE_ALL.with(|b| *b),
         };
         let t = if dequantize {
-            let tensor = qtensor.dequantize(&qtensor.device())?;
+            let tensor = qtensor.dequantize(&device)?;
             Self::Tensor(tensor)
         } else if DEQUANTIZE_ALL_F16.with(|b| *b) {
-            let tensor = qtensor.dequantize_f16(&qtensor.device())?;
+            let tensor = qtensor.dequantize_f16(&device)?;
             Self::TensorF16(tensor)
         } else {
             Self::QTensor(qtensor)

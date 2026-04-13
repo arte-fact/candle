@@ -181,6 +181,81 @@ impl GgmlType for BlockMxfp4 {
     }
 }
 
+/// IQ4_XS — 4-bit importance-matrix K-quant (ggml type 23, "Extra Small").
+///
+/// Layout (see llama.cpp `ggml-common.h` `block_iq4_xs`):
+/// - `d`: fp16 super-block scale (one per 256 elements)
+/// - `scales_h`: high 2 bits of each of 8 sub-block scales (`QK_K/32 = 8`)
+/// - `scales_l`: low 4 bits of each of 8 sub-block scales (4 bytes packed)
+/// - `qs`: 128 bytes packing 256 e2m1-style 4-bit indices (2 per byte)
+///
+/// Each dequantized value is `d * (scale_6bit - 32) * KVALUES_IQ4NL[nibble]`.
+#[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
+pub struct BlockIq4Xs {
+    pub(crate) d: f16,
+    pub(crate) scales_h: u16,
+    pub(crate) scales_l: [u8; QK_K / 64],
+    pub(crate) qs: [u8; QK_K / 2],
+}
+const _: () = assert!(
+    std::mem::size_of::<BlockIq4Xs>() == 2 + 2 + QK_K / 64 + QK_K / 2,
+    "wrong iq4_xs block size"
+);
+
+/// 16-entry nonlinear lookup table shared by IQ4_NL and IQ4_XS (see
+/// llama.cpp `ggml-common.h::kvalues_iq4nl`).
+pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+impl GgmlType for BlockIq4Xs {
+    const DTYPE: GgmlDType = GgmlDType::Iq4Xs;
+    const BLCK_SIZE: usize = QK_K;
+    type VecDotType = BlockQ8K;
+
+    fn to_float(xs: &[Self], ys: &mut [f32]) {
+        let nb = ys.len() / QK_K;
+        for i in 0..nb {
+            let d_super = xs[i].d.to_f32();
+            let scales_h = xs[i].scales_h;
+            let mut y_off = i * QK_K;
+            let mut q_off = 0usize;
+            for ib in 0..(QK_K / 32) {
+                let ls = ((xs[i].scales_l[ib / 2] >> (4 * (ib & 1))) & 0x0F) as i32;
+                let hs = ((scales_h >> (2 * ib)) & 0x3) as i32;
+                let scale_6bit = (ls | (hs << 4)) - 32;
+                let dl = d_super * scale_6bit as f32;
+                for j in 0..16 {
+                    let q = xs[i].qs[q_off + j];
+                    let lo = KVALUES_IQ4NL[(q & 0x0F) as usize] as f32;
+                    let hi = KVALUES_IQ4NL[((q >> 4) & 0x0F) as usize] as f32;
+                    ys[y_off + j] = dl * lo;
+                    ys[y_off + j + 16] = dl * hi;
+                }
+                q_off += 16;
+                y_off += 32;
+            }
+        }
+    }
+
+    fn from_float(_xs: &[f32], _ys: &mut [Self]) {
+        unimplemented!(
+            "IQ4_XS quantization (write path) is not implemented; candle only loads IQ4_XS weights from existing GGUFs."
+        )
+    }
+
+    fn vec_dot(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        unimplemented!(
+            "IQ4_XS vec_dot is not implemented — IQ4_XS weights are always dequantized before matmul."
+        )
+    }
+
+    fn vec_dot_unopt(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
+        unimplemented!("IQ4_XS vec_dot_unopt is not implemented.")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[repr(C)]
 pub struct BlockQ2K {
