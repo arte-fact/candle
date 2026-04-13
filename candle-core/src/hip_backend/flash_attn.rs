@@ -1456,12 +1456,30 @@ pub fn gqa_attention_decode_mv(
         );
     }
 
-    let kernel_name = match d {
-        64 => "gqa_decode_mv_d64_f32",
-        128 => "gqa_decode_mv_d128_f32",
-        256 => "gqa_decode_mv_d256_f32",
-        512 => "gqa_decode_mv_d512_f32",
-        _ => crate::bail!("gqa_attention_decode_mv: unsupported D={d}"),
+    // Phase Q2: `gqa_decode_mv_fast_d{256,512}_f32` uses float2 loads +
+    // 128-thread block + cross-warp LDS reduce. Targets the 73 μs/call
+    // vs turbo's 9 μs gap. Fast kernel is the default on compatible
+    // shapes (D ∈ {256, 512}); smaller heads fall back to the original
+    // scalar 64-thread kernel where the gain is negligible.
+    // Opt-out via `CANDLE_DECODE_MV_FAST=0` for bisecting regressions.
+    let use_fast = matches!(d, 256 | 512)
+        && std::env::var("CANDLE_DECODE_MV_FAST")
+            .map(|v| v != "0" && v != "false")
+            .unwrap_or(true);
+    let (kernel_name, block_dim_x): (&str, u32) = if use_fast {
+        match d {
+            256 => ("gqa_decode_mv_fast_d256_f32", WARP_SIZE),
+            512 => ("gqa_decode_mv_fast_d512_f32", WARP_SIZE),
+            _ => unreachable!(),
+        }
+    } else {
+        match d {
+            64 => ("gqa_decode_mv_d64_f32", WARP_SIZE),
+            128 => ("gqa_decode_mv_d128_f32", WARP_SIZE),
+            256 => ("gqa_decode_mv_d256_f32", WARP_SIZE),
+            512 => ("gqa_decode_mv_d512_f32", WARP_SIZE),
+            _ => crate::bail!("gqa_attention_decode_mv: unsupported D={d}"),
+        }
     };
 
     // Mask: (1,1,1,T_mask) or (B,1,1,T_mask). T_mask must be ≥ l_k_iter.
@@ -1513,7 +1531,7 @@ pub fn gqa_attention_decode_mv(
 
     let cfg = LaunchConfig {
         grid_dim: (1, n_head as u32, b as u32),
-        block_dim: (WARP_SIZE, 1, 1),
+        block_dim: (block_dim_x, 1, 1),
         shared_mem_bytes: 0,
     };
 

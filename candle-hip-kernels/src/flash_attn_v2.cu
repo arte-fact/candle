@@ -689,3 +689,146 @@ gqa_decode_mv_d512_f32(
     gqa_decode_mv_impl<512>(q, k, v, mask, out, B, H_q, H_kv, L_k,
                             scale, n_rep, mask_b_stride, L_k_iter);
 }
+
+// ============================================================================
+// Phase Q2 — fast mat-vec decode attention
+// ----------------------------------------------------------------------------
+// Same semantics as gqa_decode_mv_impl above, but:
+//   * Single-warp block (BLOCK_SIZE = WARP_SIZE = 64) — no cross-warp LDS
+//     sync, no __syncthreads in the T loop.
+//   * float2 vectorised loads: each thread reads 8 bytes per K/V access,
+//     halving the VMEM instruction count vs the scalar kernel.
+//   * ggml-mmvf-style thread→element mapping: thread `lane` owns the
+//     float2 pairs at positions `lane, lane+WARP_SIZE, ...` in the
+//     float2-indexed space. Adjacent lanes read adjacent 8-byte
+//     chunks → perfect coalescing on gfx906's `global_load_dwordx2` path.
+//
+// First iteration of Phase Q2 tried a 128-thread block with cross-warp
+// LDS reduce; that *regressed* to 46 t/s (vs 54 for the scalar kernel)
+// because two `__syncthreads` per T iteration dominated the runtime
+// at our low occupancy (E4B has only n_head=2-8 blocks per layer,
+// already CU-starved on MI50's 60 CUs — making sync latency matter more
+// than VMEM transaction count). The single-warp float2 version keeps
+// the warp-local reduction unchanged and just swaps scalar for vector
+// loads.
+//
+// Only defined for D=256 and D=512 — smaller heads use the original
+// scalar kernel (benchmarks showed negligible difference at those sizes).
+template <int D, int BLOCK_SIZE>
+static __device__ __forceinline__ void gqa_decode_mv_fast_impl(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep,
+    int mask_b_stride, int L_k_iter)
+{
+    static_assert(D % 2 == 0, "D must be even for float2 loads");
+    static_assert(BLOCK_SIZE == WARP_SIZE, "Q2 fast impl: single-warp block only");
+    static_assert(D / 2 >= BLOCK_SIZE, "D/2 must be >= BLOCK_SIZE");
+    static_assert((D / 2) % BLOCK_SIZE == 0, "D/2 must be a multiple of BLOCK_SIZE");
+    constexpr int NCOLS2 = D / 2;                 // float2 positions in one row
+    constexpr int F2_PER_LANE = NCOLS2 / BLOCK_SIZE;
+
+    const int h_idx = blockIdx.y;
+    const int b_idx = blockIdx.z;
+    const int lane  = threadIdx.x;
+
+    // llama-style GQA: q head → kv head.
+    const int h_kv = (n_rep > 1) ? (h_idx / n_rep) : h_idx;
+
+    const int64_t q_off  = ((int64_t)(b_idx * H_q) + h_idx) * D;
+    const int64_t kv_off = ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)L_k * D;
+
+    const float2 * q2       = (const float2 *)(q + q_off);
+    const float2 * k2_base  = (const float2 *)(k + kv_off);
+    const float2 * v2_base  = (const float2 *)(v + kv_off);
+    float *        o_ptr    = out + q_off;
+
+    const float * mask_row = (mask != nullptr)
+        ? mask + (int64_t)b_idx * (int64_t)mask_b_stride
+        : nullptr;
+
+    // Per-thread Q registers: F2_PER_LANE float2 values.
+    float2 q_reg[F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        q_reg[i] = q2[lane + i * BLOCK_SIZE];
+    }
+    // Output accumulators, 2×F2_PER_LANE scalars (online-softmax running o).
+    float o_reg[2 * F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < 2 * F2_PER_LANE; ++i) o_reg[i] = 0.0f;
+
+    // Online softmax scalars — per-lane, same value after warp reduce.
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    const int L_k_effective = (L_k_iter >= 0) ? L_k_iter : L_k;
+
+    for (int t = 0; t < L_k_effective; ++t) {
+        const float2 * k_row = k2_base + (int64_t)t * NCOLS2;
+        const float2 * v_row = v2_base + (int64_t)t * NCOLS2;
+
+        // Per-thread partial dot over this K row.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            float2 kv = k_row[lane + i * BLOCK_SIZE];
+            partial += q_reg[i].x * kv.x + q_reg[i].y * kv.y;
+        }
+
+        // Warp-wide reduce (no __syncthreads — single-warp block).
+        float s_t = v2_warp_reduce_sum(partial) * scale;
+        if (mask_row != nullptr) s_t += mask_row[t];
+
+        const float m_new = fmaxf(m_i, s_t);
+        const float alpha = gfx906_fast_exp(m_i - m_new);
+        const float p     = gfx906_fast_exp(s_t - m_new);
+
+        // V·attn accumulate, coalesced float2 reads.
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            float2 vv = v_row[lane + i * BLOCK_SIZE];
+            o_reg[2*i]     = alpha * o_reg[2*i]     + p * vv.x;
+            o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * vv.y;
+        }
+        l_i = alpha * l_i + p;
+        m_i = m_new;
+    }
+
+    // Normalise + write back.
+    const float inv_l = gfx906_rcp(l_i);
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        const int base = 2 * (lane + i * BLOCK_SIZE);
+        o_ptr[base]     = o_reg[2*i]     * inv_l;
+        o_ptr[base + 1] = o_reg[2*i + 1] * inv_l;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d256_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_fast_impl<256, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                     scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d512_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_fast_impl<512, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                     scale, n_rep, mask_b_stride, L_k_iter);
+}
