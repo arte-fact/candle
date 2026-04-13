@@ -3284,43 +3284,76 @@ mul_mat_vec_q4_K_q8_1_wc(
           sc[2]=((const uint8_t*)aux)[2]; sc[3]=((const uint8_t*)aux)[3];
           mn[0]=((const uint8_t*)aux)[4]; mn[1]=((const uint8_t*)aux)[5];
           mn[2]=((const uint8_t*)aux)[6]; mn[3]=((const uint8_t*)aux)[7];
-          aux[0]=((a[4]>>0)&0x0f0f)|((a[0]&0xc0c0)>>2);
-          aux[1]=((a[4]>>4)&0x0f0f)|((a[1]&0xc0c0)>>2);
-          aux[2]=((a[5]>>0)&0x0f0f)|((a[2]&0xc0c0)>>2);
-          aux[3]=((a[5]>>4)&0x0f0f)|((a[3]&0xc0c0)>>2);
+          // Subs 4,5 scales: low-4 of a[4], high-2 from a[0]. Mins: high-4 of a[4], high-2 from a[2].
+          aux[0]=((a[4]>>0)&0x0f0f)|((a[0]&0xc0c0)>>2);  // scales 4,5
+          aux[1]=((a[5]>>0)&0x0f0f)|((a[1]&0xc0c0)>>2);  // scales 6,7
+          aux[2]=((a[4]>>4)&0x0f0f)|((a[2]&0xc0c0)>>2);  // mins 4,5
+          aux[3]=((a[5]>>4)&0x0f0f)|((a[3]&0xc0c0)>>2);  // mins 6,7
           sc[4]=((const uint8_t*)aux)[0]; sc[5]=((const uint8_t*)aux)[1];
           sc[6]=((const uint8_t*)aux)[2]; sc[7]=((const uint8_t*)aux)[3];
           mn[4]=((const uint8_t*)aux)[4]; mn[5]=((const uint8_t*)aux)[5];
           mn[6]=((const uint8_t*)aux)[6]; mn[7]=((const uint8_t*)aux)[7];
         }
         float sumf_d = 0.0f, sumf_m = 0.0f;
+        // Q4_K actual layout: qs[pair*32..(pair+1)*32] holds 32 bytes where
+        // LOW nibbles encode sub-block 2*pair, HIGH nibbles encode sub-block 2*pair+1.
+        // 4 pairs × 2 sub-blocks = 8 sub-blocks.
         #pragma unroll
-        for (int sub = 0; sub < 8; ++sub) {
-            const block_q8_1 * bq8 = bq8_base + sub;
-            const float d8 = __low2float(bq8->ds);
-            const int * q4 = (const int *)(bq4->qs + sub * 16);
-            const int4 q8_lo = *((const int4 *)(bq8->qs));
-            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
-            int sumi = 0;
-            sumi = ggml_cuda_dp4a(q4[0]&0x0F0F0F0F, q8_lo.x, sumi);
-            sumi = ggml_cuda_dp4a(q4[1]&0x0F0F0F0F, q8_lo.y, sumi);
-            sumi = ggml_cuda_dp4a(q4[2]&0x0F0F0F0F, q8_lo.z, sumi);
-            sumi = ggml_cuda_dp4a(q4[3]&0x0F0F0F0F, q8_lo.w, sumi);
-            sumi = ggml_cuda_dp4a((q4[0]>>4)&0x0F0F0F0F, q8_hi.x, sumi);
-            sumi = ggml_cuda_dp4a((q4[1]>>4)&0x0F0F0F0F, q8_hi.y, sumi);
-            sumi = ggml_cuda_dp4a((q4[2]>>4)&0x0F0F0F0F, q8_hi.z, sumi);
-            sumi = ggml_cuda_dp4a((q4[3]>>4)&0x0F0F0F0F, q8_hi.w, sumi);
-            int sq8 = 0;
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.x, sq8);
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.y, sq8);
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.z, sq8);
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_lo.w, sq8);
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.x, sq8);
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.y, sq8);
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.z, sq8);
-            sq8 = ggml_cuda_dp4a(0x01010101, q8_hi.w, sq8);
-            sumf_d += d8 * (sumi * sc[sub]);
-            sumf_m += d8 * (sq8 * mn[sub]);
+        for (int pair = 0; pair < 4; ++pair) {
+            const int sub_lo = 2 * pair;
+            const int sub_hi = sub_lo + 1;
+            const block_q8_1 * bq8_l = bq8_base + sub_lo;
+            const block_q8_1 * bq8_h = bq8_base + sub_hi;
+            const float d8l = __low2float(bq8_l->ds);
+            const float d8h = __low2float(bq8_h->ds);
+            // 32 bytes of qs = 8 int32 for this pair.
+            const int * q4 = (const int *)(bq4->qs + pair * 32);
+            const int4 q8l_lo = *((const int4 *)(bq8_l->qs));
+            const int4 q8l_hi = *((const int4 *)(bq8_l->qs + 16));
+            const int4 q8h_lo = *((const int4 *)(bq8_h->qs));
+            const int4 q8h_hi = *((const int4 *)(bq8_h->qs + 16));
+            // Low nibbles × bq8_l (sub_lo)
+            int sumi_l = 0;
+            sumi_l = ggml_cuda_dp4a(q4[0]&0x0F0F0F0F, q8l_lo.x, sumi_l);
+            sumi_l = ggml_cuda_dp4a(q4[1]&0x0F0F0F0F, q8l_lo.y, sumi_l);
+            sumi_l = ggml_cuda_dp4a(q4[2]&0x0F0F0F0F, q8l_lo.z, sumi_l);
+            sumi_l = ggml_cuda_dp4a(q4[3]&0x0F0F0F0F, q8l_lo.w, sumi_l);
+            sumi_l = ggml_cuda_dp4a(q4[4]&0x0F0F0F0F, q8l_hi.x, sumi_l);
+            sumi_l = ggml_cuda_dp4a(q4[5]&0x0F0F0F0F, q8l_hi.y, sumi_l);
+            sumi_l = ggml_cuda_dp4a(q4[6]&0x0F0F0F0F, q8l_hi.z, sumi_l);
+            sumi_l = ggml_cuda_dp4a(q4[7]&0x0F0F0F0F, q8l_hi.w, sumi_l);
+            // High nibbles × bq8_h (sub_hi)
+            int sumi_h = 0;
+            sumi_h = ggml_cuda_dp4a((q4[0]>>4)&0x0F0F0F0F, q8h_lo.x, sumi_h);
+            sumi_h = ggml_cuda_dp4a((q4[1]>>4)&0x0F0F0F0F, q8h_lo.y, sumi_h);
+            sumi_h = ggml_cuda_dp4a((q4[2]>>4)&0x0F0F0F0F, q8h_lo.z, sumi_h);
+            sumi_h = ggml_cuda_dp4a((q4[3]>>4)&0x0F0F0F0F, q8h_lo.w, sumi_h);
+            sumi_h = ggml_cuda_dp4a((q4[4]>>4)&0x0F0F0F0F, q8h_hi.x, sumi_h);
+            sumi_h = ggml_cuda_dp4a((q4[5]>>4)&0x0F0F0F0F, q8h_hi.y, sumi_h);
+            sumi_h = ggml_cuda_dp4a((q4[6]>>4)&0x0F0F0F0F, q8h_hi.z, sumi_h);
+            sumi_h = ggml_cuda_dp4a((q4[7]>>4)&0x0F0F0F0F, q8h_hi.w, sumi_h);
+            // Sum-of-q8 per sub-block for min correction
+            int sq8_l = 0, sq8_h = 0;
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_lo.x, sq8_l);
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_lo.y, sq8_l);
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_lo.z, sq8_l);
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_lo.w, sq8_l);
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_hi.x, sq8_l);
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_hi.y, sq8_l);
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_hi.z, sq8_l);
+            sq8_l = ggml_cuda_dp4a(0x01010101, q8l_hi.w, sq8_l);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_lo.x, sq8_h);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_lo.y, sq8_h);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_lo.z, sq8_h);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_lo.w, sq8_h);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_hi.x, sq8_h);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_hi.y, sq8_h);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_hi.z, sq8_h);
+            sq8_h = ggml_cuda_dp4a(0x01010101, q8h_hi.w, sq8_h);
+            sumf_d += d8l * (sumi_l * sc[sub_lo]);
+            sumf_d += d8h * (sumi_h * sc[sub_hi]);
+            sumf_m += d8l * (sq8_l * mn[sub_lo]);
+            sumf_m += d8h * (sq8_h * mn[sub_hi]);
         }
         sumf += dall * sumf_d - dmin * sumf_m;
     }
@@ -3364,45 +3397,76 @@ mul_mat_vec_q5_K_q8_1_wc(
           sc[2]=((const uint8_t*)aux)[2]; sc[3]=((const uint8_t*)aux)[3];
           mn[0]=((const uint8_t*)aux)[4]; mn[1]=((const uint8_t*)aux)[5];
           mn[2]=((const uint8_t*)aux)[6]; mn[3]=((const uint8_t*)aux)[7];
-          aux[0]=((a[4]>>0)&0x0f0f)|((a[0]&0xc0c0)>>2);
-          aux[1]=((a[4]>>4)&0x0f0f)|((a[1]&0xc0c0)>>2);
-          aux[2]=((a[5]>>0)&0x0f0f)|((a[2]&0xc0c0)>>2);
-          aux[3]=((a[5]>>4)&0x0f0f)|((a[3]&0xc0c0)>>2);
+          // Subs 4,5 scales & mins: see Q4_K derivation — need aux[2] for mins,
+          // not aux[1] (which is scales for pair 6,7).
+          aux[0]=((a[4]>>0)&0x0f0f)|((a[0]&0xc0c0)>>2);  // scales 4,5
+          aux[1]=((a[5]>>0)&0x0f0f)|((a[1]&0xc0c0)>>2);  // scales 6,7
+          aux[2]=((a[4]>>4)&0x0f0f)|((a[2]&0xc0c0)>>2);  // mins 4,5
+          aux[3]=((a[5]>>4)&0x0f0f)|((a[3]&0xc0c0)>>2);  // mins 6,7
           sc[4]=((const uint8_t*)aux)[0]; sc[5]=((const uint8_t*)aux)[1];
           sc[6]=((const uint8_t*)aux)[2]; sc[7]=((const uint8_t*)aux)[3];
           mn[4]=((const uint8_t*)aux)[4]; mn[5]=((const uint8_t*)aux)[5];
           mn[6]=((const uint8_t*)aux)[6]; mn[7]=((const uint8_t*)aux)[7];
         }
         float sumf_d = 0.0f, sumf_m = 0.0f;
+        // Q5_K layout: qs = 128 bytes paired like Q4_K (qs[pair*32..(pair+1)*32]
+        // low nibble = sub 2*pair, high nibble = sub 2*pair+1).
+        // qh = 32 bytes shared: bit N of qh byte v = high bit of value v in sub N.
+        const int * qh4 = (const int *)bq5->qh;  // 8 int32s, 32 bytes total
         #pragma unroll
-        for (int sub = 0; sub < 8; ++sub) {
-            const block_q8_1 * bq8 = bq8_base + sub;
-            const float d8 = __low2float(bq8->ds);
-            const int * ql = (const int *)(bq5->qs + sub * 16);
-            const int * qh_ptr = (const int *)(bq5->qh + sub * 4);
-            const int qh = qh_ptr[0];
-            const int4 q8_lo = *((const int4 *)(bq8->qs));
-            const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
-            int sumi = 0;
-            { int v0=(ql[0]&0x0F0F0F0F)|(((qh>>0)&0x01010101)<<4);
-              int v1=(ql[1]&0x0F0F0F0F)|(((qh>>4)&0x01010101)<<4);
-              int v2=(ql[2]&0x0F0F0F0F)|(((qh>>8)&0x01010101)<<4);
-              int v3=(ql[3]&0x0F0F0F0F)|(((qh>>12)&0x01010101)<<4);
-              sumi=ggml_cuda_dp4a(v0,q8_lo.x,sumi); sumi=ggml_cuda_dp4a(v1,q8_lo.y,sumi);
-              sumi=ggml_cuda_dp4a(v2,q8_lo.z,sumi); sumi=ggml_cuda_dp4a(v3,q8_lo.w,sumi); }
-            { int v0=((ql[0]>>4)&0x0F0F0F0F)|(((qh>>16)&0x01010101)<<4);
-              int v1=((ql[1]>>4)&0x0F0F0F0F)|(((qh>>20)&0x01010101)<<4);
-              int v2=((ql[2]>>4)&0x0F0F0F0F)|(((qh>>24)&0x01010101)<<4);
-              int v3=((ql[3]>>4)&0x0F0F0F0F)|(((qh>>28)&0x01010101)<<4);
-              sumi=ggml_cuda_dp4a(v0,q8_hi.x,sumi); sumi=ggml_cuda_dp4a(v1,q8_hi.y,sumi);
-              sumi=ggml_cuda_dp4a(v2,q8_hi.z,sumi); sumi=ggml_cuda_dp4a(v3,q8_hi.w,sumi); }
-            int sq8=0;
-            sq8=ggml_cuda_dp4a(0x01010101,q8_lo.x,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_lo.y,sq8);
-            sq8=ggml_cuda_dp4a(0x01010101,q8_lo.z,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_lo.w,sq8);
-            sq8=ggml_cuda_dp4a(0x01010101,q8_hi.x,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_hi.y,sq8);
-            sq8=ggml_cuda_dp4a(0x01010101,q8_hi.z,sq8); sq8=ggml_cuda_dp4a(0x01010101,q8_hi.w,sq8);
-            sumf_d += d8 * (sumi * sc[sub]);
-            sumf_m += d8 * (sq8 * mn[sub]);
+        for (int pair = 0; pair < 4; ++pair) {
+            const int sub_lo = 2 * pair;
+            const int sub_hi = sub_lo + 1;
+            const block_q8_1 * bq8_l = bq8_base + sub_lo;
+            const block_q8_1 * bq8_h = bq8_base + sub_hi;
+            const float d8l = __low2float(bq8_l->ds);
+            const float d8h = __low2float(bq8_h->ds);
+            const int * ql4 = (const int *)(bq5->qs + pair * 32);
+            const int4 q8l_lo = *((const int4 *)(bq8_l->qs));
+            const int4 q8l_hi = *((const int4 *)(bq8_l->qs + 16));
+            const int4 q8h_lo = *((const int4 *)(bq8_h->qs));
+            const int4 q8h_hi = *((const int4 *)(bq8_h->qs + 16));
+            int sumi_l = 0;
+            {   int v0=(ql4[0]&0x0F0F0F0F)|(((qh4[0]>>sub_lo)&0x01010101)<<4);
+                int v1=(ql4[1]&0x0F0F0F0F)|(((qh4[1]>>sub_lo)&0x01010101)<<4);
+                int v2=(ql4[2]&0x0F0F0F0F)|(((qh4[2]>>sub_lo)&0x01010101)<<4);
+                int v3=(ql4[3]&0x0F0F0F0F)|(((qh4[3]>>sub_lo)&0x01010101)<<4);
+                sumi_l=ggml_cuda_dp4a(v0,q8l_lo.x,sumi_l); sumi_l=ggml_cuda_dp4a(v1,q8l_lo.y,sumi_l);
+                sumi_l=ggml_cuda_dp4a(v2,q8l_lo.z,sumi_l); sumi_l=ggml_cuda_dp4a(v3,q8l_lo.w,sumi_l);
+                int v4=(ql4[4]&0x0F0F0F0F)|(((qh4[4]>>sub_lo)&0x01010101)<<4);
+                int v5=(ql4[5]&0x0F0F0F0F)|(((qh4[5]>>sub_lo)&0x01010101)<<4);
+                int v6=(ql4[6]&0x0F0F0F0F)|(((qh4[6]>>sub_lo)&0x01010101)<<4);
+                int v7=(ql4[7]&0x0F0F0F0F)|(((qh4[7]>>sub_lo)&0x01010101)<<4);
+                sumi_l=ggml_cuda_dp4a(v4,q8l_hi.x,sumi_l); sumi_l=ggml_cuda_dp4a(v5,q8l_hi.y,sumi_l);
+                sumi_l=ggml_cuda_dp4a(v6,q8l_hi.z,sumi_l); sumi_l=ggml_cuda_dp4a(v7,q8l_hi.w,sumi_l);
+            }
+            int sumi_h = 0;
+            {   int v0=((ql4[0]>>4)&0x0F0F0F0F)|(((qh4[0]>>sub_hi)&0x01010101)<<4);
+                int v1=((ql4[1]>>4)&0x0F0F0F0F)|(((qh4[1]>>sub_hi)&0x01010101)<<4);
+                int v2=((ql4[2]>>4)&0x0F0F0F0F)|(((qh4[2]>>sub_hi)&0x01010101)<<4);
+                int v3=((ql4[3]>>4)&0x0F0F0F0F)|(((qh4[3]>>sub_hi)&0x01010101)<<4);
+                sumi_h=ggml_cuda_dp4a(v0,q8h_lo.x,sumi_h); sumi_h=ggml_cuda_dp4a(v1,q8h_lo.y,sumi_h);
+                sumi_h=ggml_cuda_dp4a(v2,q8h_lo.z,sumi_h); sumi_h=ggml_cuda_dp4a(v3,q8h_lo.w,sumi_h);
+                int v4=((ql4[4]>>4)&0x0F0F0F0F)|(((qh4[4]>>sub_hi)&0x01010101)<<4);
+                int v5=((ql4[5]>>4)&0x0F0F0F0F)|(((qh4[5]>>sub_hi)&0x01010101)<<4);
+                int v6=((ql4[6]>>4)&0x0F0F0F0F)|(((qh4[6]>>sub_hi)&0x01010101)<<4);
+                int v7=((ql4[7]>>4)&0x0F0F0F0F)|(((qh4[7]>>sub_hi)&0x01010101)<<4);
+                sumi_h=ggml_cuda_dp4a(v4,q8h_hi.x,sumi_h); sumi_h=ggml_cuda_dp4a(v5,q8h_hi.y,sumi_h);
+                sumi_h=ggml_cuda_dp4a(v6,q8h_hi.z,sumi_h); sumi_h=ggml_cuda_dp4a(v7,q8h_hi.w,sumi_h);
+            }
+            int sq8_l = 0, sq8_h = 0;
+            sq8_l=ggml_cuda_dp4a(0x01010101,q8l_lo.x,sq8_l); sq8_l=ggml_cuda_dp4a(0x01010101,q8l_lo.y,sq8_l);
+            sq8_l=ggml_cuda_dp4a(0x01010101,q8l_lo.z,sq8_l); sq8_l=ggml_cuda_dp4a(0x01010101,q8l_lo.w,sq8_l);
+            sq8_l=ggml_cuda_dp4a(0x01010101,q8l_hi.x,sq8_l); sq8_l=ggml_cuda_dp4a(0x01010101,q8l_hi.y,sq8_l);
+            sq8_l=ggml_cuda_dp4a(0x01010101,q8l_hi.z,sq8_l); sq8_l=ggml_cuda_dp4a(0x01010101,q8l_hi.w,sq8_l);
+            sq8_h=ggml_cuda_dp4a(0x01010101,q8h_lo.x,sq8_h); sq8_h=ggml_cuda_dp4a(0x01010101,q8h_lo.y,sq8_h);
+            sq8_h=ggml_cuda_dp4a(0x01010101,q8h_lo.z,sq8_h); sq8_h=ggml_cuda_dp4a(0x01010101,q8h_lo.w,sq8_h);
+            sq8_h=ggml_cuda_dp4a(0x01010101,q8h_hi.x,sq8_h); sq8_h=ggml_cuda_dp4a(0x01010101,q8h_hi.y,sq8_h);
+            sq8_h=ggml_cuda_dp4a(0x01010101,q8h_hi.z,sq8_h); sq8_h=ggml_cuda_dp4a(0x01010101,q8h_hi.w,sq8_h);
+            sumf_d += d8l * (sumi_l * sc[sub_lo]);
+            sumf_d += d8h * (sumi_h * sc[sub_hi]);
+            sumf_m += d8l * (sq8_l * mn[sub_lo]);
+            sumf_m += d8h * (sq8_h * mn[sub_hi]);
         }
         sumf += dall * sumf_d - dmin * sumf_m;
     }

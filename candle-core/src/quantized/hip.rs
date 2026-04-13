@@ -366,13 +366,20 @@ pub fn launch_mul_mat_vec_q8_1_chunk(
         GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
-    let warp_coop_kquants = std::env::var("CANDLE_KQUANT_WARP_COOP").is_ok();
+    // Q4K/Q5K warp-coop are correct as of Phase B3-redo (2026-04-13).
+    // Q6K still diverges (distinct 4+2 packing; kernel layout not yet ported).
+    // Opt into Q6K warp-coop via CANDLE_KQUANT_WARP_COOP=1 (still broken).
+    let q6_warp_coop = std::env::var("CANDLE_KQUANT_WARP_COOP").is_ok();
     let kernel_name = if b_size == 1
-        && warp_coop_kquants
-        && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K)
+        && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q5K)
     {
-        // Opt-in: use the warp-coop K-quant kernel (currently buggy).
-        format!("{kernel_name}wc")
+        match dtype {
+            GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_wc".to_string(),
+            GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_wc".to_string(),
+            _ => unreachable!(),
+        }
+    } else if b_size == 1 && q6_warp_coop && matches!(dtype, GgmlDType::Q6K) {
+        "mul_mat_vec_q6_K_q8_1_wc".to_string()
     } else {
         format!("{kernel_name}{b_size}")
     };
@@ -383,20 +390,17 @@ pub fn launch_mul_mat_vec_q8_1_chunk(
     // per row). The K-quant b_size=1 kernels and all b_size>1 paths still
     // use the original ggml-cuda template which expects (WARP_SIZE,4,1)
     // or (WARP_SIZE,2,1) blocks.
-    // K-quant warp-coop kernels (Q4K/Q5K/Q6K) are buggy on gfx906 — they
-    // produce ~24% off L2 norm in lm_head logits (Phase J 2026-04-13).
-    // Use the template-based mul_mat_vec kernels for K-quants until fixed;
-    // opt back in via CANDLE_KQUANT_WARP_COOP=1.
-    let warp_coop_kquants = std::env::var("CANDLE_KQUANT_WARP_COOP").is_ok();
+    // Q4K/Q5K warp-coop kernels correct after Phase B3-redo (pair-layout fix
+    // landed 2026-04-13). Q6K still diverges; opt in via
+    // CANDLE_KQUANT_WARP_COOP=1 once fixed.
+    let q6_warp_coop = std::env::var("CANDLE_KQUANT_WARP_COOP").is_ok();
     let warp_coop = b_size == 1
         && (matches!(
                 dtype,
                 GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0
+                | GgmlDType::Q4K | GgmlDType::Q5K
             )
-            || (warp_coop_kquants && matches!(
-                dtype,
-                GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K
-            )));
+            || (q6_warp_coop && matches!(dtype, GgmlDType::Q6K)));
     let cfg = if warp_coop {
         hipdarc::driver::LaunchConfig {
             grid_dim: ((nrows as u32).div_ceil(2), 1, 1),
