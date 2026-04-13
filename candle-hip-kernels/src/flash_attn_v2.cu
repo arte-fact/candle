@@ -580,14 +580,42 @@ static __device__ __forceinline__ void gqa_decode_mv_impl(
         mask_row = mask + (int64_t)b_idx * (int64_t)mask_b_stride;
     }
 
-    // Load Q and init O in registers. Each lane owns D_PER_LANE contiguous
-    // elements at stride WARP_SIZE (lane=0 owns d=0, 64, 128, ...).
+    // Phase Q2 — vectorised float2 loads (8 bytes per VMEM txn) to match
+    // llama.cpp-turbo's `mul_mat_vec_f` pattern in `ggml-cuda/mmvf.cu:132`.
+    //
+    // Per-lane element ownership under float2:
+    //   lane L, pair i=0..PAIRS_PER_LANE-1 owns the two f32 elements at
+    //     d = 2*(L + i*WARP_SIZE) + {0, 1}
+    //   i.e. for D=256, D_PER_LANE=4, PAIRS=2:
+    //     lane 0: d ∈ {0, 1, 128, 129}
+    //     lane 1: d ∈ {2, 3, 130, 131}
+    //     ...
+    //   This differs from the scalar layout (lane owns d=lane, lane+64, ...)
+    //   but the dot product is commutative in d — correctness is preserved
+    //   as long as Q and K/V use the SAME partitioning.
+    //
+    // For D=64 (D_PER_LANE=1) we keep scalar reads: no float2 benefit.
+    constexpr int PAIRS_PER_LANE = D_PER_LANE / 2;
+    constexpr bool USE_FLOAT2 = (D_PER_LANE >= 2);
+
     float q_reg[D_PER_LANE];
     float o_reg[D_PER_LANE];
-    #pragma unroll
-    for (int i = 0; i < D_PER_LANE; ++i) {
-        q_reg[i] = q_ptr[lane + i * WARP_SIZE];
-        o_reg[i] = 0.0f;
+    if constexpr (USE_FLOAT2) {
+        const float2 * q_ptr2 = reinterpret_cast<const float2 *>(q_ptr);
+        #pragma unroll
+        for (int i = 0; i < PAIRS_PER_LANE; ++i) {
+            const float2 qq = q_ptr2[lane + i * WARP_SIZE];
+            q_reg[2*i]     = qq.x;
+            q_reg[2*i + 1] = qq.y;
+            o_reg[2*i]     = 0.0f;
+            o_reg[2*i + 1] = 0.0f;
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            q_reg[i] = q_ptr[lane + i * WARP_SIZE];
+            o_reg[i] = 0.0f;
+        }
     }
 
     // Online softmax state.
@@ -597,22 +625,30 @@ static __device__ __forceinline__ void gqa_decode_mv_impl(
     const int L_k_effective = (L_k_iter >= 0) ? L_k_iter : L_k;
 
     // Main loop over T positions. Each iteration:
-    //   1. Warp-coalesced read of K[t, d_lane..d_lane+D_PER_LANE*WARP_SIZE)
+    //   1. float2-coalesced read of K[t, d_lane..d_lane+D_PER_LANE*WARP_SIZE)
     //   2. Per-lane partial dot, warp-reduce → scalar s_t
     //   3. Apply scale + mask
     //   4. Online softmax update
-    //   5. Warp-coalesced read of V[t, d_lane], MAC into o_reg
+    //   5. float2-coalesced read of V[t, d_lane], MAC into o_reg
     for (int t = 0; t < L_k_effective; ++t) {
         const float * k_row = k_ptr + (int64_t)t * D;
         const float * v_row = v_ptr + (int64_t)t * D;
 
-        // Per-lane partial dot product. Adjacent lanes read adjacent
-        // float elements from k_row → one coalesced VMEM transaction
-        // per D_PER_LANE load batch.
+        // Per-lane partial dot product. Adjacent lanes read 8 adjacent
+        // bytes — one 128-bit VMEM transaction per warp per pair.
         float partial = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < D_PER_LANE; ++i) {
-            partial += q_reg[i] * k_row[lane + i * WARP_SIZE];
+        if constexpr (USE_FLOAT2) {
+            const float2 * k_row2 = reinterpret_cast<const float2 *>(k_row);
+            #pragma unroll
+            for (int i = 0; i < PAIRS_PER_LANE; ++i) {
+                const float2 kk = k_row2[lane + i * WARP_SIZE];
+                partial += q_reg[2*i] * kk.x + q_reg[2*i + 1] * kk.y;
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < D_PER_LANE; ++i) {
+                partial += q_reg[i] * k_row[lane + i * WARP_SIZE];
+            }
         }
         float s_t = v2_warp_reduce_sum(partial) * scale;
 
@@ -625,20 +661,42 @@ static __device__ __forceinline__ void gqa_decode_mv_impl(
         const float alpha = gfx906_fast_exp(m_i - m_new);
         const float p     = gfx906_fast_exp(s_t - m_new);
 
-        // O update — coalesced V read.
-        #pragma unroll
-        for (int i = 0; i < D_PER_LANE; ++i) {
-            o_reg[i] = alpha * o_reg[i] + p * v_row[lane + i * WARP_SIZE];
+        // O update — float2 V read.
+        if constexpr (USE_FLOAT2) {
+            const float2 * v_row2 = reinterpret_cast<const float2 *>(v_row);
+            #pragma unroll
+            for (int i = 0; i < PAIRS_PER_LANE; ++i) {
+                const float2 vv = v_row2[lane + i * WARP_SIZE];
+                o_reg[2*i]     = alpha * o_reg[2*i]     + p * vv.x;
+                o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * vv.y;
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < D_PER_LANE; ++i) {
+                o_reg[i] = alpha * o_reg[i] + p * v_row[lane + i * WARP_SIZE];
+            }
         }
         l_i = alpha * l_i + p;
         m_i = m_new;
     }
 
-    // Normalise and write back.
+    // Normalise and write back. Match the float2 ownership layout used
+    // for Q/K/V throughout the kernel.
     const float inv_l = gfx906_rcp(l_i);
-    #pragma unroll
-    for (int i = 0; i < D_PER_LANE; ++i) {
-        o_ptr[lane + i * WARP_SIZE] = o_reg[i] * inv_l;
+    if constexpr (USE_FLOAT2) {
+        float2 * o_ptr2 = reinterpret_cast<float2 *>(o_ptr);
+        #pragma unroll
+        for (int i = 0; i < PAIRS_PER_LANE; ++i) {
+            float2 oo;
+            oo.x = o_reg[2*i]     * inv_l;
+            oo.y = o_reg[2*i + 1] * inv_l;
+            o_ptr2[lane + i * WARP_SIZE] = oo;
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            o_ptr[lane + i * WARP_SIZE] = o_reg[i] * inv_l;
+        }
     }
 }
 
