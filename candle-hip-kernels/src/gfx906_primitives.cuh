@@ -120,27 +120,27 @@ static __device__ __forceinline__ float gfx906_swizzle_xor16(float x) {
 // --- Full 64-wide warp reductions ---
 
 static __device__ __forceinline__ float gfx906_warp_reduce_sum(float x) {
-    // Stage 1: xor 1 — DPP quad_perm:[1,0,3,2]
-    x = gfx906_dpp_add_xor1(x, x);
-    // Stage 2: xor 2 — DPP quad_perm:[2,3,0,1]
-    x = gfx906_dpp_add_xor2(x, x);
-    // Stage 3: xor 4 — shuffle (no DPP row_shl:4 for add on GCN5.1)
-    x += __shfl_xor(x, 4);
-    // Stage 4: xor 8 — DPP row_ror:8
-    x = gfx906_dpp_add_ror8(x, x);
-    // Stage 5: xor 16 — ds_swizzle
-    x += gfx906_swizzle_xor16(x);
-    // Stage 6: xor 32 — cross-half shuffle
-    x += __shfl_xor(x, 32);
+    // The DPP-fused 6-stage reduce (xor1/xor2/xor4/ror8/swizzle16/xor32)
+    // produces wrong results on this MI50 + ROCm 7.1.1 toolchain — every
+    // user (rmsnorm, softmax, GDN, MMVQ) ended up with NaN or 8x-off
+    // outputs, breaking Qwen3.5 (`!!!!!!` decode) and Gemma4. Fall back
+    // to the portable shfl_xor loop until the DPP encoding can be debugged
+    // in isolation. See Phase J postmortem 2026-04-13.
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        x += __shfl_xor(x, mask);
+    }
     return x;
 }
 
 static __device__ __forceinline__ float gfx906_warp_reduce_max(float x) {
-    x = gfx906_dpp_max_xor1(x, x);
-    x = gfx906_dpp_max_xor2(x, x);
-    x = fmaxf(x, __shfl_xor(x, 4));
-    x = gfx906_dpp_max_ror8(x, x);
-    x = fmaxf(x, gfx906_swizzle_xor16(x));
+    // See gfx906_warp_reduce_sum for why DPP is disabled.
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        x = fmaxf(x, __shfl_xor(x, mask));
+    }
+    return x;
+    // unreachable, kept to satisfy the original tail with the matching trailing brace
     x = fmaxf(x, __shfl_xor(x, 32));
     return x;
 }
@@ -158,20 +158,20 @@ static __device__ __forceinline__ float2 gfx906_warp_reduce_sum(float2 a) {
 // Stages: xor1, xor2, xor4(shuffle), xor8(DPP), xor16(swizzle). ~5 cycles.
 
 static __device__ __forceinline__ float gfx906_half_warp_reduce_sum_dpp(float x) {
-    x = gfx906_dpp_add_xor1(x, x);
-    x = gfx906_dpp_add_xor2(x, x);
-    x += __shfl_xor(x, 4);
-    x = gfx906_dpp_add_ror8(x, x);
-    x += gfx906_swizzle_xor16(x);
+    // See gfx906_warp_reduce_sum for why DPP is disabled. Width=32 keeps
+    // each half-warp's reduce contained.
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x += __shfl_xor(x, offset, 32);
+    }
     return x;
 }
 
 static __device__ __forceinline__ float gfx906_half_warp_reduce_max_dpp(float x) {
-    x = gfx906_dpp_max_xor1(x, x);
-    x = gfx906_dpp_max_xor2(x, x);
-    x = fmaxf(x, __shfl_xor(x, 4));
-    x = gfx906_dpp_max_ror8(x, x);
-    x = fmaxf(x, gfx906_swizzle_xor16(x));
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        x = fmaxf(x, __shfl_xor(x, offset, 32));
+    }
     return x;
 }
 

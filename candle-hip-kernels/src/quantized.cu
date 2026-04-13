@@ -3243,8 +3243,18 @@ extern "C" __global__ void mul_mat_vec_q3_K_q8_1_cuda1(
 // The actual implementation is in mul_mat_vec_q*_K_q8_1_warp_coop above;
 // these entry points replicate that logic under the cuda1 name.
 
+// Old template-based kernel (correct on gfx906, slower).
+extern "C" __global__ void mul_mat_vec_q4_K_q8_1_cuda1(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_q<1, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
+// Warp-cooperative variant (kept for opt-in; currently produces wrong logits
+// — see Phase J debugging notes 2026-04-13).
 extern "C" __global__ void __launch_bounds__(64, 1)
-mul_mat_vec_q4_K_q8_1_cuda1(
+mul_mat_vec_q4_K_q8_1_wc(
     const void * __restrict__ vx, const void * __restrict__ vy,
     float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
@@ -3318,8 +3328,15 @@ mul_mat_vec_q4_K_q8_1_cuda1(
     if (half_lane == 0) dst[row] = sumf;
 }
 
+extern "C" __global__ void mul_mat_vec_q5_K_q8_1_cuda1(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_q<1, QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
 extern "C" __global__ void __launch_bounds__(64, 1)
-mul_mat_vec_q5_K_q8_1_cuda1(
+mul_mat_vec_q5_K_q8_1_wc(
     const void * __restrict__ vx, const void * __restrict__ vy,
     float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
@@ -3393,8 +3410,15 @@ mul_mat_vec_q5_K_q8_1_cuda1(
     if (half_lane == 0) dst[row] = sumf;
 }
 
+extern "C" __global__ void mul_mat_vec_q6_K_q8_1_cuda1(
+    const void * vx, const void * vy, float * dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_q<1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+
 extern "C" __global__ void __launch_bounds__(64, 1)
-mul_mat_vec_q6_K_q8_1_cuda1(
+mul_mat_vec_q6_K_q8_1_wc(
     const void * __restrict__ vx, const void * __restrict__ vy,
     float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
