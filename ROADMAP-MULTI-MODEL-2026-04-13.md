@@ -25,6 +25,21 @@ this session (n_kv pad, G2 replay, G3 graph, fused FFN) live in
 | MMQ (prefill) | 296 ms | 119 ms | **2.9× slower per call** |
 | Total GPU | 1782 ms | 1185 ms | +50 % |
 
+## Priority update — post-survey (2026-04-13)
+
+See `SURVEY-GFX906-FORKS-2026-04-13.md` for the full landscape comparison of candle vs turbo vs vllm-mobydick. The survey's ranked recommendations reshape the roadmap order-of-attack:
+
+| # | action | unlocks / payoff | effort | survey §11 rank |
+|---|---|---|---|---|
+| 1 | **ROCm 7.2.1 + Tensile migration** (existing `ROADMAP-ROCM-722-MIGRATION`) | DPP warp reductions (Phase J disabled), K-quant warp-coop (Phase B3 gated), rocBLAS sgemv (Phase O) — THREE gated features in one migration | 1 day rebuild + regression | #1 |
+| 2 | **Phase R — LDS `+1` padding** on flash-attn-v2 tiles + MMQ v2f | 2× LDS bandwidth per skyne98 wiki (3974 vs 1865 GB/s); direct port of turbo's `cpy.cu:59` pattern | 2-4 h per kernel | #2 |
+| 3 | **Phase Q2 — `gqa_decode_mv` tuning** | 73 μs/call → ~30 μs matching turbo's `mul_mat_vec_f`; +3-4 t/s on E4B | 1-2 days | #3 |
+| 4 | **Phase S — TurboQuant KV port** | 5× KV memory reduction; enables 32K+ context on 16 GB MI50 | 2-3 days | #4 |
+| 5 | graph-fusion engine | marginal over existing Phase D1/D2 ad-hoc fusions | 1-2 days | #5 |
+| 6 | **Phase Q1 — G2 + Phase P integration** | make Phase P default-on without regressing G2 users | 1-2 days | #6 |
+
+**NOT pursuing** (survey §11): PagedAttention / continuous batching (vLLM's serving domain, not ours); Triton codegen (would trade type-safety + G2 capture for portability we don't need on the single-arch gfx906 target).
+
 ## Phases
 
 ### Phase H — Port attention optimisations to Gemma4 (highest single leverage)
@@ -601,26 +616,147 @@ Optimisation ideas tracked under Phase Q (below):
 9 t/s expected improvement. Q1 is a separate track — important for
 users who need both G2 replay and fast decode.
 
+### Phase R — LDS `+1` padding (bank-conflict elimination)
+
+Motivation from the survey (§6 + §8-1): skyne98 [wiki-gfx906 LDS
+layout study](https://skyne98.github.io/wiki-gfx906/studies/2026-02-21/gfx906-lds-layout-standard-llm.html)
+measures **2× LDS bandwidth** (3974 vs 1865 GB/s) when a column-
+consumed shared-memory tile gets a `+1 vec4` padding row to serialise
+bank conflicts. Turbo applies this in `cpy.cu:59`:
+
+```cpp
+__shared__ float tile[2][CUDA_CPY_TILE_DIM_2D][CUDA_CPY_TILE_DIM_2D+1];
+```
+
+— only on the 2D transpose kernel. We have no `+1` padding anywhere.
+Two direct targets in our codebase:
+
+- **R1** — `flash_attn_v2.cu`: the `__shared__ float k_lds[BC * D];`
+  and `v_lds[BC * D];` declarations in `flash_attn_fwd_v2_impl`
+  (template at line 63). Pad the inner dim to `D + 1` (or `D + 4`
+  for 16-byte alignment) and adjust indexing. Each warp-coop tile
+  read currently hits bank conflicts since D=256 / 64 banks means
+  4-way stride-aligned accesses.
+- **R2** — `quantized.cu`: MMQ v2f tile32 LDS tiles. Less certain
+  of the expected gain (the Tensile gemm kernels turbo uses for
+  prefill are already optimised); profile before committing.
+
+**Expected:** attention kernel per-call time drops 10-20 % on d=256
+and d=512 paths (LDS read-bound for the K/V tile load). Compounds
+with Phase Q2 — the `+1` padding is invisible to the outer
+kernel-rewrite work.
+
+**Effort:** 2-4 hours per kernel including regression + perf bench.
+Low risk: correctness only depends on the indexing update matching
+the declared shape.
+
+### Phase S — TurboQuant KV port (long-context memory win)
+
+Motivation (survey §4, §8-2): turbo ships sub-byte KV cache
+quantization (TURBO2_0 at 2.5 bits/val, TURBO3_0 at 4 bits,
+TURBO4_0 at 5.3 bits) via lazy F16 shadow cache. ICLR 2026 paper
+([Zandieh et al. arXiv:2504.19874](https://arxiv.org/abs/2504.19874))
+shows near-lossless quality at 3-4 bit. Gives candle two things:
+
+- **Decode-latency-neutral memory reduction** at batch=1 —
+  dequant-to-f16 runs once per cache-write, amortised.
+- **32K+ context on 16 GB MI50** — current E4B Q4_0 + KV fits in 8 GB
+  at 256-tok context; at 32 K context the f16 KV dominates. Turbo
+  quant gets us there.
+
+Reference impls to port from:
+
+- Turbo: `ggml/src/ggml-cuda/convert.cu:765+` (dequant kernels),
+  `cpy.cu:549` (append path), `fattn.cu:117-200` (shadow cache).
+- Pascal-SAPUI5's AMD-ROCm-specific port:
+  [Pascal-SAPUI5/llama.cpp-turboquant](https://github.com/Pascal-SAPUI5/llama.cpp-turboquant)
+  — already gfx1100-validated, reuse where possible.
+
+Community observations worth noting before porting:
+
+- [llama.cpp TurboQuant discussion #20969](https://github.com/ggml-org/llama.cpp/discussions/20969)
+  reports "gfx906 at batch=1 is latency-bound (10 % bandwidth
+  utilization)" — dequant overhead eats more of our cycle budget
+  than on RDNA3. Expect 5-10 % decode throughput cost on our
+  workload (turbo measures ~1 % on RX 7900 XTX).
+- Trade-off: big memory win, small latency loss. Worth it for
+  long-context; probably not worth defaulting on for the short-
+  prompt bench workload.
+
+**Scope:**
+
+- **S1** — Add block_turbo2/3/4 dtypes to `candle-core/src/quantized/`.
+  Mirror `k_quants.rs` structure.
+- **S2** — Port dequant-to-f16 shadow kernels. Run paused under
+  G2 / lazy on first access.
+- **S3** — Extend KvCache with a shadow-cache indirection (or reuse
+  the existing pad + narrow machinery with dtype=u8 storage +
+  f16 materialised view).
+- **S4** — Opt-in via `CANDLE_KV_QUANT={turbo2,turbo3,turbo4}`.
+  Default stays f16/f32.
+
+**Effort:** 2-3 days. Gated on Phase Q1 (KV layout changes during S
+would collide with G2 plan capture if Q1 isn't done first).
+
 ## Order of attack
 
+Updated 2026-04-13 after `SURVEY-GFX906-FORKS-2026-04-13.md`. Phases
+H, J, K already landed (see memory + commits); listed here for
+completeness only.
+
 ```
-H (Gemma4 attention) → J (Qwen correctness) → I (MMQ rewrite, cross-cutting)
-       ↓                       ↓
-K (Gemma4 G2/G3)          (Qwen bench valid)
+[DONE: H (n_kv pad + flash-attn-v2 on gemma4)]
+[DONE: K (G2/G3 on gemma4, decode correctness)]
+[DONE: P Stage 1 (T-major K + mat-vec decode, opt-in)]
        ↓
-L (MMVQ tune) + M (MoE FFN) + N (prefill) in parallel
+STEP 1: ROCm 7.2.1 + Tensile migration
+        (see ROADMAP-ROCM-722-MIGRATION-2026-04-13.md)
+        → unblocks Phase J DPP reductions (≈40% on reduction hotpath)
+        → unblocks Phase B3 K-quant warp-coop (decode Q4_K faster)
+        → unblocks Phase O rocBLAS sgemv (probably obsolete post-P)
+       ↓
+STEP 2: Phase R (LDS +1 padding) + Phase Q2 (mat-vec kernel tuning)
+        (parallel; neither blocks the other)
+        → Phase R:  flash-attn-v2 LDS tiles +1 pad → +10-20% per call
+        → Phase Q2: 128-thread block, float2 loads, split-K, strided
+                    K args → 73 μs → ~30 μs per gqa_decode_mv call
+        Combined expected: Gemma4-E4B decode 54 → 62-65 t/s
+       ↓
+STEP 3: Phase Q1 (G2 + Phase P integration)
+        → flip Phase P from opt-in to default without regressing G2
+        → so everyone gets the decode win transparently
+       ↓
+STEP 4: Phase I (MMQ rewrite) + Phase S (TurboQuant KV) + Phase N (prefill)
+        — tracks are independent, pick by schedule / model priority.
+        → I: prefill 2-3× across every Q4_0 model (TinyLlama 801 → 2k)
+        → S: 5× KV memory compression, long-context unlock
+        → N: fused attention for prefill (also needs Phase Q4 — d=512
+             K_TRANS=false kernel)
 ```
 
-## Expected final numbers after H+K+I
+## Expected final numbers
 
-| Model | Current | After H+K | After H+K+I |
-|---|---|---|---|
-| TinyLlama Q4_0 decode | 267 | 267 (no change) | 280 (prefill faster doesn't help decode) |
-| Gemma4-E4B Q4_0 decode | 44 | 62 | 65 |
-| Qwen3.5-9B Q4_1 decode | broken | 55 (after J) | 58 |
-| TinyLlama Q4_0 prefill | 801 | 801 | ~2 000 |
-| Gemma4-E4B Q4_0 prefill | 87 | 87 | ~250 |
+Target evolves per step (numbers track Gemma4-E4B Q4_0 single-MI50 decode):
 
-Targets remain honest: 2× turbo (420 t/s TinyLlama decode) is still
-unreachable without matrix-core hardware. But Gemma4/Qwen gap to vanilla
-llama.cpp should close and we get faster prefill everywhere.
+| Step | Gemma4-E4B decode | TinyLlama decode | Qwen3.5 decode | Gemma4 prefill |
+|---|---|---|---|---|
+| Today (post-P Stage 1 opt-in) | 54 | 267 | broken | 244 |
+| +STEP 1 (ROCm 7.2.1) | 55 | 275 | broken | 250 |
+| +STEP 2 (Phase R+Q2) | **62-65** | 275 | — | 260 |
+| +STEP 3 (Phase Q1 → P default on) | 62-65 (+G2 working) | 275 | — | 260 |
+| +STEP 4 (Phase I prefill rewrite) | 65 | 275 | 55 (after J) | **~500** |
+
+Turbo's 75 t/s on E4B decode remains the ceiling at batch=1 (`SURVEY
+§7`); closing the last 10 t/s requires either TurboQuant KV (memory-
+bound path) or would need MFMA hardware we don't have. 2× turbo
+(420 t/s TinyLlama decode) is still unreachable without matrix cores.
+
+## Cross-reference
+
+- `SURVEY-GFX906-FORKS-2026-04-13.md` — landscape + technical-choice
+  comparison vs turbo / vllm-mobydick. All phase priorities above are
+  traceable to survey §11 recommendations.
+- `ROADMAP-ROCM-722-MIGRATION-2026-04-13.md` — STEP 1 detail.
+- `REVIEW-CANDLE-VS-TURBO-HIP-KERNELS-2026-04-12.md` — original
+  per-kernel comparison (supersedes parts of survey §3-6 that pre-
+  date Phase P; survey reflects post-P state).
