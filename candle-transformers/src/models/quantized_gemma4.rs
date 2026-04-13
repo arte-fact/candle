@@ -1446,6 +1446,14 @@ impl ModelWeights {
             };
 
             // -------- per-layer embedding injection (E4B) --------
+            // Diagnostic switch: CANDLE_GEMMA4_NO_PE_INJECT=1 skips the
+            // per-layer embed injection entirely. Used to localize where
+            // the G2 replay state divergence comes from. WARNING: model
+            // output is wrong (drops a learned residual contribution),
+            // so only useful for diff'ing replay vs baseline at the same
+            // configuration.
+            let pe_inject_off = std::env::var("CANDLE_GEMMA4_NO_PE_INJECT").is_ok();
+            if !pe_inject_off {
             if let (Some(ref ple), Some(ref ipl)) =
                 (&self.layers[il].per_layer_embed, &inp_per_layer)
             {
@@ -1463,6 +1471,7 @@ impl ModelWeights {
                 let pe_cur = ple.post_norm.forward(&pe_cur)?;
                 x = (pe_in + pe_cur)?;
             }
+            } // end pe_inject_off guard
 
             // -------- layer output scale (gemma4) --------
             if let Some(ref scale) = self.layers[il].layer_output_scale {
