@@ -89,20 +89,41 @@ first, otherwise G2 replay divergence returns).
   Mlp in some layers — fits). Gemma4 MoE uses different FFN structure;
   won't apply there without a separate fused-MoE kernel.
 
-**Status (2026-04-13):** Scaffolding wired but no measurable speedup yet.
-Eligibility gates skip both testable models:
-  - Gemma4-E4B Q4_0 (single-GPU): `per_layer_embeddings` adds a second
-    CPU→GPU transfer per token; G2 currently anchors only one external
-    input. Needs `decode_cache::patch_externals_split` to handle
-    multiple input tensors independently.
-  - Gemma4-31B Q4_0: 17 GB doesn't fit on a single 16 GB MI50; multi-GPU
-    pipeline-parallel needs per-device recording.
-Output verified identical to baseline with `CANDLE_G2_REPLAY=1` (gate
-falls through cleanly).
+**Status (2026-04-13):** Infrastructure complete, two known blockers:
+
+  - **K1/K2** (commit 10185833): scaffolding + state machine.
+  - **K5** (commit a8d22fa0): multi-anchor `decode_cache` API
+    (`from_two_recordings_with_inputs` + `patch_external_input`) and a
+    `with_recording_paused` helper that pauses both kernel recording
+    and decode_alloc.
+  - **K6** (commit a8d22fa0): E4B prelude (CPU embed + per_layer
+    compute) runs paused; results anchored as inputs #0/#1. Plan builds
+    successfully (1305 ops, externals/input=[2,1]) but actual replays
+    produce `"I I I I"` loop + rocBLAS error. **Blocker**: Gemma4's
+    sliding-window-attention mask is built fresh per token at varying
+    sizes (mask `last_dim` depends on `index_pos` until it reaches
+    `sliding_window_size+1`). The captured plan has the mask
+    `last_dim` baked in — replays at a different position fail the
+    `masked_softmax_scale_fused` shape check. Two ways out: pad the SWA
+    mask buffer to a fixed window length the same way `n_kv` pads the
+    K cache, or anchor the mask buffer as a third external input.
+  - **K7** (commit 5a645f77): multi-device replay fails on op[0] with
+    `hipErrorInvalidImage`. **Blocker**: HIP module/function handles
+    are per-device (`get_or_load_func` loads the kernel into each
+    device's module separately), and `hipModuleLaunchKernel` validates
+    the handle against the *current* device set via `hipSetDevice` —
+    not against the stream's device. Needs `RecordedOp` to carry the
+    device ordinal and `DecodePlan::replay` to `hipSetDevice` before
+    each launch (or batch consecutive same-device ops). Opt-in via
+    `CANDLE_G2_MULTI_DEV=1`.
+
+Default path (G2 disabled) verified intact — Gemma4-E4B Q4_0 still
+emits `"Hello! How can I help you today?"` at the baseline 47 t/s
+decode.
 
 **Owner:** TBD.
-**Effort:** 1 day after Phase H. Follow-up (per-layer-embed support):
-~half day.
+**Effort:** 1 day after Phase H. Each follow-up (SWA mask anchor /
+multi-device device-ordinal tracking): ~half day each.
 
 ### Phase L — MMVQ per-call tuning
 
