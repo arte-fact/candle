@@ -444,6 +444,41 @@ impl DecodePlan {
         if first.len() != second.len() {
             return None;
         }
+        let debug_ext = std::env::var("CANDLE_G2_EXT_DEBUG").is_ok();
+        if debug_ext {
+            // Same dynamic-arg histogram as the legacy single-input
+            // constructor — useful for diagnosing why a Counter arg
+            // got the wrong delta (or got missed entirely).
+            let mut diffs: Vec<(usize, usize, u64, u64, usize)> = Vec::new();
+            for (op_i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
+                for (arg_i, ((va, vb), sz)) in a.arg_values.iter().zip(b.arg_values.iter()).zip(a.arg_sizes.iter()).enumerate() {
+                    if va != vb {
+                        diffs.push((op_i, arg_i, *va, *vb, *sz));
+                    }
+                }
+            }
+            let mut delta_counts = std::collections::HashMap::<i64, usize>::new();
+            for (_, _, va, vb, _) in &diffs {
+                let d = *vb as i64 - *va as i64;
+                *delta_counts.entry(d).or_insert(0) += 1;
+            }
+            let mut dc: Vec<_> = delta_counts.iter().collect();
+            dc.sort_by_key(|(_, cnt)| std::cmp::Reverse(**cnt));
+            eprintln!("[G2-mi] {} dynamic args, delta histogram (top 10):", diffs.len());
+            for (d, c) in dc.iter().take(10) {
+                eprintln!("  delta={} ({:#x}) → {} args", d, **d as u64, c);
+            }
+            // Largest |delta| for visibility (probably pointer counters).
+            let mut by_abs: Vec<_> = diffs.iter().collect();
+            by_abs.sort_by_key(|(_, _, va, vb, _)| std::cmp::Reverse((*vb as i64 - *va as i64).abs()));
+            eprintln!("[G2-mi] largest |delta| (first 8):");
+            for (op_i, arg_i, va, vb, sz) in by_abs.iter().take(8) {
+                let delta = *vb as i64 - *va as i64;
+                eprintln!("    op[{}] arg[{}] size={} {:#x} -> {:#x} (delta={}, kernel={:?})",
+                    op_i, arg_i, sz, va, vb, delta,
+                    second[*op_i].func);
+            }
+        }
 
         let ops = second.to_vec();
         let mut dynamic_args = Vec::with_capacity(ops.len());

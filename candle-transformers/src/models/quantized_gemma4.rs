@@ -989,6 +989,25 @@ impl ModelWeights {
                             plan.advance_counters();
                         }
                         unsafe { plan.replay(&dev_for_replay)?; }
+                        // Diagnostic for K10: dump the first 8 logits to
+                        // confirm whether the captured plan actually
+                        // produces fresh output per replay or stays
+                        // stuck. If they're byte-identical across
+                        // multiple replays, the plan has at least one
+                        // critical arg that wasn't recognized as
+                        // dynamic (Counter/External), so its kernel
+                        // re-runs with stale data.
+                        if std::env::var("CANDLE_G2_REPLAY_TRACE").is_ok() {
+                            let _ = dev_for_replay.stream().synchronize();
+                            let out = plan.output_tensor(&dev_for_replay)?;
+                            let head: Vec<f32> = out
+                                .narrow(out.rank() - 1, 0, 8.min(out.dim(out.rank()-1)?))?
+                                .flatten_all()?.to_vec1()?;
+                            eprintln!(
+                                "[G2-gemma4] replay#{} idx={} output head: {:?}",
+                                plan.replay_count(), index_pos, head
+                            );
+                        }
                         let g3_enabled = std::env::var("CANDLE_G3_GRAPH").is_ok();
                         let g3_after = std::env::var("CANDLE_G3_AFTER")
                             .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2);
