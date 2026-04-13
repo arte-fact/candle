@@ -36,96 +36,140 @@
 
 #ifdef __HIP_PLATFORM_AMD__
 
-// --- DPP add primitives ---
-// Each macro emits inline asm that fuses a DPP permutation into v_add_f32.
-// The s_nop ensures the DPP source is ready (GCN 5.1 pipeline hazard).
+// --- DPP fused add/max primitives (2026-04-13 re-port of turbo pattern) ---
+//
+// Vega ISA Table 8 (§4.5) wait-state rules for DPP:
+//   VALU writes VGPR  → VALU DPP reads that VGPR  → 2 wait states
+//   VALU writes EXEC  → VALU DPP op               → 5 wait states
+//
+// The EXEC rule is the usual trap: any `if`/compare above a reduction call
+// writes EXEC (via v_cmpx_*). The FIRST DPP after a reduction entry point
+// therefore needs `s_nop 4` (= 5 cycles) to be robust. Subsequent DPPs in
+// the same reduction chain follow other DPP ops (which don't write EXEC)
+// and can use `s_nop 1` (= 2 cycles) per the VGPR-write rule.
+//
+// Key port points from turbo (`ggml-cuda/gfx906/gfx906-common.cuh:73-93`):
+//   - SINGLE-arg inline asm: "%1, %1" ensures compiler uses same VGPR for
+//     src0 and src1, no intermediate MOV that could break timing.
+//   - NO `bound_ctrl` specified (default 0 = don't write on OOB). Our
+//     earlier `bound_ctrl:1` was probably wrong for these patterns; the
+//     quad_perm and row_ror:8 patterns never have OOB anyway but setting
+//     bound_ctrl:1 might poke a different codegen path.
+//   - "memory" clobber to prevent the compiler reordering instructions
+//     across the DPP (critical for the wait-state to hold).
+//   - `s_nop 4` on first DPP of each reduction chain (xor1) — 5 cycles to
+//     cover EXEC hazard; `s_nop 1` on subsequent (xor2, xor8) since the
+//     prior op is itself DPP.
 
-static __device__ __forceinline__ float gfx906_dpp_add_xor1(float a, float b) {
-    float r;
+#define CANDLE_FUSED_DPP_F32(name, barrier, dpp_ctrl, vop_instr)        \
+    static __device__ __forceinline__ float name(float x) {             \
+        float r;                                                        \
+        asm volatile(                                                   \
+            barrier                                                     \
+            vop_instr " %0, %1, %1 " dpp_ctrl " row_mask:0xf bank_mask:0xf" \
+            : "=v"(r) : "v"(x) : "memory"                               \
+        );                                                              \
+        return r;                                                       \
+    }
+
+CANDLE_FUSED_DPP_F32(gfx906_dpp_add_xor1, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_add_f32_dpp")
+CANDLE_FUSED_DPP_F32(gfx906_dpp_max_xor1, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_max_f32_dpp")
+CANDLE_FUSED_DPP_F32(gfx906_dpp_add_xor2, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_add_f32_dpp")
+CANDLE_FUSED_DPP_F32(gfx906_dpp_max_xor2, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_max_f32_dpp")
+CANDLE_FUSED_DPP_F32(gfx906_dpp_add_ror8, "s_nop 1\n", "row_ror:8", "v_add_f32_dpp")
+CANDLE_FUSED_DPP_F32(gfx906_dpp_max_ror8, "s_nop 1\n", "row_ror:8", "v_max_f32_dpp")
+
+#undef CANDLE_FUSED_DPP_F32
+
+// --- xor-4 via v_mov_b32_dpp with split bank_mask (turbo pattern) ---
+// row_shl:4 with bank_mask:0x5 (banks 0,2) + row_shr:4 with bank_mask:0xa (banks 1,3)
+// writes both directions in-place; the result is a xor-4 permutation.
+
+static __device__ __forceinline__ float gfx906_shuffle_xor4(float x) {
+    int src = __float_as_int(x);
+    int dst;
     asm volatile(
+        "v_mov_b32 %0, %1\n"
         "s_nop 1\n"
-        "v_add_f32_dpp %0, %1, %2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(r) : "v"(a), "v"(b)
+        "v_mov_b32_dpp %0, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
+        "v_mov_b32_dpp %0, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
+        : "=v"(dst) : "v"(src) : "memory"
     );
-    return r;
+    return __int_as_float(dst);
 }
 
-static __device__ __forceinline__ float gfx906_dpp_add_xor2(float a, float b) {
-    float r;
-    asm volatile(
-        "s_nop 1\n"
-        "v_add_f32_dpp %0, %1, %2 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(r) : "v"(a), "v"(b)
-    );
-    return r;
-}
-
-static __device__ __forceinline__ float gfx906_dpp_add_ror8(float a, float b) {
-    float r;
-    asm volatile(
-        "s_nop 1\n"
-        "v_add_f32_dpp %0, %1, %2 row_ror:8 row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(r) : "v"(a), "v"(b)
-    );
-    return r;
-}
-
-// --- DPP max primitives ---
-
-static __device__ __forceinline__ float gfx906_dpp_max_xor1(float a, float b) {
-    float r;
-    asm volatile(
-        "s_nop 1\n"
-        "v_max_f32_dpp %0, %1, %2 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(r) : "v"(a), "v"(b)
-    );
-    return r;
-}
-
-static __device__ __forceinline__ float gfx906_dpp_max_xor2(float a, float b) {
-    float r;
-    asm volatile(
-        "s_nop 1\n"
-        "v_max_f32_dpp %0, %1, %2 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(r) : "v"(a), "v"(b)
-    );
-    return r;
-}
-
-static __device__ __forceinline__ float gfx906_dpp_max_ror8(float a, float b) {
-    float r;
-    asm volatile(
-        "s_nop 1\n"
-        "v_max_f32_dpp %0, %1, %2 row_ror:8 row_mask:0xf bank_mask:0xf bound_ctrl:1"
-        : "=v"(r) : "v"(a), "v"(b)
-    );
-    return r;
-}
-
-// --- ds_swizzle for xor-16 (uses LDS crossbar, not actual LDS memory) ---
+// --- xor-16 via ds_swizzle_b32 (LDS crossbar, no actual LDS) ---
+// Symbolic offset form: swizzle(SWAP,16) — more readable than hex constant.
 
 static __device__ __forceinline__ float gfx906_swizzle_xor16(float x) {
-    // ds_swizzle_b32 with xor pattern = 16 (0x001f | (16 << 10))
-    // Encoding: bits[14:10] = xor mask = 16, bits[9:5] = or = 0, bits[4:0] = and = 0x1f
-    float r;
+    int src = __float_as_int(x);
+    int dst;
     asm volatile(
-        "ds_swizzle_b32 %0, %1 offset:0x401f"
-        : "=v"(r) : "v"(x)
+        "ds_swizzle_b32 %0, %1 offset:swizzle(SWAP,16)\n"
+        "s_waitcnt lgkmcnt(0)\n"
+        : "=v"(dst) : "v"(src) : "memory"
     );
-    // ds_swizzle has latency, need a wait
-    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
-    return r;
+    return __int_as_float(dst);
 }
 
-// --- Full 64-wide warp reductions ---
+// --- Full 64-wide warp reductions (DPP chain) ---
+//
+// Stages match turbo's warp_reduce_amd_f32 template:
+//   xor 1  → DPP quad_perm:[1,0,3,2]    (1 VALU cycle fused)
+//   xor 2  → DPP quad_perm:[2,3,0,1]    (1 VALU cycle fused)
+//   xor 4  → v_mov_b32_dpp split-bank   (2 VALU cycles)
+//   xor 8  → DPP row_ror:8              (1 VALU cycle fused)
+//   xor 16 → ds_swizzle_b32 SWAP,16     (1 LDS-xbar cycle)
+//   xor 32 → __shfl_xor(x, 32, 64)      (cross-half, 2 cycles)
+// Total: ~8 cycles vs __shfl_xor loop's ~12.
+//
+// Opt-out via CANDLE_DPP_OFF=1 at kernel-compile-time by passing
+// -DCANDLE_DPP_OFF=1. Defaults to DPP-enabled after the 2026-04-13 port.
+
+#ifndef CANDLE_DPP_OFF
 
 static __device__ __forceinline__ float gfx906_warp_reduce_sum(float x) {
-    // The DPP-fused 6-stage reduce (xor1/xor2/xor4/ror8/swizzle16/xor32)
-    // produces wrong results on this MI50 + ROCm 7.1.1 toolchain — every
-    // user (rmsnorm, softmax, GDN, MMVQ) ended up with NaN or 8x-off
-    // outputs, breaking Qwen3.5 (`!!!!!!` decode) and Gemma4. Fall back
-    // to the portable shfl_xor loop until the DPP encoding can be debugged
-    // in isolation. See Phase J postmortem 2026-04-13.
+    x = gfx906_dpp_add_xor1(x);
+    x = gfx906_dpp_add_xor2(x);
+    x = x + gfx906_shuffle_xor4(x);
+    x = gfx906_dpp_add_ror8(x);
+    x = x + gfx906_swizzle_xor16(x);
+    x = x + __shfl_xor(x, 32, 64);
+    return x;
+}
+
+static __device__ __forceinline__ float gfx906_warp_reduce_max(float x) {
+    x = gfx906_dpp_max_xor1(x);
+    x = gfx906_dpp_max_xor2(x);
+    x = fmaxf(x, gfx906_shuffle_xor4(x));
+    x = gfx906_dpp_max_ror8(x);
+    x = fmaxf(x, gfx906_swizzle_xor16(x));
+    x = fmaxf(x, __shfl_xor(x, 32, 64));
+    return x;
+}
+
+// Half-warp (32-wide) — stops at xor-16, skips cross-half.
+static __device__ __forceinline__ float gfx906_half_warp_reduce_sum_dpp(float x) {
+    x = gfx906_dpp_add_xor1(x);
+    x = gfx906_dpp_add_xor2(x);
+    x = x + gfx906_shuffle_xor4(x);
+    x = gfx906_dpp_add_ror8(x);
+    x = x + gfx906_swizzle_xor16(x);
+    return x;
+}
+
+static __device__ __forceinline__ float gfx906_half_warp_reduce_max_dpp(float x) {
+    x = gfx906_dpp_max_xor1(x);
+    x = gfx906_dpp_max_xor2(x);
+    x = fmaxf(x, gfx906_shuffle_xor4(x));
+    x = gfx906_dpp_max_ror8(x);
+    x = fmaxf(x, gfx906_swizzle_xor16(x));
+    return x;
+}
+
+#else // CANDLE_DPP_OFF — portable fallback path
+
+static __device__ __forceinline__ float gfx906_warp_reduce_sum(float x) {
     #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
         x += __shfl_xor(x, mask);
@@ -134,32 +178,14 @@ static __device__ __forceinline__ float gfx906_warp_reduce_sum(float x) {
 }
 
 static __device__ __forceinline__ float gfx906_warp_reduce_max(float x) {
-    // See gfx906_warp_reduce_sum for why DPP is disabled.
     #pragma unroll
     for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
         x = fmaxf(x, __shfl_xor(x, mask));
     }
     return x;
-    // unreachable, kept to satisfy the original tail with the matching trailing brace
-    x = fmaxf(x, __shfl_xor(x, 32));
-    return x;
 }
-
-// --- float2 warp reduction (used in layernorm for mean+variance) ---
-
-static __device__ __forceinline__ float2 gfx906_warp_reduce_sum(float2 a) {
-    a.x = gfx906_warp_reduce_sum(a.x);
-    a.y = gfx906_warp_reduce_sum(a.y);
-    return a;
-}
-
-// --- Half-warp (32-wide) reductions for MMVQ ---
-// Used when a 64-thread wavefront is split into 2 independent 32-lane groups.
-// Stages: xor1, xor2, xor4(shuffle), xor8(DPP), xor16(swizzle). ~5 cycles.
 
 static __device__ __forceinline__ float gfx906_half_warp_reduce_sum_dpp(float x) {
-    // See gfx906_warp_reduce_sum for why DPP is disabled. Width=32 keeps
-    // each half-warp's reduce contained.
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         x += __shfl_xor(x, offset, 32);
@@ -173,6 +199,16 @@ static __device__ __forceinline__ float gfx906_half_warp_reduce_max_dpp(float x)
         x = fmaxf(x, __shfl_xor(x, offset, 32));
     }
     return x;
+}
+
+#endif // CANDLE_DPP_OFF
+
+// --- float2 warp reduction (used in layernorm for mean+variance) ---
+
+static __device__ __forceinline__ float2 gfx906_warp_reduce_sum(float2 a) {
+    a.x = gfx906_warp_reduce_sum(a.x);
+    a.y = gfx906_warp_reduce_sum(a.y);
+    return a;
 }
 
 // ============================================================================
