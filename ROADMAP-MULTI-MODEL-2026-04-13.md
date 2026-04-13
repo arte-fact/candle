@@ -159,10 +159,42 @@ today?"). G3 graph capture works (1557 nodes, 240 dynamic ops).
 Default decode unchanged AND faster — 47 → 62 t/s (Q8_0 MMVQ
 beats rocBLAS gemv for the 256-wide per_layer projections).
 
-**Remaining (smaller):** replays still pick wrong token despite
-per-call output evolution and full kernel coverage. Possibly Q8_0
-vs F16 quantization noise on per_layer, or one more uncaptured
-helper op.
+**K13 SECOND ROOT CAUSE (commit f5fb8a78) — PHASE K CORRECTNESS COMPLETE.**
+Even after every matmul was captured, replay still produced
+"I I I I" garbage. Trace of `inp_per_layer.ptr` across replays
+revealed the smoking gun: the prelude allocator returns DIFFERENT
+addresses each replay (decode_alloc serves different slots), but
+the captured plan only marked args matching the BASE pointer as
+External. Each per-layer kernel reads via
+`inp_per_layer.narrow(2, il, 1).ptr() = base + il*stride`, so
+layers 1..41's args sat in the MIDDLE of the input buffer and
+matched nothing in the patcher's pointer-equality check.
+
+Fix: extend `ExternalInput` with `bytes`, scan args for values
+inside `[input_ptr, input_ptr + bytes)`, capture per-loc
+`external_offsets`, patch as `fresh_ptr + offset`. External
+patches went 3 → 44.
+
+**Final results on Gemma4-E4B Q4_0:**
+- Default: 52-67 t/s decode, correct output.
+- G2 (`CANDLE_G2_REPLAY=1 CANDLE_G2_REPLAY_MAX=256`): 27 t/s
+  decode, VALID output — matches default exactly for short
+  sequences, stays sensible (and informative) on longer ones.
+  Subtle drift over many tokens is from Q8_0 vs F16
+  quantization, NOT from G2 itself: re-running default with
+  Q8_0 requant but no G2 also diverges from default-no-requant
+  in the same way.
+- G2+G3 (`CANDLE_G3_GRAPH=1`): 34 t/s decode, also valid output.
+
+**Phase K correctness goal MET.**
+
+Performance hit (G2 27 t/s vs default 52 t/s) is from per-call
+prelude work (CPU embed + transfer + per_layer compute + SWA mask
+rebuild — runs FRESH every replay since it's outside the captured
+plan). NOTE: the prelude's `model_proj` must stay F16 (tested:
+requantizing it adds an extra alloc per call that throws the
+decode_alloc cursor out of sync, causing mid-replay
+`hipErrorNotReady`). Optimizing the prelude is follow-up work.
 
 ---
 
