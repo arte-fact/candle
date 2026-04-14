@@ -1466,6 +1466,7 @@ pub fn gqa_attention_decode_mv(
         && std::env::var("CANDLE_DECODE_MV_FAST")
             .map(|v| v != "0" && v != "false")
             .unwrap_or(true);
+
     let (kernel_name, block_dim_x): (&str, u32) = if use_fast {
         match d {
             256 => ("gqa_decode_mv_fast_d256_f32", WARP_SIZE),
@@ -1527,29 +1528,108 @@ pub fn gqa_attention_decode_mv(
     });
 
     let out = unsafe { dev.alloc::<f32>(b * n_head * d)? };
-    let func = dev.get_or_load_func(kernel_name, &kernels::FLASH_ATTN_V2)?;
-
-    let cfg = LaunchConfig {
-        grid_dim: (1, n_head as u32, b as u32),
-        block_dim: (block_dim_x, 1, 1),
-        shared_mem_bytes: 0,
-    };
 
     let (ba, nha, nka, lka) = (b as i32, n_head as i32, n_kv as i32, l_k_alloc as i32);
     let sa = scale as f32;
     let nra = n_rep as i32;
     let lk_it = l_k_iter as i32;
 
-    let mut bld = func.builder();
-    bld.arg(&q_v); bld.arg(&k_v); bld.arg(&v_v);
-    match m_v.as_ref() {
-        Some(v) => { bld.arg(v); }
-        None => { bld.arg(&hipdarc::driver::NullDevicePtr::default()); }
+    // Phase R1: split-L_k attention (Flash-Decoding pattern).
+    // At low H_q the unsplit kernel only launches 8 wavefronts → 1 wave
+    // per active SIMD on MI50, no latency hiding for the loop-carried
+    // softmax state. Splitting T into chunks puts CHUNKS×H_q×B waves on
+    // the GPU. Validated by arXiv 2311.01282 (3.93× decode on AMD).
+    //
+    // Default chunk_t = 64. Threshold = 96: below this, kernel-launch
+    // overhead of the 2-kernel sequence exceeds the gain.
+    // Opt-in via CANDLE_FLASH_SPLIT_LK=1.
+    let split_lk_enabled = std::env::var("CANDLE_FLASH_SPLIT_LK")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(false);
+    let chunk_t: usize = std::env::var("CANDLE_FLASH_SPLIT_CHUNK_T")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(64);
+    let split_threshold: usize = std::env::var("CANDLE_FLASH_SPLIT_THRESHOLD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(96);
+    let n_chunks = (l_k_iter + chunk_t - 1) / chunk_t;
+    let use_split = use_fast
+        && split_lk_enabled
+        && l_k_iter >= split_threshold
+        && n_chunks >= 2;
+
+    if use_split {
+        // Scratch: partial_o[B, n_head, n_chunks, D]; partial_m,l[B, n_head, n_chunks].
+        let scratch_o = unsafe { dev.alloc::<f32>(b * n_head * n_chunks * d)? };
+        let scratch_m = unsafe { dev.alloc::<f32>(b * n_head * n_chunks)? };
+        let scratch_l = unsafe { dev.alloc::<f32>(b * n_head * n_chunks)? };
+
+        let split_name = match d {
+            256 => "gqa_decode_split_chunk_d256_f32",
+            512 => "gqa_decode_split_chunk_d512_f32",
+            _ => unreachable!(),
+        };
+        let combine_name = match d {
+            256 => "gqa_decode_split_combine_d256_f32",
+            512 => "gqa_decode_split_combine_d512_f32",
+            _ => unreachable!(),
+        };
+
+        let split_func   = dev.get_or_load_func(split_name,   &kernels::FLASH_ATTN_V2)?;
+        let combine_func = dev.get_or_load_func(combine_name, &kernels::FLASH_ATTN_V2)?;
+
+        let split_cfg = LaunchConfig {
+            grid_dim: (n_chunks as u32, n_head as u32, b as u32),
+            block_dim: (WARP_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let combine_cfg = LaunchConfig {
+            grid_dim: (n_head as u32, b as u32, 1),
+            block_dim: (WARP_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let chunk_t_i = chunk_t as i32;
+        let n_chunks_i = n_chunks as i32;
+
+        let mut bld = split_func.builder();
+        bld.arg(&q_v); bld.arg(&k_v); bld.arg(&v_v);
+        match m_v.as_ref() {
+            Some(v) => { bld.arg(v); }
+            None => { bld.arg(&hipdarc::driver::NullDevicePtr::default()); }
+        }
+        bld.arg(&scratch_o); bld.arg(&scratch_m); bld.arg(&scratch_l);
+        bld.arg(&ba); bld.arg(&nha); bld.arg(&nka); bld.arg(&lka);
+        bld.arg(&sa); bld.arg(&nra); bld.arg(&mbs);
+        bld.arg(&chunk_t_i); bld.arg(&n_chunks_i);
+        unsafe { bld.launch(split_cfg) }.w()?;
+
+        let mut bld = combine_func.builder();
+        bld.arg(&scratch_o); bld.arg(&scratch_m); bld.arg(&scratch_l);
+        bld.arg(&out);
+        bld.arg(&ba); bld.arg(&nha); bld.arg(&n_chunks_i);
+        unsafe { bld.launch(combine_cfg) }.w()?;
+    } else {
+        let func = dev.get_or_load_func(kernel_name, &kernels::FLASH_ATTN_V2)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, n_head as u32, b as u32),
+            block_dim: (block_dim_x, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut bld = func.builder();
+        bld.arg(&q_v); bld.arg(&k_v); bld.arg(&v_v);
+        match m_v.as_ref() {
+            Some(v) => { bld.arg(v); }
+            None => { bld.arg(&hipdarc::driver::NullDevicePtr::default()); }
+        }
+        bld.arg(&out);
+        bld.arg(&ba); bld.arg(&nha); bld.arg(&nka); bld.arg(&lka);
+        bld.arg(&sa); bld.arg(&nra); bld.arg(&mbs); bld.arg(&lk_it);
+        unsafe { bld.launch(cfg) }.w()?;
     }
-    bld.arg(&out);
-    bld.arg(&ba); bld.arg(&nha); bld.arg(&nka); bld.arg(&lka);
-    bld.arg(&sa); bld.arg(&nra); bld.arg(&mbs); bld.arg(&lk_it);
-    unsafe { bld.launch(cfg) }.w()?;
 
     drop(q_st); drop(k_st); drop(v_st); drop(m_owned);
 

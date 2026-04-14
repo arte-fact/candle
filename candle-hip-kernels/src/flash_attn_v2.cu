@@ -908,3 +908,290 @@ gqa_decode_mv_fast_d512_f32(
     gqa_decode_mv_fast_impl<512, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
                                      scale, n_rep, mask_b_stride, L_k_iter);
 }
+
+// =====================================================================
+// Phase R1 — Split-L_k attention (Flash-Decoding pattern)
+// =====================================================================
+//
+// At low H_q, the unsplit gqa_decode_mv_fast_impl launches H_q*B blocks of
+// one warp each. On MI50 (60 CUs × 4 SIMDs = 240 SIMD slots) this gives 1
+// wave per active SIMD with no other wave to hide the loop-carried
+// (m_i, l_i, o_reg) softmax-state dependency. Splitting the T dimension
+// across CHUNKS extra blocks puts CHUNKS×H_q×B waves on the GPU, so the
+// scheduler can co-schedule independent waves on the same SIMD.
+//
+// arXiv 2311.01282 ("FlashDecoding++") measured 3.93× decode speedup on
+// AMD using this pattern. CK-Tile FlashAttention does not target gfx906,
+// so we implement it ourselves.
+//
+// Two-kernel design:
+//   (1) gqa_decode_split_chunk_d{D}_f32 — each block handles t in [t0, t1).
+//       Writes (m_chunk, l_chunk, o_chunk[D]) to scratch.
+//   (2) gqa_decode_split_combine_d{D}_f32 — one block per (b,h_q) reads the
+//       CHUNKS partial entries and does the log-sum-exp combine to produce
+//       the final output[D].
+//
+// Scratch layout per (b, h_q):
+//   partial_o : float[CHUNKS][D]
+//   partial_m : float[CHUNKS]
+//   partial_l : float[CHUNKS]
+// Stored as three separate buffers so the combine kernel can read m and l
+// from one cacheline burst, then read o[D] sequentially.
+//
+// The split-chunk kernel is structurally identical to the fast kernel:
+// same V-prefetch, same DPP reduce. Only difference is the loop bounds
+// (t0..t1 instead of 0..L_k_iter) and the final write target. VGPR count
+// preserved at 24 → max 10 waves/SIMD on gfx906.
+
+template <int D, int BLOCK_SIZE>
+static __device__ __forceinline__ void gqa_decode_split_chunk_impl(
+    const float * __restrict__ q,
+    const float * __restrict__ k,
+    const float * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ partial_o,   // [B, H_q, n_chunks, D]
+    float * __restrict__ partial_m,   // [B, H_q, n_chunks]
+    float * __restrict__ partial_l,   // [B, H_q, n_chunks]
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep,
+    int mask_b_stride,
+    int chunk_t,                      // tokens per chunk
+    int n_chunks)                     // total chunks per (b,h_q)
+{
+    static_assert(D % 2 == 0, "D must be even for float2 loads");
+    static_assert(BLOCK_SIZE == WARP_SIZE, "split-chunk impl: single-warp block only");
+    static_assert(D / 2 >= BLOCK_SIZE, "D/2 must be >= BLOCK_SIZE");
+    static_assert((D / 2) % BLOCK_SIZE == 0, "D/2 must be a multiple of BLOCK_SIZE");
+    constexpr int NCOLS2 = D / 2;
+    constexpr int F2_PER_LANE = NCOLS2 / BLOCK_SIZE;
+
+    const int chunk_idx = blockIdx.x;
+    const int h_idx     = blockIdx.y;
+    const int b_idx     = blockIdx.z;
+    const int lane      = threadIdx.x;
+
+    const int t0 = chunk_idx * chunk_t;
+    if (t0 >= L_k) return;
+    const int t1 = (t0 + chunk_t < L_k) ? (t0 + chunk_t) : L_k;
+
+    // GQA mapping
+    const int h_kv = (n_rep > 1) ? (h_idx / n_rep) : h_idx;
+
+    const int64_t q_off  = ((int64_t)(b_idx * H_q) + h_idx) * D;
+    const int64_t kv_off = ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)L_k * D;
+
+    const float2 * q2      = (const float2 *)(q + q_off);
+    const float2 * k2_base = (const float2 *)(k + kv_off);
+    const float2 * v2_base = (const float2 *)(v + kv_off);
+
+    const float * mask_row = (mask != nullptr)
+        ? mask + (int64_t)b_idx * (int64_t)mask_b_stride
+        : nullptr;
+
+    // Load Q registers (same layout as fast kernel).
+    float2 q_reg[F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        q_reg[i] = q2[lane + i * BLOCK_SIZE];
+    }
+    float o_reg[2 * F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < 2 * F2_PER_LANE; ++i) o_reg[i] = 0.0f;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    // Loop body: bit-for-bit copy of gqa_decode_mv_fast_impl's inner loop,
+    // only the bounds change. Keep VGPR count at 24.
+    for (int t = t0; t < t1; ++t) {
+        const float2 * k_row = k2_base + (int64_t)t * NCOLS2;
+        const float2 * v_row = v2_base + (int64_t)t * NCOLS2;
+
+        float2 k_vals[F2_PER_LANE];
+        float2 v_vals[F2_PER_LANE];
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            k_vals[i] = k_row[lane + i * BLOCK_SIZE];
+            v_vals[i] = v_row[lane + i * BLOCK_SIZE];
+        }
+
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            partial += q_reg[i].x * k_vals[i].x + q_reg[i].y * k_vals[i].y;
+        }
+
+        float s_t = v2_warp_reduce_sum(partial) * scale;
+        if (mask_row != nullptr) s_t += mask_row[t];
+
+        const float m_new = fmaxf(m_i, s_t);
+        const float alpha = gfx906_fast_exp(m_i - m_new);
+        const float p     = gfx906_fast_exp(s_t - m_new);
+
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            o_reg[2*i]     = alpha * o_reg[2*i]     + p * v_vals[i].x;
+            o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * v_vals[i].y;
+        }
+        l_i = alpha * l_i + p;
+        m_i = m_new;
+    }
+
+    // Write partial results. NOTE: do NOT divide o_reg by l_i here — the
+    // combine kernel needs the un-normalised numerator.
+    const int64_t pml_off = ((int64_t)(b_idx * H_q) + h_idx) * (int64_t)n_chunks + chunk_idx;
+    const int64_t po_off  = pml_off * (int64_t)D;
+    float * po_ptr = partial_o + po_off;
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        const int base = 2 * (lane + i * BLOCK_SIZE);
+        po_ptr[base]     = o_reg[2*i];
+        po_ptr[base + 1] = o_reg[2*i + 1];
+    }
+    if (lane == 0) {
+        partial_m[pml_off] = m_i;
+        partial_l[pml_off] = l_i;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_split_chunk_d256_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ partial_o,
+    float * __restrict__ partial_m,
+    float * __restrict__ partial_l,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride,
+    int chunk_t, int n_chunks)
+{
+    gqa_decode_split_chunk_impl<256, 64>(
+        q, k, v, mask, partial_o, partial_m, partial_l,
+        B, H_q, H_kv, L_k, scale, n_rep, mask_b_stride, chunk_t, n_chunks);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_split_chunk_d512_f32(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ partial_o,
+    float * __restrict__ partial_m,
+    float * __restrict__ partial_l,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride,
+    int chunk_t, int n_chunks)
+{
+    gqa_decode_split_chunk_impl<512, 64>(
+        q, k, v, mask, partial_o, partial_m, partial_l,
+        B, H_q, H_kv, L_k, scale, n_rep, mask_b_stride, chunk_t, n_chunks);
+}
+
+// =====================================================================
+// P1 combine kernel — log-sum-exp across CHUNKS partial results.
+// =====================================================================
+//
+// Grid: (H_q, B), block: (64, 1, 1).
+// For each (b, h), reads CHUNKS triples (m_c, l_c, o_c[D]) and produces
+//   m_global = max_c(m_c)
+//   l_global = sum_c(exp(m_c - m_global) * l_c)
+//   o_global[d] = sum_c(exp(m_c - m_global) * o_c[d]) / l_global
+//
+// CHUNKS is small (≤ ~16 in practice for L_k ≤ 1024). All partial m/l
+// fit in registers per lane; o[D] is reduced one slot at a time per lane.
+
+template <int D, int BLOCK_SIZE, int MAX_CHUNKS>
+static __device__ __forceinline__ void gqa_decode_split_combine_impl(
+    const float * __restrict__ partial_o,   // [B, H_q, n_chunks, D]
+    const float * __restrict__ partial_m,   // [B, H_q, n_chunks]
+    const float * __restrict__ partial_l,   // [B, H_q, n_chunks]
+    float * __restrict__ out,               // [B, H_q, D]
+    int B, int H_q, int n_chunks)
+{
+    static_assert(D % 2 == 0, "D must be even");
+    static_assert(BLOCK_SIZE == WARP_SIZE, "single-warp block only");
+    static_assert((D / 2) % BLOCK_SIZE == 0, "D/2 must be multiple of BLOCK_SIZE");
+    constexpr int NCOLS2 = D / 2;
+    constexpr int F2_PER_LANE = NCOLS2 / BLOCK_SIZE;
+
+    const int h_idx = blockIdx.x;
+    const int b_idx = blockIdx.y;
+    const int lane  = threadIdx.x;
+
+    const int64_t pml_base = ((int64_t)(b_idx * H_q) + h_idx) * (int64_t)n_chunks;
+    const int64_t po_base  = pml_base * (int64_t)D;
+
+    // Load m and l for all chunks into registers (small — at most MAX_CHUNKS).
+    // Find m_global = max(m_c).
+    float m_global = -INFINITY;
+    for (int c = 0; c < n_chunks; ++c) {
+        const float m_c = partial_m[pml_base + c];
+        m_global = fmaxf(m_global, m_c);
+    }
+
+    // Compute per-chunk weight exp(m_c - m_global) and accumulate l_global.
+    // Recompute m_c and l_c (they're cheap; avoids storing them in MAX_CHUNKS regs).
+    float l_global = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const float m_c = partial_m[pml_base + c];
+        const float l_c = partial_l[pml_base + c];
+        l_global += gfx906_fast_exp(m_c - m_global) * l_c;
+    }
+    const float inv_l = gfx906_rcp(l_global);
+
+    // For each lane, accumulate F2_PER_LANE float2 entries of o.
+    float2 o_acc[F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        o_acc[i].x = 0.0f;
+        o_acc[i].y = 0.0f;
+    }
+
+    for (int c = 0; c < n_chunks; ++c) {
+        const float m_c = partial_m[pml_base + c];
+        const float w_c = gfx906_fast_exp(m_c - m_global);  // un-normalised
+        const float2 * po2 = (const float2 *)(partial_o + po_base + (int64_t)c * D);
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            const float2 oc = po2[lane + i * BLOCK_SIZE];
+            o_acc[i].x += w_c * oc.x;
+            o_acc[i].y += w_c * oc.y;
+        }
+    }
+
+    // Normalise + write back.
+    const int64_t out_off = ((int64_t)(b_idx * H_q) + h_idx) * D;
+    float2 * o_ptr2 = (float2 *)(out + out_off);
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        float2 oo;
+        oo.x = o_acc[i].x * inv_l;
+        oo.y = o_acc[i].y * inv_l;
+        o_ptr2[lane + i * BLOCK_SIZE] = oo;
+    }
+
+    (void)MAX_CHUNKS;  // currently informational only
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_split_combine_d256_f32(
+    const float * __restrict__ partial_o,
+    const float * __restrict__ partial_m,
+    const float * __restrict__ partial_l,
+    float * __restrict__ out,
+    int B, int H_q, int n_chunks)
+{
+    gqa_decode_split_combine_impl<256, 64, 16>(
+        partial_o, partial_m, partial_l, out, B, H_q, n_chunks);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_split_combine_d512_f32(
+    const float * __restrict__ partial_o,
+    const float * __restrict__ partial_m,
+    const float * __restrict__ partial_l,
+    float * __restrict__ out,
+    int B, int H_q, int n_chunks)
+{
+    gqa_decode_split_combine_impl<512, 64, 16>(
+        partial_o, partial_m, partial_l, out, B, H_q, n_chunks);
+}
