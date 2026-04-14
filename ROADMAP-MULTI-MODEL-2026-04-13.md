@@ -59,21 +59,72 @@ See `SURVEY-GFX906-FORKS-2026-04-13.md` for the full landscape comparison of can
 
 ### Phase I — MMQ kernel rewrite (cross-model win)
 
-**Target:** `mul_mat_q4_0_gfx906_v2f_tile32` kernel at 652 μs/call vs
-llama.cpp's `mul_mat_q<type>` at 225 μs/call (2.9× slower). Impacts prefill
-for **every** Q4_0 model.
+**Target:** `mul_mat_q4_0_gfx906_v2f_tile32` kernel at 4042 μs/call on
+E4B 874-tok prefill (78% of prefill GPU time per the 2026-04-14 long-
+prompt profile). Impacts prefill for **every** Q4_0 model.
+
+**Diagnosed root cause** (2026-04-14, commit `f395be40` analysis):
+- 88 VGPRs → 2 waves/CU naturally (occupancy isn't the problem).
+- The `__launch_bounds__(64, 1)` was a *floor*; bumping to (64, 2) made
+  zero difference (compiler was already at 2 waves).
+- **Real bottleneck**: non-coalesced X reads. Adjacent lanes read
+  adjacent rows; rows are `blocks_per_row * 18` bytes apart (~1152 B
+  for E4B hidden=2048) → **64 cachelines per wave per K-block** for X.
+- Y reads ARE shared/broadcast across the wave (1 cacheline per K-block
+  per column).
+- compute is dp4a-chain bound: 16 sequential dp4a per (col, K-block),
+  ~4 cycle latency = 64 cycles serial. 2-wave/CU can hide some but
+  the long chain still dominates.
 
 **Projected gain:** prefill 2-3× across all models (TinyLlama prefill 801 →
 ~2 000 t/s; Gemma4 87 → ~250 t/s).
 
-- **I1** — Read llama.cpp `ggml-cuda/mmq.cuh` template, understand tile
-  structure, block layout, shared-memory staging.
-- **I2** — Either port their template or rewrite our v2f kernel to match
-  — likely bigger output tiles, better LDS reuse, matching warp layout.
-- **I3** — Validate correctness (MMQ tolerance) against existing tests.
+#### I1 — One-time X repack at weight-load time *(highest-impact)*
 
-**Owner:** TBD.
-**Effort:** 1-2 days (real kernel work).
+At GGUF load time, repack each Q4_0 weight matrix from row-major (rows
+contiguous, K-blocks within row contiguous) to **K-block-major within
+row tile of 64**: for each K-block index `ib`, store the K-block data
+for rows [r..r+63] contiguously, then [r+64..r+127], etc.
+
+Then in the MMQ kernel: 64 lanes of one wave reading row tile R for
+K-block `ib` access addresses `(ib * (M/64) + R) * 64*18 + lane * 18`
+— adjacent lanes 18 bytes apart → ~16-18 cachelines per wave instead
+of 64. **4× cacheline-count reduction → expected 2-3× kernel speedup**
+(VMEM no longer the stall, dp4a chain becomes the new bottleneck).
+
+Storage cost: same total bytes, just rearranged. Doesn't affect MMVQ
+(decode) which uses the original layout — keep both layouts OR migrate
+the MMVQ kernel too in a follow-up.
+
+**Effort:** ~1 day (load-time repack in `candle-core/src/quantized/`,
+new kernel variant reading the new layout, dispatcher selects per-tensor).
+
+#### I2 — LDS staging for X tile *(alternative)*
+
+Cooperatively load X K-block into LDS at the top of each K-iter. With
+the original storage layout, even cooperative load doesn't coalesce
+(still 64 cachelines per K-block) — but the LDS staging can buffer
+multiple K-blocks at once, amortising the VMEM cost across more compute.
+
+Less effective than I1 because root cause (non-coalesced HBM reads)
+isn't fixed. **Effort:** ~1 day. **Confidence:** lower.
+
+#### I3 — Dequant-to-f16 + rocBLAS sgemm *(experimental)*
+
+For prefill where M, N, K are large, dequantize Q4_0 → f16 once, then
+let rocBLAS handle the gemm. rocBLAS has heavily-tuned Tensile kernels
+for f16/f32. On gfx906 there's no MFMA so the win isn't huge, but
+rocBLAS may still beat our hand-tuned kernel for skinny-tall shapes.
+
+Worth a 1-day benchmark to know if this is a real path. Likely
+preferable for very long prefill where the dequant cost amortizes well.
+
+**Effort:** ~1 day for the bench + decision; integration depends on
+the result.
+
+**Owner:** TBD. **Order:** I1 first (biggest expected win + cleanest
+implementation). I3 can run in parallel as a sanity check. I2 only
+if I1 hits unexpected blockers.
 
 ### Phase J — Fix Qwen3.5 correctness bug
 
