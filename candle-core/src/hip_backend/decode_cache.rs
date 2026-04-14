@@ -656,6 +656,34 @@ impl DecodePlan {
                     name, co, ext, total
                 );
             }
+            // Also print the actual delta values per kernel — distinguishes
+            // scalar-counters (delta = +1 etc.) from pointer-counters
+            // (delta = bytes per layer / per-row stride). Scalar can use
+            // the simple device-buffer T2 path; pointer needs a different
+            // design (base + offset_table indirection per kernel).
+            let mut deltas_by_kernel: HashMap<String, Vec<i64>> = HashMap::new();
+            for (i, kinds) in dynamic_kinds.iter().enumerate() {
+                let name = ops[i].name.clone();
+                let entry = deltas_by_kernel.entry(name).or_default();
+                for k in kinds {
+                    if let DynArgKind::Counter(d) = k {
+                        entry.push(*d);
+                    }
+                }
+            }
+            let mut by_kernel_sorted: Vec<_> = deltas_by_kernel.iter().collect();
+            by_kernel_sorted.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+            eprintln!("[G2-counter-deltas]");
+            for (name, deltas) in by_kernel_sorted.iter().take(10) {
+                let mut hist: HashMap<i64, usize> = HashMap::new();
+                for d in deltas.iter() { *hist.entry(*d).or_insert(0) += 1; }
+                let mut h: Vec<_> = hist.iter().collect();
+                h.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+                let summary: String = h.iter().take(4)
+                    .map(|(d, c)| format!("delta={} ({})", d, c))
+                    .collect::<Vec<_>>().join(", ");
+                eprintln!("  {:>40}  {}", name, summary);
+            }
         }
 
         Some(Self {
