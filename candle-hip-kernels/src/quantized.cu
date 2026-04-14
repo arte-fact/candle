@@ -5658,7 +5658,19 @@ static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_fast(
     }
 }
 
-extern "C" __global__ void __launch_bounds__(64, 1)
+// Phase I — MMQ Q4_0 occupancy. Profiling reports actual_vgpr_count=88,
+// which on gfx906 fits 2 waves/CU (256 VGPRs/SIMD ÷ 88 = ~2.9). The
+// (64, 1) launch_bounds was a *floor* — the compiler was already
+// emitting 2 waves. Bumping to (64, 2) made no measurable difference
+// (4042 µs/call before vs after), kept for documentation.
+//
+// Real bottleneck for further speedup is non-coalesced X reads:
+// adjacent lanes read adjacent rows, but rows are blocks_per_row*18
+// bytes apart → 64 cachelines per wave per K-block. Phase I proper
+// would reorder X storage to row-major-within-K-block at load time
+// (or stage X into LDS via cooperative loads). Both are major
+// refactors not done in this session.
+extern "C" __global__ void __launch_bounds__(64, 2)
 mul_mat_q4_0_gfx906_v2f_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
