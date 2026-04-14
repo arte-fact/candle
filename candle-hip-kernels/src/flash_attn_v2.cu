@@ -838,6 +838,10 @@ static __device__ __forceinline__ void gqa_decode_mv_fast_impl(
         // Issue K and V loads together so V latency overlaps QK reduce +
         // online-softmax exponentials. V is independent of the reduce result,
         // so the compiler is free to schedule its VMEM before the reduce.
+        // (Note: K double-buffering across T was tried; it regressed because
+        // the extra VGPR state dropped occupancy from 4→3 waves/EU, negating
+        // the latency hiding. The compiler already schedules next-T K loads
+        // via forward speculation when occupancy is high enough.)
         float2 k_vals[F2_PER_LANE];
         float2 v_vals[F2_PER_LANE];
         #pragma unroll
