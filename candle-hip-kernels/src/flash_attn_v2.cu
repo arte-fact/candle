@@ -830,12 +830,22 @@ static __device__ __forceinline__ void gqa_decode_mv_fast_impl(
         const float2 * k_row = k2_base + (int64_t)t * NCOLS2;
         const float2 * v_row = v2_base + (int64_t)t * NCOLS2;
 
+        // Issue K and V loads together so V latency overlaps QK reduce +
+        // online-softmax exponentials. V is independent of the reduce result,
+        // so the compiler is free to schedule its VMEM before the reduce.
+        float2 k_vals[F2_PER_LANE];
+        float2 v_vals[F2_PER_LANE];
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            k_vals[i] = k_row[lane + i * BLOCK_SIZE];
+            v_vals[i] = v_row[lane + i * BLOCK_SIZE];
+        }
+
         // Per-thread partial dot over this K row.
         float partial = 0.0f;
         #pragma unroll
         for (int i = 0; i < F2_PER_LANE; ++i) {
-            float2 kv = k_row[lane + i * BLOCK_SIZE];
-            partial += q_reg[i].x * kv.x + q_reg[i].y * kv.y;
+            partial += q_reg[i].x * k_vals[i].x + q_reg[i].y * k_vals[i].y;
         }
 
         // Warp-wide reduce (no __syncthreads — single-warp block).
@@ -846,12 +856,11 @@ static __device__ __forceinline__ void gqa_decode_mv_fast_impl(
         const float alpha = gfx906_fast_exp(m_i - m_new);
         const float p     = gfx906_fast_exp(s_t - m_new);
 
-        // V·attn accumulate, coalesced float2 reads.
+        // V·attn accumulate using the pre-loaded V values.
         #pragma unroll
         for (int i = 0; i < F2_PER_LANE; ++i) {
-            float2 vv = v_row[lane + i * BLOCK_SIZE];
-            o_reg[2*i]     = alpha * o_reg[2*i]     + p * vv.x;
-            o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * vv.y;
+            o_reg[2*i]     = alpha * o_reg[2*i]     + p * v_vals[i].x;
+            o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * v_vals[i].y;
         }
         l_i = alpha * l_i + p;
         m_i = m_new;
