@@ -543,7 +543,167 @@ fn mul_mat_q_v2(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
+
+    // MMQ turbo-port gate. Stage 1 skeleton — Q4_0 only, placeholder
+    // output. See candle-hip-kernels/src/mmq_turbo.cu.
+    if dtype == GgmlDType::Q4_0
+        && std::env::var("CANDLE_MMQ_TURBO_PORT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        if let Some(out) = mul_mat_q4_0_turbo(data, y, ncols, nrows, total_b, dev)? {
+            return Ok(Some(out));
+        }
+    }
+
     mul_mat_q_v2_with_tile_n(data, y, dtype, ncols, nrows, total_b, dev, tile_n)
+}
+
+/// Turbo-port path (Stage 2): Q4_0 MMQ with turbo's tile geometry
+/// (mmq_y=128, mmq_x∈{8,16,32,64}, nwarps=4). Uses the mmq Q8_1 layout
+/// (`block_q8_1_mmq`, 144 B/block, ordered (big_block, col)) rather
+/// than candle's row-major per-col Q8_1 — the port provides its own
+/// `quantize_q8_1_mmq_q4_0` kernel.
+fn mul_mat_q4_0_turbo(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    const MMQ_Y: usize = 128;
+    const MMQ_NWARPS: u32 = 4;
+    const MMQ_TILE_NE_K: usize = 32;
+    const QI4_0: usize = 4;
+    const MMQ_TILE_Y_K: usize = MMQ_TILE_NE_K + MMQ_TILE_NE_K / 8; // 36 ints
+    const Q8_1_MMQ_BYTES: usize = 144;
+    const BIG_BLOCK_ELEMS: usize = 128;
+
+    if total_b == 0 {
+        return Ok(Some(HipStorage::wrap_hip_slice(
+            dev.alloc_zeros::<f32>(0)?,
+            dev.clone(),
+        )));
+    }
+    if y.len() != ncols * total_b {
+        crate::bail!(
+            "mul_mat_q4_0_turbo: unexpected y size {}, ncols {ncols} total_b {total_b}",
+            y.len()
+        )
+    }
+    // Require K to be a multiple of MMQ_ITER_K=256 (= 8 Q4_0 blocks =
+    // 2 mmq blocks, one pair per outer K-iter). The K-loop processes
+    // 256 elements per iteration and doesn't handle partial tails; a
+    // non-aligned K would OOB-read Q4_0 blocks on the last iter.
+    // All TinyLlama shapes satisfy this (hidden=2048, ffn=5632).
+    const MMQ_ITER_K: usize = 256;
+    if ncols % MMQ_ITER_K != 0 {
+        return Ok(None);
+    }
+    // Q4_0 weight rows must be a multiple of 128 with `unchecked` kernel.
+    // We could synthesize a `checked` variant when this isn't true; for the
+    // first rollout accept the common case only.
+    if nrows % MMQ_Y != 0 {
+        return Ok(None);
+    }
+
+    // Pick mmq_x adaptive to batch.  Temporary: env override for M2 debug.
+    let mmq_x: usize = if let Ok(s) = std::env::var("CANDLE_MMQ_TURBO_X") {
+        s.parse().unwrap_or(0)
+    } else {
+        match total_b {
+            0 => return Ok(None),
+            1..=8 => 8,
+            9..=16 => 16,
+            17..=32 => 32,
+            _ => 64,
+        }
+    };
+    let need_check = false; // gated above
+    let kernel_name = match (mmq_x, need_check) {
+        (8, false) => "mul_mat_q4_0_turbo_x8_unchecked",
+        (16, false) => "mul_mat_q4_0_turbo_x16_unchecked",
+        (32, false) => "mul_mat_q4_0_turbo_x32_unchecked",
+        (64, false) => "mul_mat_q4_0_turbo_x64_unchecked",
+        _ => return Ok(None),
+    };
+
+    // Allocate + populate the turbo-layout Q8_1 buffer.
+    //   size = n_big_blocks * total_b_padded * 144 bytes
+    let n_big_blocks = ncols / BIG_BLOCK_ELEMS;
+    let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
+    let y_mmq_size_bytes = n_big_blocks * total_b_padded * Q8_1_MMQ_BYTES;
+
+    // Zero-fill so OOB cols (total_b..total_b_padded) contribute nothing.
+    let mut y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+
+    // Quantize f32 y → block_q8_1_mmq laid out (big_block, col).
+    //   grid = (n_big_blocks, total_b, 1), block = (128, 1, 1).
+    let qkernel = dev.get_or_load_func(
+        "quantize_q8_1_mmq_q4_0",
+        &candle_hip_kernels::MMQ_TURBO,
+    )?;
+    let qcfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (n_big_blocks as u32, total_b as u32, 1),
+        block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut qbuilder = qkernel.builder();
+    qbuilder.arg(/* x */ y);
+    qbuilder.arg(/* vy */ &y_mmq);
+    barg!(
+        qbuilder,
+        /* ncols */ ncols as i32,
+        /* total_b */ total_b_padded as i32
+    );
+    unsafe { qbuilder.launch(qcfg) }.w()?;
+
+    // Allocate dst.
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
+
+    // LDS size for the chosen mmq_x:
+    //   tile_y = PAD(mmq_x * MMQ_TILE_Y_K, nwarps*warp_size)  ints
+    //   x_qs   = MMQ_Y * (MMQ_TILE_NE_K + 1)                  ints
+    //   x_df   = MMQ_Y * (MMQ_TILE_NE_K / QI4_0) + MMQ_Y/QI4_0 floats
+    let tile_y_ints = {
+        let raw = mmq_x * MMQ_TILE_Y_K;
+        let pad = MMQ_NWARPS as usize * WARP_SIZE;
+        raw.div_ceil(pad) * pad
+    };
+    let x_qs_ints = MMQ_Y * (MMQ_TILE_NE_K + 1);
+    let x_df_flts = MMQ_Y * (MMQ_TILE_NE_K / QI4_0) + MMQ_Y / QI4_0;
+    let shared_mem_bytes = (tile_y_ints + x_qs_ints) * 4 + x_df_flts * 4;
+
+    // Launch the MMQ kernel.
+    let blocks_per_row_x = ncols / 32; // Q4_0 stride per X row (in blocks).
+    let func = dev.get_or_load_func(kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(nrows, MMQ_Y) as u32,
+            ceil_div(total_b, mmq_x) as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, MMQ_NWARPS, 1),
+        shared_mem_bytes: shared_mem_bytes as u32,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(/* vx */ &data.inner);
+    builder.arg(/* vy */ &y_mmq);
+    builder.arg(/* dst */ &dst);
+    barg!(
+        builder,
+        /* ncols_x */ ncols as i32,
+        /* nrows_x */ nrows as i32,
+        /* ncols_y */ total_b as i32,
+        /* stride_col_y */ total_b_padded as i32,
+        /* stride_row_x */ blocks_per_row_x as i32,
+        /* nrows_dst */ nrows as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
 }
 
 /// Internal variant of [`mul_mat_q_v2`] that takes an explicit `tile_n`.

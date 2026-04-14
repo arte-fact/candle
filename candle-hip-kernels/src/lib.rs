@@ -21,6 +21,7 @@ pub enum Id {
     FusedFfnDecode,
     GatedDeltaNet,
     Indexing,
+    MmqTurbo,
     Quantized,
     Reduce,
     Sort,
@@ -28,7 +29,7 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 15] = [
+pub const ALL_IDS: [Id; 16] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
@@ -39,6 +40,7 @@ pub const ALL_IDS: [Id; 15] = [
     Id::FusedFfnDecode,
     Id::GatedDeltaNet,
     Id::Indexing,
+    Id::MmqTurbo,
     Id::Quantized,
     Id::Reduce,
     Id::Sort,
@@ -83,11 +85,12 @@ mdl!(6, FLASH_ATTN_V2);
 mdl!(7, FUSED_FFN_DECODE);
 mdl!(8, GATED_DELTA_NET);
 mdl!(9, INDEXING);
-mdl!(10, QUANTIZED);
-mdl!(11, REDUCE);
-mdl!(12, SORT);
-mdl!(13, TERNARY);
-mdl!(14, UNARY);
+mdl!(10, MMQ_TURBO);
+mdl!(11, QUANTIZED);
+mdl!(12, REDUCE);
+mdl!(13, SORT);
+mdl!(14, TERNARY);
+mdl!(15, UNARY);
 
 /// Produce a kernel function name with dtype suffix, e.g. `"add_f32"`.
 pub fn kernel_name<T: crate::DTypeName>(root: &str) -> String {

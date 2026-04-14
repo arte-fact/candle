@@ -13,6 +13,9 @@ fn which(name: &str) -> Option<PathBuf> {
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
+    // Rerun when files are added/removed from src/ (e.g. a new `.cu`).
+    // Individual files already get their own rerun-if-changed below.
+    println!("cargo::rerun-if-changed=src");
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
     println!("cargo::rerun-if-changed=src/hip_utils.cuh");
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
