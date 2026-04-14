@@ -79,25 +79,24 @@ prompt profile). Impacts prefill for **every** Q4_0 model.
 **Projected gain:** prefill 2-3× across all models (TinyLlama prefill 801 →
 ~2 000 t/s; Gemma4 87 → ~250 t/s).
 
-#### I1 — One-time X repack at weight-load time *(highest-impact)*
+#### I1 — One-time X repack at weight-load time *(LANDED, 4% per-call only)*
 
-At GGUF load time, repack each Q4_0 weight matrix from row-major (rows
-contiguous, K-blocks within row contiguous) to **K-block-major within
-row tile of 64**: for each K-block index `ib`, store the K-block data
-for rows [r..r+63] contiguously, then [r+64..r+127], etc.
+Status (commit `11c9c92d`, 2026-04-14): kernel `mul_mat_q4_0_gfx906_v2f_tile32_repacked`
++ host repack + microbench landed. Verified bit-exact output (rel L2
+= 0). **Measured speedup: 1.04× per call** on (M=14336, K=2048, N=874)
+shape. Far below the predicted 2-3×.
 
-Then in the MMQ kernel: 64 lanes of one wave reading row tile R for
-K-block `ib` access addresses `(ib * (M/64) + R) * 64*18 + lane * 18`
-— adjacent lanes 18 bytes apart → ~16-18 cachelines per wave instead
-of 64. **4× cacheline-count reduction → expected 2-3× kernel speedup**
-(VMEM no longer the stall, dp4a chain becomes the new bottleneck).
+**Lesson:** the X-coalescing analysis was right about the cacheline
+count (64 → ~18 lines) but wrong about it being the dominant
+bottleneck. L2 was already absorbing the non-coalesced reads. The
+real bottleneck is the **dp4a-chain serial dependency** (16 sequential
+`v_dot4_i32_i8` per column-K-pair, ~4 cycle latency each → 64 cycles
+serial per inner step; 32 cols × 64 K-blocks per row tile compounds).
 
-Storage cost: same total bytes, just rearranged. Doesn't affect MMVQ
-(decode) which uses the original layout — keep both layouts OR migrate
-the MMVQ kernel too in a follow-up.
-
-**Effort:** ~1 day (load-time repack in `candle-core/src/quantized/`,
-new kernel variant reading the new layout, dispatcher selects per-tensor).
+**Conclusion:** I1 is committed as scaffolding for future Phase I work
+but **does NOT justify the load-time repack integration cost on its
+own**. Skip integration unless future kernel-side work (wider dp4a
+issue, larger row tiles, etc.) makes the X cacheline pattern matter.
 
 #### I2 — LDS staging for X tile *(alternative)*
 
@@ -122,9 +121,13 @@ preferable for very long prefill where the dequant cost amortizes well.
 **Effort:** ~1 day for the bench + decision; integration depends on
 the result.
 
-**Owner:** TBD. **Order:** I1 first (biggest expected win + cleanest
-implementation). I3 can run in parallel as a sanity check. I2 only
-if I1 hits unexpected blockers.
+**Owner:** TBD. **Order (revised post-I1):** **I3 first** — I1 only
+yielded 4 % per-call so the dp4a-chain is the real ceiling. rocBLAS
+sgemm via dequant-to-f16 may break that ceiling entirely (Tensile
+kernels use f32-accum FMA pipelines which don't have the chain
+serialisation problem). If I3 is a clear win, integrate that and
+shelve I1's repack integration. I2 deprioritised (would attack the
+same already-not-bottleneck X cacheline issue).
 
 ### Phase J — Fix Qwen3.5 correctness bug
 
