@@ -564,13 +564,13 @@ impl candle::CustomOp3 for RotaryEmb {
                 None => candle::bail!("src input has to be contiguous"),
                 Some((o1, o2)) => src.slice(o1..o2),
             };
-            let cos = match l_cos.contiguous_offsets() {
+            let (cos_o1, cos_o2) = match l_cos.contiguous_offsets() {
                 None => candle::bail!("cos input has to be contiguous"),
-                Some((o1, o2)) => cos.slice(o1..o2),
+                Some((o1, o2)) => (o1, o2),
             };
-            let sin = match l_sin.contiguous_offsets() {
+            let (sin_o1, _sin_o2) = match l_sin.contiguous_offsets() {
                 None => candle::bail!("sin input has to be contiguous"),
-                Some((o1, o2)) => sin.slice(o1..o2),
+                Some((o1, o2)) => (o1, o2),
             };
             let (b, h, t, d) = l_src.shape().dims4()?;
             let stride_b = if l_cos.dims().len() == 3 && l_sin.dims().len() == 3 {
@@ -580,18 +580,51 @@ impl candle::CustomOp3 for RotaryEmb {
             };
             let el = b * h * t * d;
             let cfg = LaunchConfig::for_num_elems((el / 2) as u32);
-            let kernel_name = format!("rope_{}", T::DTYPE.as_str());
-            let func = dev.get_or_load_func(&kernel_name, &kernels::REDUCE)?;
             // SAFETY: Set later by running the kernel.
             let dst = unsafe { dev.alloc::<T>(el)? };
+            let bh = (b * h) as u32;
+            let td = (t * d) as u32;
+            let d_u32 = d as u32;
+
+            // Phase T2: under G2 capture for f32, route to `_ctr` variant
+            // so cos/sin pointers stay stable (= cache base) across the
+            // captured plan; per-replay only the offset slot updates.
+            // We require cos/sin to share the SAME byte offset (true for
+            // the standard "narrow at index_pos" pattern in rope.rs).
+            let g2_active = std::env::var_os("CANDLE_G2_REPLAY").is_some();
+            let use_ctr = g2_active && T::DTYPE == candle::DType::F32 && cos_o1 == sin_o1;
+            if use_ctr {
+                use candle::hip_backend::g3_counters::{set, slot_ptr, CounterSlot};
+                let off_bytes = (cos_o1 * std::mem::size_of::<T>()) as u32;
+                set(dev, CounterSlot::RopeOffsetBytes, off_bytes)?;
+                let cos_full = cos.slice(0..cos.len());
+                let sin_full = sin.slice(0..sin.len());
+                let off_ptr: usize = slot_ptr(dev, CounterSlot::RopeOffsetBytes) as usize;
+                let func = dev.get_or_load_func("rope_f32_ctr", &kernels::REDUCE)?;
+                let mut builder = func.builder();
+                builder.arg(&src);
+                builder.arg(&cos_full);
+                builder.arg(&sin_full);
+                builder.arg(&dst);
+                builder.arg(&bh);
+                builder.arg(&td);
+                builder.arg(&d_u32);
+                builder.arg(&stride_b);
+                builder.arg(&off_ptr);
+                // SAFETY: ffi.
+                unsafe { builder.launch(cfg) }.w()?;
+                return Ok(dst);
+            }
+
+            let cos = cos.slice(cos_o1..cos_o2);
+            let sin = sin.slice(sin_o1..(sin_o1 + (cos_o2 - cos_o1)));
+            let kernel_name = format!("rope_{}", T::DTYPE.as_str());
+            let func = dev.get_or_load_func(&kernel_name, &kernels::REDUCE)?;
             let mut builder = func.builder();
             builder.arg(&src);
             builder.arg(&cos);
             builder.arg(&sin);
             builder.arg(&dst);
-            let bh = (b * h) as u32;
-            let td = (t * d) as u32;
-            let d_u32 = d as u32;
             builder.arg(&bh);
             builder.arg(&td);
             builder.arg(&d_u32);

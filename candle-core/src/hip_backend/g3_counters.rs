@@ -21,13 +21,20 @@
 
 use crate::hip_backend::hipdarc;
 use crate::hip_backend::HipDevice;
-use crate::hip_backend::WrapErr;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// Counter slot indices. Each unique scalar counter that flows through
 /// G3-captured kernels gets its own slot. Add new entries here when
 /// expanding T2 to more kernels.
+///
+/// Two interpretations:
+///   * "scalar" — the slot value is a direct integer counter (e.g.
+///     `LkIter` is the L_k_iter value to feed gqa_decode_mv_fast).
+///   * "byte offset" — the slot value is a pointer offset in BYTES, to
+///     be added to a base pointer in the kernel body (e.g.
+///     `RopeOffsetBytes` is the byte offset into the cos/sin tables for
+///     the current decode token).
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CounterSlot {
@@ -35,10 +42,11 @@ pub enum CounterSlot {
     /// effective number of K positions to iterate (= index_pos + 1
     /// during decode, may be larger when n_kv padding is in effect).
     LkIter = 0,
-    /// `offset` (RoPE base position) for `rope_f32_ctr`. Same value as
-    /// L_k_iter - 1 in the typical decode case but kept separate so
-    /// callers don't have to assume the relationship.
-    RopeOffset = 1,
+    /// **Byte offset** into cos/sin tables for `rope_f32_ctr`. Both cos
+    /// and sin advance by the same offset per token (= index_pos *
+    /// head_dim * sizeof(T) bytes). One slot suffices for all rope
+    /// calls in a forward pass.
+    RopeOffsetBytes = 1,
 }
 
 /// Number of slots; sized for 16 future counters.

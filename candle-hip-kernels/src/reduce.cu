@@ -1098,6 +1098,29 @@ LAYERNORM_OP(double, layernorm_f64)
 ROPE_OP(float, rope_f32, rope_i_f32, rope_thd_f32)
 ROPE_OP(double, rope_f64, rope_i_f64, rope_thd_f64)
 
+// Phase T2: `_ctr` variant that takes cos/sin as BASE pointers (stable
+// address of the full cache) plus a pointer to a device u32 holding the
+// byte-offset into the cache for the current decode step. Per-replay
+// we only need to update the 4-byte slot; the cos/sin args never
+// change. Collapses 66 rope-op Counter patches per G3 replay.
+extern "C" __global__ void rope_f32_ctr(
+    const float *src,
+    const float *cos_base,
+    const float *sin_base,
+    float *dst,
+    const uint32_t bh,
+    const uint32_t td,
+    const uint32_t d,
+    const uint32_t stride_b,
+    const uint32_t *cos_offset_bytes_ptr) {
+  const uint32_t off = *cos_offset_bytes_ptr;
+  const float *cos =
+      (const float *)((const char *)cos_base + off);
+  const float *sin =
+      (const float *)((const char *)sin_base + off);
+  rope<float>(src, cos, sin, dst, bh, td, d, stride_b);
+}
+
 FAST_OP(float, fast_min_f32, fast_max_f32, fast_argmin_f32, fast_argmax_f32, fast_sum_f32)
 FAST_OP(double, fast_min_f64, fast_max_f64, fast_argmin_f64, fast_argmax_f64, fast_sum_f64)
 FAST_OP(uint32_t, fast_min_u32, fast_max_u32, fast_argmin_u32, fast_argmax_u32, fast_sum_u32)
