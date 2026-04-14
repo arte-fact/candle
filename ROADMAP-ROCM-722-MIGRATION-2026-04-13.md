@@ -1,5 +1,38 @@
 # ROCm 7.2.1 + Tensile gfx906 Migration Roadmap — 2026-04-13
 
+## 2026-04-14 update — measured, no benefit on gfx906
+
+**TL;DR**: ROCm 7.2.1 HIP runtime installed and benched against 7.1.1 on
+Gemma4-E4B Q4_0. **No improvement**; the G3 patch loop is actually
+slower (547-661 µs vs 430 µs / 218 ops). The AQL packet-batching
+improvement claimed in arxiv 2511.11581 (which powers the Triton
+"launch-overhead" 1.99× win) is **MI200/MI300-specific**, not gfx906.
+This migration is **closed as negative result**.
+
+| bench | ROCm 7.1.1 | ROCm 7.2.1 HIP + 7.1.1 rocBLAS | Δ |
+|---|---|---|---|
+| Prefill (178 tok) | 644 t/s | 643 t/s | 0.0 % |
+| Default decode (100 tok gen) | 65.35 t/s | 65.15 t/s | -0.3 % |
+| G3 decode (100 tok gen) | 60.40 t/s | 59.71 t/s | **-1.1 %** |
+| G3 patch loop (218 ops) | 430 µs | ~600 µs | **-40 %** (slower) |
+
+**Install config benched**: `LD_PRELOAD=/opt/rocm-7.2.1/lib/libamdhip64.so.7 LD_LIBRARY_PATH=/opt/rocm-7.1.1/core-7.13/lib`
+(HIP 7.2.1 + rocBLAS 7.1.1 because 7.2.1 ships **zero** gfx906 Tensile
+kernels — native rocBLAS calls crash with "Cannot read
+`TensileLibrary.dat` for GPU arch : gfx906"). Pure-7.2.1 would need
+mixa3607's `tensile-files-7.2.1.tgz` supplement.
+
+**Conclusion**: the gfx906 graph-node overhead ceiling is **not an API
+version problem**, it's a silicon-generation limitation (pre-CDNA2, no
+AQL packet batching support). There is no userspace path to close the
+G3 launch-overhead gap on this hardware.
+
+**Action**: keep ROCm 7.1.1 as the build target. G3 stays opt-in
+(`CANDLE_G3_GRAPH=1`) and remains a regression on gfx906 — use
+default decode unless benchmarking.
+
+---
+
 ## Starting point
 
 | Stack | libamdhip64 | librocblas | Tensile gfx906 coverage | Used by |
