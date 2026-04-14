@@ -634,21 +634,36 @@ static __device__ __forceinline__ void gqa_decode_mv_impl(
         const float * k_row = k_ptr + (int64_t)t * D;
         const float * v_row = v_ptr + (int64_t)t * D;
 
-        // Per-lane partial dot product. Adjacent lanes read 8 adjacent
-        // bytes — one 128-bit VMEM transaction per warp per pair.
-        float partial = 0.0f;
+        // Issue both K and V loads together so V VMEM latency overlaps
+        // the warp-reduce + softmax-exp critical path (same pattern as
+        // gqa_decode_mv_fast_impl; see its comment for details).
+        float k_reg[D_PER_LANE];
+        float v_reg[D_PER_LANE];
         if constexpr (USE_FLOAT2) {
             const float2 * k_row2 = reinterpret_cast<const float2 *>(k_row);
+            const float2 * v_row2 = reinterpret_cast<const float2 *>(v_row);
             #pragma unroll
             for (int i = 0; i < PAIRS_PER_LANE; ++i) {
                 const float2 kk = k_row2[lane + i * WARP_SIZE];
-                partial += q_reg[2*i] * kk.x + q_reg[2*i + 1] * kk.y;
+                const float2 vv = v_row2[lane + i * WARP_SIZE];
+                k_reg[2*i]     = kk.x;
+                k_reg[2*i + 1] = kk.y;
+                v_reg[2*i]     = vv.x;
+                v_reg[2*i + 1] = vv.y;
             }
         } else {
             #pragma unroll
             for (int i = 0; i < D_PER_LANE; ++i) {
-                partial += q_reg[i] * k_row[lane + i * WARP_SIZE];
+                k_reg[i] = k_row[lane + i * WARP_SIZE];
+                v_reg[i] = v_row[lane + i * WARP_SIZE];
             }
+        }
+
+        // Per-lane partial dot product using pre-loaded K.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            partial += q_reg[i] * k_reg[i];
         }
         float s_t = v2_warp_reduce_sum(partial) * scale;
 
@@ -661,20 +676,10 @@ static __device__ __forceinline__ void gqa_decode_mv_impl(
         const float alpha = gfx906_fast_exp(m_i - m_new);
         const float p     = gfx906_fast_exp(s_t - m_new);
 
-        // O update — float2 V read.
-        if constexpr (USE_FLOAT2) {
-            const float2 * v_row2 = reinterpret_cast<const float2 *>(v_row);
-            #pragma unroll
-            for (int i = 0; i < PAIRS_PER_LANE; ++i) {
-                const float2 vv = v_row2[lane + i * WARP_SIZE];
-                o_reg[2*i]     = alpha * o_reg[2*i]     + p * vv.x;
-                o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * vv.y;
-            }
-        } else {
-            #pragma unroll
-            for (int i = 0; i < D_PER_LANE; ++i) {
-                o_reg[i] = alpha * o_reg[i] + p * v_row[lane + i * WARP_SIZE];
-            }
+        // O update using pre-loaded V.
+        #pragma unroll
+        for (int i = 0; i < D_PER_LANE; ++i) {
+            o_reg[i] = alpha * o_reg[i] + p * v_reg[i];
         }
         l_i = alpha * l_i + p;
         m_i = m_new;
