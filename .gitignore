@@ -55,3 +55,6 @@ vega-shader-instruction-set-architecture.pdf
 
 # Vega ISA PDFs — extracted text lives in docs/
 docs/vega-isa-*.txt
+
+# prefill_3way.py run outputs (mirrored under /tmp too; keep repo clean)
+bench/results/
