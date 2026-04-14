@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""3-way prefill/decode bench: candle vs llamacpp-turbo vs vLLM.
+"""4-way prefill/decode bench: candle vs llama.cpp (vanilla) vs llamacpp-turbo vs vLLM.
 
 Each backend is pinned to a single GPU (apples-to-apples; no multi-GPU
 overhead inside candle). Backends run in parallel on different GPUs.
@@ -53,6 +53,7 @@ DEFAULT_MODEL = "/artefact/models/tinyllama-1.1b-q4_0.gguf"
 ROCM_LIB = "/opt/rocm-7.1.1/core-7.13/lib"
 ROCM_SMI = "/opt/rocm-7.1.1/core-7.13/bin/rocm-smi"
 TURBO_BIN_DIR = "/artefact/llamacpp-turbo/llama-cpp-gfx906-turbo/build/bin"
+LLAMACPP_BIN_DIR = "/artefact/llama.cpp/build/bin"
 VLLM_PY = "/artefact/mobydick-venv/bin/python"
 VLLM_SCRIPT = str(CANDLE_ROOT / "bench" / "vllm_prefill.py")
 RESULTS_DIR = CANDLE_ROOT / "bench" / "results"
@@ -293,6 +294,50 @@ def bench_turbo(model: str, gpu: int, log_dir: pathlib.Path,
     return result
 
 
+def bench_llamacpp(model: str, gpu: int, log_dir: pathlib.Path,
+                   timeout: int, reps: int, keys: set[str]) -> dict:
+    """Vanilla llama.cpp (upstream) llama-bench — identical protocol to turbo."""
+    bin_path = f"{LLAMACPP_BIN_DIR}/llama-bench"
+    env = _env_for_gpu(gpu, {"LD_LIBRARY_PATH":
+                              f"{LLAMACPP_BIN_DIR}:{ROCM_LIB}"})
+    log = log_dir / "llamacpp.log"
+    result = _empty_result(log)
+    p_list = ",".join(p for k, _, _, p in SUBBENCHES
+                      if p is not None and k in keys)
+    run_tg = "tg64" in keys
+    cmd = [bin_path, "-m", model, "-ngl", "99", "-t", "1", "-r", str(reps)]
+    if p_list:
+        cmd += ["-p", p_list]
+    cmd += ["-n", "64" if run_tg else "0"]
+    logger.info("[llamacpp] gpu=%d prompts=%s tg=%s reps=%d",
+                gpu, p_list or "-", run_tg, reps)
+    rc, out = run(cmd, env, timeout)
+    log.write_text(f"$ {shlex.join(cmd)}\n(rc={rc})\n{out}\n")
+    if rc != 0 and "token/s" not in out:
+        result["error"] = extract_error(out, rc)
+        logger.error("[llamacpp] %s", result["error"])
+        return result
+    for line in out.splitlines():
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        if len(cells) < 3:
+            continue
+        label = cells[-3] if len(cells) >= 3 else ""
+        val_str = cells[-2] if len(cells) >= 2 else ""
+        m = re.match(r"([\d.]+)\s*±", val_str)
+        if not m:
+            continue
+        val = float(m.group(1))
+        if label in keys:
+            result[label] = val
+            logger.info("[llamacpp %s] %.1f t/s", label, val)
+    for k in keys:
+        if result[k] is None:
+            result["sub_errors"][k] = "not in llama-bench output"
+    return result
+
+
 def bench_vllm(model: str, gpu: int, log_dir: pathlib.Path,
                timeout: int, reps: int, keys: set[str]) -> dict:
     env = _env_for_gpu(gpu, {
@@ -335,26 +380,32 @@ def bench_vllm(model: str, gpu: int, log_dir: pathlib.Path,
 def format_table(results: dict[str, dict], keys: list[str]) -> str:
     def cell(v):
         return f"{v:.0f}" if isinstance(v, (int, float)) else "—"
-    header = "| bench  | candle | turbo  | vllm   | candle/turbo | candle/vllm |\n"
-    header += "|--------|--------|--------|--------|--------------|-------------|\n"
+
+    def ratio(a, b):
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b > 0:
+            return f"{a / b:.2f}×"
+        return "—"
+
+    header = ("| bench  | candle | llama.cpp | turbo  | vllm   "
+              "| c/llama | c/turbo | c/vllm |\n")
+    header += ("|--------|--------|-----------|--------|--------"
+               "|---------|---------|--------|\n")
     rows = []
     for k in keys:
-        c = results["candle"].get(k)
-        t = results["turbo"].get(k)
-        v = results["vllm"].get(k)
-
-        def ratio(a, b):
-            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b > 0:
-                return f"{a / b:.2f}×"
-            return "—"
-        rows.append(f"| {k:<6} | {cell(c):>6} | {cell(t):>6} | "
-                    f"{cell(v):>6} | {ratio(c, t):>12} | {ratio(c, v):>11} |")
+        c  = results["candle"].get(k)
+        lc = results["llamacpp"].get(k)
+        t  = results["turbo"].get(k)
+        v  = results["vllm"].get(k)
+        rows.append(
+            f"| {k:<6} | {cell(c):>6} | {cell(lc):>9} | {cell(t):>6} | "
+            f"{cell(v):>6} | {ratio(c, lc):>7} | {ratio(c, t):>7} | "
+            f"{ratio(c, v):>6} |")
     return header + "\n".join(rows)
 
 
 def format_errors(results: dict[str, dict]) -> str:
     lines = []
-    for name in ("candle", "turbo", "vllm"):
+    for name in ("candle", "llamacpp", "turbo", "vllm"):
         r = results.get(name, {})
         be = r.get("error")
         if be == "skipped":
@@ -434,7 +485,7 @@ def main() -> int:
                    help="per-backend subprocess timeout in seconds")
     p.add_argument("--out-dir", default=None,
                    help="log directory (default /tmp/prefill_3way_<ts>)")
-    p.add_argument("--only", choices=["candle", "turbo", "vllm"],
+    p.add_argument("--only", choices=["candle", "llamacpp", "turbo", "vllm"],
                    help="restrict to one backend")
     p.add_argument("--gpus", default="0,1,2,3",
                    help="comma-separated GPU indices to assign "
@@ -472,9 +523,10 @@ def main() -> int:
         return 1
 
     all_backends = {
-        "candle": bench_candle,
-        "turbo":  bench_turbo,
-        "vllm":   bench_vllm,
+        "candle":   bench_candle,
+        "llamacpp": bench_llamacpp,
+        "turbo":    bench_turbo,
+        "vllm":     bench_vllm,
     }
     if args.only:
         backends = {args.only: all_backends[args.only]}
@@ -509,7 +561,7 @@ def main() -> int:
                 results[name] = _empty_result(log_dir / f"{name}.log")
                 results[name]["error"] = f"{type(e).__name__}: {e}"
 
-    for name in ("candle", "turbo", "vllm"):
+    for name in ("candle", "llamacpp", "turbo", "vllm"):
         results.setdefault(name,
                            _empty_result(log_dir / f"{name}.log") |
                            {"error": "skipped"})
