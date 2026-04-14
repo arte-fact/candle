@@ -1560,7 +1560,20 @@ pub fn gqa_attention_decode_mv(
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(96);
-    let n_chunks = (l_k_iter + chunk_t - 1) / chunk_t;
+    // Phase T1: compute n_chunks from l_k_alloc (the padded extent that
+    // stays constant across a pad window) instead of l_k_iter (which
+    // advances per token). Why: the captured G2/G3 graph freezes
+    // grid_dim at recording time; if l_k_iter advances and changes
+    // n_chunks, runtime grid mismatches the captured kernel-node
+    // grid → silent miscompute or skipped chunks. The split kernel
+    // already early-exits chunks where `t0 >= L_k`, so excess chunks
+    // launched against l_k_alloc cost only ~5 µs each but produce
+    // correct output. Scratch is also sized once per pad window.
+    //
+    // For non-G2 default-path callers, this just rounds n_chunks up to
+    // the pad multiple — same correctness, ≤ pad_t/chunk_t extra
+    // empty-chunk launches per call (worst case 8 for pad=256/chunk=32).
+    let n_chunks = (l_k_alloc + chunk_t - 1) / chunk_t;
     let use_split = use_fast
         && split_lk_enabled
         && l_k_iter >= split_threshold
