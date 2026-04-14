@@ -946,6 +946,46 @@ impl DecodePlan {
             .collect()
     }
 
+    /// Op indices whose dynamic args are ALL `Counter` (no External). These
+    /// ops only need an in-place arg_values update via `advance_counters`;
+    /// IF the HIP runtime stores graph kernel-node `kernelParams` as
+    /// pointers into our `arg_values` (rather than copies), they don't need
+    /// `hipGraphExecKernelNodeSetParams` calls per replay.
+    ///
+    /// Phase T2 experiment (CANDLE_G3_SKIP_COUNTER_PATCH=1): tries to skip
+    /// these. If output stays correct, HIP is dereferencing on launch and
+    /// we save up to ~92 % of the per-replay set-params overhead.
+    pub fn counter_only_op_indices(&self) -> Vec<usize> {
+        self.dynamic_args
+            .iter()
+            .zip(self.dynamic_kinds.iter())
+            .enumerate()
+            .filter(|(_, (args, kinds))| {
+                !args.is_empty()
+                    && kinds
+                        .iter()
+                        .all(|k| matches!(k, DynArgKind::Counter(_)))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Counterpart: ops with at least one External dynamic arg. Always need
+    /// `set_kernel_node_params` because the External pointer changes per
+    /// replay and isn't covered by the in-place value update.
+    pub fn external_op_indices(&self) -> Vec<usize> {
+        self.dynamic_args
+            .iter()
+            .zip(self.dynamic_kinds.iter())
+            .enumerate()
+            .filter(|(_, (args, kinds))| {
+                !args.is_empty()
+                    && kinds.iter().any(|k| matches!(k, DynArgKind::External))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Create a Tensor wrapping the output buffer. The buffer is owned
     /// by the decode allocator (sentinel-marked) so it stays alive.
     /// Content changes on each replay but the metadata is stable.
@@ -1130,6 +1170,15 @@ pub struct DecodeGraph {
     arg_ptr_storage: Vec<Vec<*mut c_void>>,
     /// op indices that have at least one dynamic arg (cached).
     dynamic_ops: Vec<usize>,
+    /// Subset of `dynamic_ops` whose dynamic args are ALL `Counter`. Phase
+    /// T2 experiment can skip set_kernel_node_params for these ops (under
+    /// `CANDLE_G3_SKIP_COUNTER_PATCH=1`) to test whether HIP dereferences
+    /// `arg_ptr_storage` on each launch (cheap path) or copies values at
+    /// the original setParams call (slow path requires per-replay patch).
+    counter_only_ops: Vec<usize>,
+    /// Subset of `dynamic_ops` with at least one External arg. Always
+    /// patched per-replay (External pointers change every tick).
+    external_ops: Vec<usize>,
 }
 
 // SAFETY: The internal HIP handles are thread-safe; the arg_ptr_storage
@@ -1158,10 +1207,20 @@ impl DecodeGraph {
                     .collect()
             })
             .collect();
+        // Phase T2 experiment: split dynamic ops into Counter-only vs
+        // External-bearing. With CANDLE_G3_SKIP_COUNTER_PATCH=1 we skip
+        // set_kernel_node_params for Counter-only ops on the bet that
+        // HIP dereferences our stable arg_values pointers at launch time.
+        // External ops always need the patch (their pointer values change
+        // per replay).
         let dynamic_ops = plan.dynamic_op_indices();
+        let counter_only_ops = plan.counter_only_op_indices();
+        let external_ops = plan.external_op_indices();
         eprintln!(
-            "[G3] DecodeGraph: {} nodes, {} dynamic ops to patch per launch",
-            nodes.len(), dynamic_ops.len()
+            "[G3] DecodeGraph: {} nodes, {} dynamic ops to patch per launch \
+             ({} counter-only + {} external)",
+            nodes.len(), dynamic_ops.len(),
+            counter_only_ops.len(), external_ops.len()
         );
         Ok(DecodeGraph {
             exec,
@@ -1169,6 +1228,8 @@ impl DecodeGraph {
             nodes,
             arg_ptr_storage,
             dynamic_ops,
+            counter_only_ops,
+            external_ops,
         })
     }
 
@@ -1188,7 +1249,34 @@ impl DecodeGraph {
         dev: &super::device::HipDevice,
     ) -> crate::Result<()> {
         use hipdarc::error::DriverError;
-        for &op_i in &self.dynamic_ops {
+
+        // Phase T2 experiment. CANDLE_G3_SKIP_COUNTER_PATCH=1 skips
+        // set_kernel_node_params for ops whose dynamic args are ALL
+        // `Counter`. Their arg_values are already updated in-place via
+        // `advance_counters()`. If HIP dereferences the kernelParams
+        // pointers we passed at setup (one-time path through
+        // capture_graph_full -> hipModuleLaunchKernel under capture mode,
+        // which records pointers, not values), the in-place update
+        // propagates and we eliminate ~92 % of the per-replay patch cost
+        // on a typical Gemma4-E4B plan (~300 counter-only ops out of 326
+        // dynamic ops). External-bearing ops still need set_kernel_node_params
+        // because the pointer values themselves change per replay.
+        //
+        // If output drifts under this flag, HIP copies values at setParams
+        // time and we fall back to the (deeper) Phase T2 plan: change kernel
+        // signatures to dereference a device-resident counter buffer.
+        let skip_counter_patch =
+            std::env::var("CANDLE_G3_SKIP_COUNTER_PATCH")
+                .map(|v| v != "0" && v != "false")
+                .unwrap_or(false);
+
+        let patch_set: &[usize] = if skip_counter_patch {
+            &self.external_ops
+        } else {
+            &self.dynamic_ops
+        };
+
+        for &op_i in patch_set {
             let op = &plan.ops[op_i];
             // Refresh the pointer storage — arg_values backing Vec should
             // not have moved (we build the plan once), but sanity-update
@@ -1214,6 +1302,32 @@ impl DecodeGraph {
                 )
                 .map_err(|e: DriverError| crate::Error::wrap(e))?;
         }
+
+        // Even when we skip set_kernel_node_params for counter-only ops,
+        // we MUST still refresh their arg_ptr_storage entries — `advance_counters`
+        // updated arg_values in place, and HIP (in the optimistic case) is
+        // dereferencing pointers from arg_ptr_storage at launch. The
+        // pointers themselves are stable; the underlying u64 values change
+        // and HIP picks them up via the dereference.
+        //
+        // No-op in practice: arg_ptr_storage[op_i][j] is already
+        // `&plan.ops[op_i].arg_values[j]`. Just guard against the Vec moving.
+        if skip_counter_patch {
+            for &op_i in &self.counter_only_ops {
+                let op = &plan.ops[op_i];
+                let storage = &mut self.arg_ptr_storage[op_i];
+                if storage.len() != op.arg_values.len() {
+                    storage.clear();
+                    storage.extend(
+                        op.arg_values.iter().map(|v| v as *const u64 as *mut c_void),
+                    );
+                }
+                // No re-set: the captured graph node already holds these
+                // pointers from the original capture-time launch. We bet on
+                // HIP dereferencing them at launch.
+            }
+        }
+
         self.exec
             .launch(dev.stream())
             .map_err(|e| crate::Error::wrap(e))?;
