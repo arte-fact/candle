@@ -767,34 +767,41 @@ would collide with G2 plan capture if Q1 isn't done first).
 
 ### Phase T — G2/G3 maturation (close the regression vs default)
 
-> **Status update 2026-04-14 (end-of-Phase-T checkpoint):**
+> **Status update 2026-04-14 (end-of-Phase-T closure):**
 > - **T1 DONE** (commit `c6642007`) — split-L_k grid stability fix. Correctness only.
 > - **T4 DONE** (commit `fbc8b240`) — Relaxed capture mode default. Diagnostic; perf-equivalent.
-> - **T2 PARTIAL** (commit `a5c5374c` first kernel pair, `b817182e`/`f0547286` diagnostics) —
->   `g3_counters` infrastructure landed. `gqa_decode_mv_fast_d{256,512}_f32_ctr`
->   converted = +5 % G3 decode (60.84 vs 58 t/s on E4B Q4_0 short prompt).
->   Patches dropped 326 → 284. Per arg-position breakdown the remaining
->   240 counter-only ops all have ≥1 8-byte pointer arg as a "Counter"
->   (rope cos/sin pointer-strides; copy2d dst pointer; const_set unclear).
->   Continuing T2 needs the deeper `(base_ptr, offset_table)` kernel-
->   signature redesign — multi-day work, paused.
-> - **T3 NOT STARTED** — but actual measurement done via
->   `CANDLE_G2_PHASE_TIME=1`: prelude costs **246 µs/tok** in G3 mode
->   (li=55 µs CPU embed, pe=166 µs per_layer rocBLAS gemm, swa=25 µs
->   mask). Total G3 forward = 1480 µs/tok; prelude = 17 % of that.
->   Maximum theoretical T3 win = +20 % wall-clock IF all prelude moves
->   into the graph. Phase K13 documented blocker on requantizing
->   model_proj to Q8_0 (decode_alloc cursor desync). Solving needs a
->   reserved-slot decode_alloc strategy or completely separate
->   prelude-capture pipeline. Multi-day work.
-> - **T5 NOT STARTED** — exploratory multi-stream topology.
+> - **T2 PARTIAL-DONE** (commits `a5c5374c` + `057e91db`) — `g3_counters`
+>   infrastructure + scalar-slot conversion for 2 kernels:
+>   `gqa_decode_mv_fast_d{256,512}_f32_ctr` + `rope_f32_ctr`. Patches
+>   dropped 326 → 218. G3 decode 58 → 60.3 t/s (+4 %, now 92.8 % of
+>   default 64.97 t/s on E4B Q4_0).
+> - **T2.1 DEFERRED** — remaining 174 counter-only ops (copy2d=90,
+>   const_set=42, bmul=42) are pointer-stride counters with per-layer
+>   base addresses; single shared-slot doesn't apply. Needs per-op
+>   struct buffer + plan-level refresh machinery (kernel ABI rewrite).
+>   Max upside +2-3 % wall-clock for ~1-day effort. **Not pursued** —
+>   Phase S has 10× better ROI toward the 1 TB/s BW ceiling.
+> - **T3 INVESTIGATED, DEFERRED** — measured prelude = 156 µs/tok
+>   (li=37, pe=97, swa=22), not the 1-2 ms originally estimated.
+>   Tried `CANDLE_GPU_EMBED=1` (dequantize token_embd on dev0): li
+>   -6 µs but pe +62 µs (rocBLAS alloc perturbation), net -1 %
+>   wall-clock. Reverted. Real T3 max upside is ~+1 % — not worth
+>   multi-day kernel-port work.
+> - **T5 NOT STARTED** — exploratory multi-stream topology. Deferred.
 >
-> **Realistic Phase T closure:** T1 + T4 + T2-first-kernel landed, with
-> +5 % wall-clock decode under G3. Default (66 t/s) still beats G3
-> (61 t/s); closing the gap needs T2-rest (~+3 % more) and T3 (~+20 %
-> if achievable) — both multi-day. The architectural infrastructure
-> (`g3_counters`, `_ctr` kernel pattern, per-replay slot refresh) is
-> in place for follow-up sessions.
+> **Phase T closure — remaining G3-vs-default gap analysis (850 µs):**
+> | source | µs/tok | % of gap | fixable? |
+> |---|---|---|---|
+> | setParams patch loop (218 ops) | 430 | 51 % | yes via T2.1 (kernel rewrite) |
+> | prelude host work | ~156 | ~18 % | partially via T3 (~1 %) |
+> | remaining (graph-node launch @ ~0.5 µs × 1533 nodes) | ~260 | ~31 % | **not on gfx906 + ROCm 7.1.1** — ROCm 7.2.0 AQL batching required |
+>
+> **Phase T net result**: T1+T2+T4 done, G3 closed from 58 → 60.3 t/s.
+> The residual 7 % gap is dominated by gfx906+ROCm 7.1.1 graph-node
+> overhead (hardware+driver limitation). **Pivoting to Phase S** —
+> TurboQuant KV cache reduces per-tok weight-read bytes by 2-3×,
+> expected +10-15 % decode, directly attacks the gap to the 208 t/s
+> BW-ceiling (we're currently at 65 t/s = 31 % of ceiling).
 
 
 
