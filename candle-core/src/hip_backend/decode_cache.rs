@@ -684,6 +684,39 @@ impl DecodePlan {
                     .collect::<Vec<_>>().join(", ");
                 eprintln!("  {:>40}  {}", name, summary);
             }
+            // Per-kernel arg-index histogram: which arg POSITIONS are
+            // dynamic? Tells us exactly what to rewrite per kernel.
+            let mut arg_idx_by_kernel: HashMap<String, HashMap<usize, usize>> = HashMap::new();
+            let mut sz_by_kernel: HashMap<String, HashMap<(usize, usize), usize>> = HashMap::new();
+            for (i, args) in dynamic_args.iter().enumerate() {
+                let name = ops[i].name.clone();
+                let sizes = &ops[i].arg_sizes;
+                let entry = arg_idx_by_kernel.entry(name.clone()).or_default();
+                let szentry = sz_by_kernel.entry(name).or_default();
+                for &arg_idx in args {
+                    *entry.entry(arg_idx).or_insert(0) += 1;
+                    let sz = sizes.get(arg_idx).copied().unwrap_or(0);
+                    *szentry.entry((arg_idx, sz)).or_insert(0) += 1;
+                }
+            }
+            eprintln!("[G2-counter-arg-positions]");
+            for (name, _) in by_kernel_sorted.iter().take(10) {
+                if let Some(positions) = arg_idx_by_kernel.get(*name) {
+                    let mut p: Vec<_> = positions.iter().collect();
+                    p.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+                    let szmap = sz_by_kernel.get(*name).unwrap();
+                    let summary: String = p.iter().take(4)
+                        .map(|(idx, c)| {
+                            let sz = szmap.iter()
+                                .find(|((i, _), _)| i == *idx)
+                                .map(|((_, s), _)| *s)
+                                .unwrap_or(0);
+                            format!("arg[{}]({}B):{}", idx, sz, c)
+                        })
+                        .collect::<Vec<_>>().join(", ");
+                    eprintln!("  {:>40}  {}", name, summary);
+                }
+            }
         }
 
         Some(Self {
