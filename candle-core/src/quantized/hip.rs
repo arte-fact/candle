@@ -544,14 +544,13 @@ fn mul_mat_q_v2(
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
-    // MMQ turbo-port gate. Stage 1 skeleton — Q4_0 only, placeholder
-    // output. See candle-hip-kernels/src/mmq_turbo.cu.
-    if dtype == GgmlDType::Q4_0
-        && std::env::var("CANDLE_MMQ_TURBO_PORT")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    {
-        if let Some(out) = mul_mat_q4_0_turbo(data, y, ncols, nrows, total_b, dev)? {
+    // MMQ turbo-port gate. Q4_0 (M2) and Q4_1 (M3a) covered.
+    // See candle-hip-kernels/src/mmq_turbo.cu.
+    let turbo_on = std::env::var("CANDLE_MMQ_TURBO_PORT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if turbo_on && (dtype == GgmlDType::Q4_0 || dtype == GgmlDType::Q4_1) {
+        if let Some(out) = mul_mat_q40q41_turbo(data, y, dtype, ncols, nrows, total_b, dev)? {
             return Ok(Some(out));
         }
     }
@@ -559,14 +558,15 @@ fn mul_mat_q_v2(
     mul_mat_q_v2_with_tile_n(data, y, dtype, ncols, nrows, total_b, dev, tile_n)
 }
 
-/// Turbo-port path (Stage 2): Q4_0 MMQ with turbo's tile geometry
+/// Turbo-port path: Q4_0 (M2) / Q4_1 (M3a) MMQ with turbo's tile geometry
 /// (mmq_y=128, mmq_x∈{8,16,32,64}, nwarps=4). Uses the mmq Q8_1 layout
 /// (`block_q8_1_mmq`, 144 B/block, ordered (big_block, col)) rather
 /// than candle's row-major per-col Q8_1 — the port provides its own
-/// `quantize_q8_1_mmq_q4_0` kernel.
-fn mul_mat_q4_0_turbo(
+/// `quantize_q8_1_mmq_q4_0` kernel (reusable across Q4_0 and Q4_1).
+fn mul_mat_q40q41_turbo(
     data: &PaddedHipSlice,
     y: &HipView<'_, f32>,
+    dtype: GgmlDType,
     ncols: usize,
     nrows: usize,
     total_b: usize,
@@ -575,10 +575,15 @@ fn mul_mat_q4_0_turbo(
     const MMQ_Y: usize = 128;
     const MMQ_NWARPS: u32 = 4;
     const MMQ_TILE_NE_K: usize = 32;
-    const QI4_0: usize = 4;
-    const MMQ_TILE_Y_K: usize = MMQ_TILE_NE_K + MMQ_TILE_NE_K / 8; // 36 ints
     const Q8_1_MMQ_BYTES: usize = 144;
     const BIG_BLOCK_ELEMS: usize = 128;
+    const MMQ_TILE_Y_K: usize = MMQ_TILE_NE_K + MMQ_TILE_NE_K / 8; // 36 ints
+
+    let dtype_tag = match dtype {
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        _ => return Ok(None),
+    };
 
     if total_b == 0 {
         return Ok(Some(HipStorage::wrap_hip_slice(
@@ -588,27 +593,25 @@ fn mul_mat_q4_0_turbo(
     }
     if y.len() != ncols * total_b {
         crate::bail!(
-            "mul_mat_q4_0_turbo: unexpected y size {}, ncols {ncols} total_b {total_b}",
-            y.len()
+            "mul_mat_{}_turbo: unexpected y size {}, ncols {ncols} total_b {total_b}",
+            dtype_tag, y.len()
         )
     }
-    // Require K to be a multiple of MMQ_ITER_K=256 (= 8 Q4_0 blocks =
-    // 2 mmq blocks, one pair per outer K-iter). The K-loop processes
-    // 256 elements per iteration and doesn't handle partial tails; a
-    // non-aligned K would OOB-read Q4_0 blocks on the last iter.
-    // All TinyLlama shapes satisfy this (hidden=2048, ffn=5632).
+    // K must be a multiple of MMQ_ITER_K=256 (8 weight blocks, 2 mmq blocks
+    // per outer K-iter). The K-loop doesn't handle partial tails.
     const MMQ_ITER_K: usize = 256;
     if ncols % MMQ_ITER_K != 0 {
         return Ok(None);
     }
-    // Q4_0 weight rows must be a multiple of 128 with `unchecked` kernel.
-    // We could synthesize a `checked` variant when this isn't true; for the
-    // first rollout accept the common case only.
-    if nrows % MMQ_Y != 0 {
-        return Ok(None);
-    }
+    // Non-aligned M (nrows): use the `_checked` kernel variant which
+    // clamps OOB i values during load_tiles and gates the write-back
+    // by row_g < nrows_x.  Only requires that the X buffer has room
+    // for at least one valid row past the last legitimate one — true
+    // because Q4_0/Q4_1 weight buffers are PaddedHipSlice-sized to
+    // dtype-block alignment.
+    let need_check = nrows % MMQ_Y != 0;
 
-    // Pick mmq_x adaptive to batch.  Temporary: env override for M2 debug.
+    // Pick mmq_x adaptive to batch.  Temporary: env override for debug.
     let mmq_x: usize = if let Ok(s) = std::env::var("CANDLE_MMQ_TURBO_X") {
         s.parse().unwrap_or(0)
     } else {
@@ -620,12 +623,9 @@ fn mul_mat_q4_0_turbo(
             _ => 64,
         }
     };
-    let need_check = false; // gated above
-    let kernel_name = match (mmq_x, need_check) {
-        (8, false) => "mul_mat_q4_0_turbo_x8_unchecked",
-        (16, false) => "mul_mat_q4_0_turbo_x16_unchecked",
-        (32, false) => "mul_mat_q4_0_turbo_x32_unchecked",
-        (64, false) => "mul_mat_q4_0_turbo_x64_unchecked",
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let kernel_name: String = match mmq_x {
+        8 | 16 | 32 | 64 => format!("mul_mat_{dtype_tag}_turbo_x{mmq_x}_{suffix}"),
         _ => return Ok(None),
     };
 
@@ -672,12 +672,14 @@ fn mul_mat_q4_0_turbo(
         raw.div_ceil(pad) * pad
     };
     let x_qs_ints = MMQ_Y * (MMQ_TILE_NE_K + 1);
-    let x_df_flts = MMQ_Y * (MMQ_TILE_NE_K / QI4_0) + MMQ_Y / QI4_0;
+    // QI4_0 == QI4_1 == 4 (4 ints per 32-element block).
+    const QI: usize = 4;
+    let x_df_flts = MMQ_Y * (MMQ_TILE_NE_K / QI) + MMQ_Y / QI;
     let shared_mem_bytes = (tile_y_ints + x_qs_ints) * 4 + x_df_flts * 4;
 
     // Launch the MMQ kernel.
     let blocks_per_row_x = ncols / 32; // Q4_0 stride per X row (in blocks).
-    let func = dev.get_or_load_func(kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
     let cfg = hipdarc::driver::LaunchConfig {
         grid_dim: (
             ceil_div(nrows, MMQ_Y) as u32,

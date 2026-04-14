@@ -9,20 +9,24 @@ use anyhow::Result;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{Device, Module, Tensor};
 
-fn run_once(gate: &str, m: usize, k: usize, n: usize) -> Result<(Vec<f32>, Vec<f32>)> {
-    // Safety: env-var flips the dispatch for this process.
+fn run_once(
+    gate: &str,
+    dtype: GgmlDType,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(Vec<f32>, Vec<f32>)> {
     // SAFETY: we're single-threaded in main.
     unsafe {
         std::env::set_var("CANDLE_MMQ_TURBO_PORT", gate);
     }
 
     let device = Device::new_hip(0)?;
-    // Fixed pseudo-random weights + inputs (seed-ish).
     let weight_data: Vec<f32> = (0..(n * k))
         .map(|i| ((i * 37 % 251) as f32 - 125.0) / 200.0)
         .collect();
     let w = Tensor::new(weight_data.as_slice(), &device)?.reshape((n, k))?;
-    let qw = QTensor::quantize(&w, GgmlDType::Q4_0)?;
+    let qw = QTensor::quantize(&w, dtype)?;
     let qmm = QMatMul::from_qtensor(qw)?;
 
     let input_data: Vec<f32> = (0..(m * k))
@@ -39,20 +43,27 @@ fn run_once(gate: &str, m: usize, k: usize, n: usize) -> Result<(Vec<f32>, Vec<f
 }
 
 fn main() -> Result<()> {
-    // Shapes chosen to hit each mmq_x path.
-    // Each (label, m, k, n).
+    // (label, dtype, m, k, n).  Q4_0 + Q4_1 covered by M2/M3a; mmq_x
+    // selection: <=8→x8, <=16→x16, <=32→x32, else x64.
     let shapes = [
-        ("pp_m13_k2048_n2048", 13, 2048, 2048), // Q proj shape, mmq_x=16
-        ("pp_m33_k2048_n2048", 33, 2048, 2048), // mmq_x=64
-        ("pp_m128_k2048_n512", 128, 2048, 512), // mmq_x=64, small N
-        ("pp_m513_k2048_n256", 513, 2048, 256), // K/V proj, mmq_x=64
+        ("Q4_0 m13  k2048 n2048", GgmlDType::Q4_0, 13, 2048, 2048),
+        ("Q4_0 m128 k2048 n512",  GgmlDType::Q4_0, 128, 2048, 512),
+        ("Q4_0 m513 k2048 n256",  GgmlDType::Q4_0, 513, 2048, 256),
+        // Q4_1 aligned-K shapes — exercise the M3a turbo kernel.
+        ("Q4_1 m13  k2048 n2048", GgmlDType::Q4_1, 13, 2048, 2048),
+        ("Q4_1 m513 k2048 n2048", GgmlDType::Q4_1, 513, 2048, 2048),
+        // Qwen3.5-9B FFN-down (K=15360 = 60×256, aligned; N=2880).
+        ("Q4_1 m513 k15360 n2880", GgmlDType::Q4_1, 513, 15360, 2880),
+        // Non-aligned K: gates out (M3b TODO). Should land ~0 diff because
+        // the dispatcher routes to baseline.
+        ("Q4_1 m13  k2880 n2880", GgmlDType::Q4_1, 13, 2880, 2880),
     ];
 
-    for (label, m, k, n) in shapes {
-        println!("\n=== {label} (M={m}, K={k}, N={n}) ===");
+    for (label, dtype, m, k, n) in shapes {
+        println!("\n=== {label} ===");
 
-        let (out0, x0) = run_once("0", m, k, n)?;
-        let (out1, x1) = run_once("1", m, k, n)?;
+        let (out0, x0) = run_once("0", dtype, m, k, n)?;
+        let (out1, x1) = run_once("1", dtype, m, k, n)?;
 
         assert_eq!(out0.len(), out1.len(), "output length mismatch");
         // Sanity check: same inputs.
