@@ -469,12 +469,25 @@ pub struct HipGraphCapture<'s> {
 
 impl<'s> HipGraphCapture<'s> {
     /// Begin capturing every operation submitted to `stream`.
+    ///
+    /// Phase T4: defaults to RELAXED capture mode rather than GLOBAL.
+    /// Rationale: ROCm 7.0 restricted some APIs (e.g. hipEventQuery)
+    /// to Relaxed-only — Global silently rejects them. HIP doesn't
+    /// raise on illegal capture ops the way CUDA does
+    /// ([pytorch/pytorch#155684](https://github.com/pytorch/pytorch/issues/155684)),
+    /// so any silent drops just produce a subtly-wrong replay. Relaxed
+    /// is a strict superset of what Global accepts.
+    /// Override via `CANDLE_G3_CAPTURE_MODE={global,thread_local,relaxed}`.
     pub fn begin(stream: &'s HipStream) -> Result<Self, DriverError> {
+        let mode = match std::env::var("CANDLE_G3_CAPTURE_MODE")
+            .unwrap_or_default().as_str()
+        {
+            "global" => sys::HIP_STREAM_CAPTURE_MODE_GLOBAL,
+            "thread_local" => sys::HIP_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            _ => sys::HIP_STREAM_CAPTURE_MODE_RELAXED,
+        };
         unsafe {
-            check_hip(sys::hipStreamBeginCapture(
-                stream.raw,
-                sys::HIP_STREAM_CAPTURE_MODE_GLOBAL,
-            ))?;
+            check_hip(sys::hipStreamBeginCapture(stream.raw, mode))?;
         }
         Ok(Self {
             stream,
