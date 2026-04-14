@@ -986,6 +986,44 @@ gqa_decode_mv_fast_d512_f32(
 }
 
 // =====================================================================
+// Phase T2 — counter-buffer (_ctr) variants. Take L_k_iter as a device
+// pointer instead of a value. The pointer is captured in the G3 graph
+// node as a stable arg; the value at the pointer is updated per-replay
+// via a single hipMemcpyHtoDAsync (vs N hipGraphExecKernelNodeSetParams
+// calls in the value-arg path).
+//
+// Eliminates 42 of 326 dynamic ops in the captured plan = ~13% of the
+// per-replay patch storm, paired with rope/const_set/copy2d ports for
+// the full ~85% reduction.
+// =====================================================================
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d256_f32_ctr(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, const int * __restrict__ L_k_iter_ptr)
+{
+    const int L_k_iter = *L_k_iter_ptr;
+    gqa_decode_mv_fast_impl<256, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                     scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d512_f32_ctr(
+    const float * __restrict__ q, const float * __restrict__ k,
+    const float * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, const int * __restrict__ L_k_iter_ptr)
+{
+    const int L_k_iter = *L_k_iter_ptr;
+    gqa_decode_mv_fast_impl<512, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                     scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+// =====================================================================
 // Phase R1 — Split-L_k attention (Flash-Decoding pattern)
 // =====================================================================
 //

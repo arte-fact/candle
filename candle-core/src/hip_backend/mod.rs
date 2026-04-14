@@ -15,6 +15,7 @@ mod flash_attn;
 pub mod decode_cache;
 mod fused_pointwise;
 mod gated_delta_net;
+pub mod g3_counters;
 mod utils;
 pub use device::{HipDevice, DeviceId};
 pub use error::{HipError, WrapErr};

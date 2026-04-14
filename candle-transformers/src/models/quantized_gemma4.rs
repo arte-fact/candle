@@ -1075,6 +1075,18 @@ impl ModelWeights {
                         if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
                             plan.advance_counters();
                         }
+                        // Phase T2: refresh the device-resident counter
+                        // buffer slots before launching the captured graph.
+                        // L_k_iter for the captured gqa_decode_mv_fast_*_ctr
+                        // kernels reads from CounterSlot::LkIter; without
+                        // this update the kernels see whatever value the
+                        // slot held at recording time and produce stale
+                        // attention output.
+                        candle::hip_backend::g3_counters::set(
+                            &dev_for_replay,
+                            candle::hip_backend::g3_counters::CounterSlot::LkIter,
+                            current_t as u32,
+                        )?;
                         unsafe { graph.patch_and_launch(plan, &dev_for_replay)?; }
                         if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
                             let _ = dev_for_replay.stream().synchronize();
@@ -1107,6 +1119,16 @@ impl ModelWeights {
                         if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
                             plan.advance_counters();
                         }
+                        // Phase T2: refresh device-resident counter buffer
+                        // (same rationale as the Graph branch above —
+                        // replay shortcuts the gqa_attention_decode_mv
+                        // call site that would normally write the slot).
+                        let current_t_for_ctr = index_pos + seq_len;
+                        candle::hip_backend::g3_counters::set(
+                            &dev_for_replay,
+                            candle::hip_backend::g3_counters::CounterSlot::LkIter,
+                            current_t_for_ctr as u32,
+                        )?;
                         unsafe { plan.replay(&dev_for_replay)?; }
                         // Phase-time: optional sync-here-to-measure-GPU.
                         // CANDLE_G2_SYNC_REPLAY=1 makes the fp timing

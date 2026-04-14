@@ -53,6 +53,10 @@ impl HipDevice {
         &self.stream
     }
 
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
     /// Allocate uninitialized device memory.
     ///
     /// # Safety

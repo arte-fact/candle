@@ -1467,10 +1467,24 @@ pub fn gqa_attention_decode_mv(
             .map(|v| v != "0" && v != "false")
             .unwrap_or(true);
 
+    // Phase T2: when G2 is enabled, route to the `_ctr` (counter-buffer)
+    // variant. The kernel reads L_k_iter from a stable device buffer slot
+    // instead of taking it as a value arg — eliminates per-replay
+    // hipGraphExecKernelNodeSetParams calls for this kernel (was 42 of
+    // 326 dynamic ops on E4B Q4_0 = ~13 % of the patch storm).
+    //
+    // Both recording and replay must use the same kernel sig, so we
+    // gate on G2-enabled (recording always happens then) rather than
+    // G3-enabled-and-currently-replaying.
+    let g2_enabled = std::env::var("CANDLE_G2_REPLAY")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(false);
     let (kernel_name, block_dim_x): (&str, u32) = if use_fast {
-        match d {
-            256 => ("gqa_decode_mv_fast_d256_f32", WARP_SIZE),
-            512 => ("gqa_decode_mv_fast_d512_f32", WARP_SIZE),
+        match (d, g2_enabled) {
+            (256, true)  => ("gqa_decode_mv_fast_d256_f32_ctr", WARP_SIZE),
+            (256, false) => ("gqa_decode_mv_fast_d256_f32",     WARP_SIZE),
+            (512, true)  => ("gqa_decode_mv_fast_d512_f32_ctr", WARP_SIZE),
+            (512, false) => ("gqa_decode_mv_fast_d512_f32",     WARP_SIZE),
             _ => unreachable!(),
         }
     } else {
@@ -1482,6 +1496,7 @@ pub fn gqa_attention_decode_mv(
             _ => crate::bail!("gqa_attention_decode_mv: unsupported D={d}"),
         }
     };
+    let use_ctr = use_fast && g2_enabled;
 
     // Mask: (1,1,1,T_mask) or (B,1,1,T_mask). T_mask must be ≥ l_k_iter.
     let mbs: i32 = match mask {
@@ -1638,6 +1653,28 @@ pub fn gqa_attention_decode_mv(
             shared_mem_bytes: 0,
         };
 
+        // Phase T2: prepare counter-buffer slot for L_k_iter when using
+        // the `_ctr` kernel variant. The slot pointer is stable across
+        // calls; the value is updated by `g3_counters::set` BEFORE this
+        // launch (in-stream async memcpy on the device's primary stream).
+        // Captured by G3 as a constant pointer arg → zero per-replay
+        // set_kernel_node_params for this op.
+        if use_ctr {
+            crate::hip_backend::g3_counters::set(
+                &dev,
+                crate::hip_backend::g3_counters::CounterSlot::LkIter,
+                l_k_iter as u32,
+            )?;
+        }
+        let lk_iter_ptr: usize = if use_ctr {
+            crate::hip_backend::g3_counters::slot_ptr(
+                &dev,
+                crate::hip_backend::g3_counters::CounterSlot::LkIter,
+            ) as usize
+        } else {
+            0
+        };
+
         let mut bld = func.builder();
         bld.arg(&q_v); bld.arg(&k_v); bld.arg(&v_v);
         match m_v.as_ref() {
@@ -1646,7 +1683,16 @@ pub fn gqa_attention_decode_mv(
         }
         bld.arg(&out);
         bld.arg(&ba); bld.arg(&nha); bld.arg(&nka); bld.arg(&lka);
-        bld.arg(&sa); bld.arg(&nra); bld.arg(&mbs); bld.arg(&lk_it);
+        bld.arg(&sa); bld.arg(&nra); bld.arg(&mbs);
+        if use_ctr {
+            // Pass the device pointer as a usize (8 bytes on 64-bit) —
+            // the kernel signature has `const int * L_k_iter_ptr`;
+            // bld.arg(&usize) writes the pointer value which the kernel
+            // dereferences on the device.
+            bld.arg(&lk_iter_ptr);
+        } else {
+            bld.arg(&lk_it);
+        }
         unsafe { bld.launch(cfg) }.w()?;
     }
 
