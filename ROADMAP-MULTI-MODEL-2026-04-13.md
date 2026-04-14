@@ -883,6 +883,18 @@ T2 + T3 are the high-value items. T4 is diagnostic. T5 is exploratory.
 
 ### Phase U — Triton-inspired prefill kernel optimisations (2026-04-14)
 
+> **Status update 2026-04-14** (post-investigation, see SURVEY §12).
+> Phase U was framed around "Triton has a lever, let's extract it." A
+> focused investigation found that **Triton's actual lever on AMD is
+> launch-overhead elimination + per-shape autotuning, NOT clever
+> codegen** (HipKittens beats Triton on AMD by 1.3–3.0×; vLLM picked
+> Triton for maintenance, not perf). Phase U's four algorithmic ideas
+> (U1–U4) are real but **bounded** wins — U1+U1b's measured +3.5 % is
+> roughly the ceiling of that track. The 2× gap-closing levers are
+> **Phase T** (G2/G3 maturation = launch-overhead) and the new
+> **Phase V** (per-shape kernel autotuning). Phase U remains on the
+> menu as algorithmic polish but is **second-priority** to T2/T3/V.
+
 Prefill kernels `flash_attn_v2_fwd_ktvs_d{64,128,256,512}_f32` are
 hand-tuned for gfx906 (DPP warp reduce from `gfx906_primitives.cuh`,
 Q-in-registers, 32 KiB LDS at occupancy=2, `s_nop 4` EXEC hazard
@@ -1033,6 +1045,72 @@ is the headline win but needs the KV migration; U4/U5 are polish.
   gfx906 dropped from supported Instinct list — underwrites the
   "stay in hand C++/HIP, not Triton" decision
 
+### Phase V — Per-shape kernel autotuning (the other half of the Triton lever, 2026-04-14)
+
+The 2026-04-14 Triton-lever investigation (SURVEY §12) identified
+**two** levers behind Triton-on-AMD: (a) launch-overhead elimination
+(Phase T territory) and (b) per-shape autotuning of block sizes. We
+already had (a) in flight; (b) is new.
+
+Triton's `@triton.autotune` decorator picks `(BLOCK_M, BLOCK_N,
+waves_per_eu, PRE_LOAD_V)` per problem shape from a registered list
+and caches the best. [ROCm Triton docs](https://rocm.docs.amd.com/en/docs-6.1.1/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html)
+measure this as **2–5× wins** over naive Triton. We compile-time-fix
+every tile size; a runtime dispatcher per problem shape captures the
+same lever in HIP.
+
+#### V1 — Multi-BC variants of `flash_attn_v2_fwd_ktvs_d{256,512}_f32`
+
+Compile BC ∈ {8, 16, 32, 64} variants. Runtime dispatcher in
+`flash_attn.rs` picks based on `(L_q, L_k_iter, head_dim)`. For
+short L_q with long L_k, smaller BC reduces LDS contention;
+larger BC at long L_q amortises kernel launch cost. The existing
+single-BC choice (BC=16 for d=256, BC=8 for d=512) is one point
+on this surface; a sweep over a representative shape set will
+identify the per-(L_q, L_k) sweet spots.
+
+**Effort:** 1 day (re-template + dispatcher table). **Risk:** low —
+each variant is a re-instantiation of the existing template. **Wall-
+clock:** pessimistic +5 % on the bench prompt; optimistic 1.3–1.5×
+on outlier shapes (very short L_q or very long L_k).
+
+#### V2 — Multi-TILE_N variants of `mul_mat_q4_0_gfx906_v2f_tile32`
+
+The existing kernel is fixed at TILE_N=32. For prefill at small N
+(short prompts, < 128 tokens) the over-tiled grid wastes blocks; for
+large N (long prompts) the under-tiled inner loop has too few
+columns per block to amortise the X-load. Compile TILE_N ∈ {16, 32,
+64} variants; dispatcher picks based on N.
+
+Phase I1 confirmed MMQ Q4_0 is at the gfx906 hardware ceiling on
+its current shape (see roadmap Phase I); V2 is the per-shape variant
+of that finding — same kernel body, different tile, no architectural
+change.
+
+**Effort:** 1 day. **Risk:** low. **Wall-clock:** ~5 % on shape
+outliers, neutral on the 178-tok / 874-tok bench prompts.
+
+#### V3 — Multi-chunk_t variants of `gqa_decode_split_chunk_d{256,512}_f32`
+
+The Phase R1 split-L_k attention currently picks chunk_t=32 as a
+balanced default (sweep on E4B showed chunk=16 best on long, 64
+best on short, 32 the balanced sweet spot). A runtime dispatcher
+that picks chunk_t based on `l_k_alloc` (16 for short context, 32
+for medium, 64 for long) collapses the trade-off.
+
+**Effort:** half day. **Risk:** very low. **Wall-clock:** ~3–8 %
+across the L_k spectrum.
+
+**Effort total for Phase V:** ~3 engineer-days. **Combined realistic
+target:** +5–10 % wall-clock on the standard bench prompts; up to
+2× on outlier shapes (very short or very long L_q/L_k that the
+fixed-tile kernel doesn't fit well).
+
+**Order within Phase V:** V1 first (biggest expected variance across
+shapes — attention BC on long context). V2 second (orthogonal MMQ
+prefill win). V3 last (the wins are smaller and partly overlap with
+existing chunk_t tuning).
+
 ## Order of attack
 
 Updated 2026-04-13 after `SURVEY-GFX906-FORKS-2026-04-13.md`. Phases
@@ -1047,40 +1125,48 @@ completeness only.
 [DONE: B3 redo (Q4_K/Q5_K warp-coop pair-layout fix)]
 [DONE: Q2 (float2 loads + V-prefetch in gqa_decode_mv)]
 [DONE: R1 (split-L_k attention default-on, +31% long-prompt decode)]
+[DONE: U1+U1b (float4 / coalesced LDS staging, +3.5% prefill)]
+[DONE: T1 (split-L_k grid stability, correctness)]
+[DONE: T4 (capture mode → Relaxed, diagnostic)]
+[DONE: I1+I3 (Phase I capped — gfx906 hardware ceiling, see Phase I §)]
        ↓
-STEP T (next):  Phase T G2/G3 maturation — close the regression vs
-                default and unlock launch-overhead savings on every
-                model (not just E4B). Subphases:
-                T1: split-L_k grid stability (1h, correctness)
-                T2: device-resident counters (½ day, +1.5-3%)
-                T3: prelude into captured plan (1 day, +6% if works)
-                T4: capture-mode flip (1h, diagnostic)
-                T5: multi-stream topology (1-2 days, exploratory)
-                Order: T1 → T4 → T2 → T3 → T5.
+STEP A (NEXT — concrete, this session):
+        Phase T2 — device-resident counter slot. Collapses 326
+        per-launch hipGraphExecKernelNodeSetParams calls to one
+        hipMemcpyHtoDAsync. Directly attacks the launch-overhead
+        surface that arxiv 2511.11581 quantifies as up to 1.99×
+        on attention < 1k tokens. Per SURVEY §12 this IS the
+        Triton lever — same lever, our HIP code.
+        Effort: ½ day. Risk: medium (kernel signature changes for
+        ~5–10 kernels). Target: short-prompt decode 58 → ≥62 t/s
+        under G3 (currently regresses vs default 65).
        ↓
-STEP 1: ROCm 7.2.1 + Tensile migration
-        (see ROADMAP-ROCM-722-MIGRATION-2026-04-13.md)
-        — withdrawn finding: tensile bundle has ZERO new files vs our
-        7.1.1; only the AQL batching for set_kernel_node_params (T2's
-        fallback) gives us anything. Lower priority post-T2.
+STEP B: Phase T3 — drag prelude (CPU embed + per_layer model_proj)
+        into the captured plan. CPU→GPU memcpy via
+        hipGraphAddMemcpyNode1D + custom MMVQ for model_proj OR
+        rocBLAS-via-Relaxed-mode capture. Gates the second half of
+        the launch-overhead win.
+        Effort: 1 day. Wall-clock target: +6% on top of T2.
        ↓
-STEP 2: Phase R LDS padding (was Phase R; now R2 since R1 = split-L_k)
-        — `+1` padding on flash-attn-v2 k_lds/v_lds tiles. Already
-        analysed; no clear bank-conflict target in our current code.
-        Re-survey post-T to confirm.
+STEP C: Phase V — per-shape kernel autotuning (the OTHER half of the
+        Triton lever per SURVEY §12). V1 (multi-BC flash-attn) +
+        V2 (multi-TILE_N MMQ) + V3 (multi-chunk_t split-L_k).
+        Effort: 3 days. Wall-clock target: +5–10% across standard
+        bench prompts; up to 2× on outlier shapes.
        ↓
-STEP 3: Phase S (TurboQuant KV port)
-        → 5× KV memory compression, long-context unlock
-        → halves the bandwidth cost of the Q4_0 MMVQ grid=655360
-          bucket (currently 40% of decode GPU)
-        Expected: another +10-15% wall-clock decode IF G2/G3 (post-T)
-        already eliminated CPU-side overhead.
+STEP D: Phase S (TurboQuant 3-bit KV port) — multi-day. Halves the
+        weight bytes for the bandwidth-bound long-prefill MMQ regime
+        (78% of long-prompt prefill GPU). Direct attack on the
+        residual cap after Phase I shelved.
        ↓
-STEP 4: Phase I (MMQ rewrite) + Phase N (prefill)
-        — tracks are independent.
-        → I: prefill 2-3× across every Q4_0 model
-        → N: fused attention for prefill (needs Phase Q4 — d=512
-             K_TRANS=false kernel)
+STEP E: Phase U2/U3/U4 (algorithmic prefill polish) — second-priority
+        per SURVEY §12. Bounded ~10–30% wins each on long-context /
+        fp16 prefill. Pick up after T2/T3/V2 land.
+       ↓
+STEP F: Phase R2 LDS padding (no clear target today; re-survey
+        post-V); Phase N (fused prefill attention); ROCm 7.2.1
+        migration (withdrawn — tensile bundle has zero new files
+        vs 7.1.1; only AQL batching helps, which T2 supersedes).
 ```
 
 ## Expected final numbers

@@ -182,7 +182,65 @@ Ranked by payoff × certainty × effort:
 
 What NOT to pursue:
 - **Don't port PagedAttention / continuous batching** unless the product shifts to serving. Candle's comparative advantage is single-binary + G2 for latency-sensitive single-batch; duplicating vLLM's serving stack dilutes that.
-- **Don't port Triton codegen** — it would trade type-safety and the G2 capture machinery for portable kernel tuning we can approximate by hand on gfx906.
+- **Don't port Triton codegen** — it would trade type-safety and the G2 capture machinery for portable kernel tuning we can approximate by hand on gfx906. **See §12 below for the specific evidence on what Triton's actual lever is and isn't.**
+
+---
+
+## §12 — What Triton's actual lever is (added 2026-04-14)
+
+The Phase U work was framed around "Triton has a lever, let's extract
+it without the toolchain." We extracted four algorithmic ideas
+(float4 LDS staging, causal/SWA tile skip, fp16 packed-dot, K
+double-buffer) and assumed those were the entire Triton advantage on
+AMD. A focused investigation prompted by the question _what is the
+real lever behind Triton?_ found four converging sources that contradict
+that framing:
+
+| Claim | Source | Evidence |
+|---|---|---|
+| Triton's win on AMD is **launch-overhead elimination** (static launch grid + full HIP graphs), NOT codegen | [arxiv 2511.11581 — Anatomy of a Triton Attention Kernel](https://arxiv.org/html/2511.11581v1) | Ablation study on MI300: "Static Launch Grid + full HIP graphs is up to **1.99× faster** than the [naive] version" because "launch overhead dominates kernel execution time for sequences below ~1 000 tokens." |
+| Triton's codegen on AMD is **worse** than well-written HIP | [HipKittens (Hazy Research) — arxiv 2511.08083](https://arxiv.org/abs/2511.08083) + [HK blog](https://hazyresearch.stanford.edu/blog/2025-11-09-hk) | "HipKittens outperforms the Triton compiler by **1.3–3.0×** on various AMD workloads." Root cause per HK blog: "Triton on AMD struggles with register lifetime tracking and lowering memory accesses to the most performant intrinsics... may fail to lower vectorized loads." |
+| vLLM picked Triton for AMD as a **maintenance**, not performance, decision | [vLLM blog: ROCm Attention Backend](https://vllm.ai/blog/rocm-attention-backend) | "Triton-based unified attention kernel contains only **239 lines of code**... easier to maintain in the long term." Plus: "AMD experiments showed that in some scenarios, the Triton kernels were still **underperforming** [vs C++/HIP V0]." |
+| Software pipelining (Triton's `num_stages > 1`) **barely helps on GCN/CDNA** — it's a Hopper TMA lever | [ROCm Triton kernel optimization docs](https://rocm.docs.amd.com/en/docs-6.1.1/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html) | AMD recommends `num_stages=0` for single-GEMM and `num_stages=1` for FA — i.e. multi-stage cp.async-equivalent pipelining is not the lever on AMD. |
+| **gfx906 Triton is dead** — the question of "should we port to Triton?" is moot | [nlzy/triton-gfx906](https://github.com/nlzy/triton-gfx906) (archived 2026-02-20), [ROCm 7.0.2 release notes](https://rocm.docs.amd.com/en/docs-7.0.2/about/release-notes.html), [AMD GFX906 Support issue #8992](https://github.com/triton-lang/triton/issues/8992) | nlzy fork archived; AOTriton excludes gfx906; ROCm 7.0.2 dropped gfx906 from supported architectures. |
+
+### Implications
+
+1. **The Triton advantage we should chase is the same lever our G2/G3
+   work pulls.** Phase T (G2/G3 maturation) — specifically T2
+   (collapse Counter args to a device-resident counter buffer) and T3
+   (drag prelude into captured plan) — directly attacks the launch-
+   overhead surface that arxiv 2511.11581 quantifies as up to 1.99×
+   on attention < 1 k tokens. We were already on the right path; we
+   just didn't know that's what Triton's secret sauce was.
+
+2. **Phase U2/U3/U4 (algorithmic polish) stay valuable** but are
+   bounded ~10–30 % wins each, not the path to a 2× gap closure.
+   Phase U1+U1b's measured +3.5 % wall-clock prefill is roughly the
+   ceiling for that track on its own.
+
+3. **A new Phase V — per-shape kernel autotuning** is the second half
+   of the Triton lever. Triton autotune picks (BLOCK_M, BLOCK_N,
+   waves_per_eu, PRE_LOAD_V) per problem; ROCm Triton docs measure
+   2–5× wins from that step (over naive Triton, not over good HIP).
+   We compile-time-fix every tile size; a runtime dispatcher per
+   problem shape captures the same lever in HIP.
+
+4. **HipKittens proves the strategy.** On AMD specifically, hand-tuned
+   HIP beats Triton. Our investment in DPP intrinsics, gfx906-aware
+   wait-states, K-quant warp-coop kernels, and hand-rolled flash-attn
+   is the right architectural choice — it just needs the launch-
+   overhead lever (Phase T) and the autotune lever (Phase V) to come
+   along too.
+
+### Bottom line
+
+The question _"what is the real lever behind Triton?"_ has a clear
+answer: **launch overhead elimination + per-shape autotuning, not
+clever codegen.** Both levers are pullable from HIP. Our roadmap has
+the first one (Phase T); we add the second (Phase V) as a result of
+this investigation. Phase U is reframed as algorithmic polish — real,
+but secondary.
 
 ---
 
