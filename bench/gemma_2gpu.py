@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""2-way 2-GPU prefill/decode bench: candle (GPUs 0,1) vs llamacpp-turbo (GPUs 2,3).
+"""3-way 2-GPU prefill/decode bench: candle vs llamacpp-vanilla vs llamacpp-turbo.
 
-Intended for models that don't fit on a single 16 GB MI50 — default model
-is gemma-4-31B-it-Q4_0 (17 GB). Each backend gets 2 GPUs with pipeline /
-layer-split, and they run in parallel on disjoint devices so the wall time
-is max(candle, turbo) rather than sum.
+Candle runs on its own GPU pair in parallel; llamacpp-vanilla and turbo share
+a GPU pair (run sequentially since they can't both use the same GPUs
+concurrently). Each backend uses pipeline/layer-split across 2 GPUs.
 
 Usage:  bench/gemma_2gpu.py [--model PATH] [--reps N] [--timeout SECONDS]
-                            [--candle-gpus 0,1] [--turbo-gpus 2,3]
-                            [--keys pp128,pp512,pp2048,tg64] [--only X]
+                            [--candle-gpus 0,1] [--llama-gpus 2,3]
+                            [--keys pp128,pp512,pp2048,tg64]
+                            [--only candle|llamacpp|turbo]
 Output: stdout markdown + bench/results/gemma_2gpu_{latest,history}.*
 """
 from __future__ import annotations
@@ -31,6 +31,7 @@ DEFAULT_MODEL = "/artefact/models/gemma-4-31B-it-Q4_0.gguf"
 ROCM_LIB = "/opt/rocm-7.1.1/core-7.13/lib"
 ROCM_EXTRA_LIB = "/opt/rocm/lib"  # roctx lives here
 TURBO_BIN_DIR = "/artefact/llamacpp-turbo/llama-cpp-gfx906-turbo/build/bin"
+LLAMACPP_BIN_DIR = "/artefact/llama.cpp/build/bin"
 RESULTS_DIR = CANDLE_ROOT / "bench" / "results"
 
 SUBBENCHES = [
@@ -61,8 +62,11 @@ def configure_logging(log_dir: pathlib.Path) -> None:
 
 def env_for_gpus(gpus: str, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
     e = os.environ.copy()
+    # Use HIP_VISIBLE_DEVICES only — setting ROCR_VISIBLE_DEVICES as well
+    # double-filters (ROCR remaps, then HIP tries original indices from the
+    # remapped set), which breaks non-zero-starting selections like "2,3".
     e["HIP_VISIBLE_DEVICES"] = gpus
-    e["ROCR_VISIBLE_DEVICES"] = gpus
+    e.pop("ROCR_VISIBLE_DEVICES", None)
     # roctx symlink path via /opt/rocm/lib (links to 7.2.1 but ABI compatible).
     e["LD_LIBRARY_PATH"] = f"{ROCM_LIB}:{ROCM_EXTRA_LIB}"
     if extra:
@@ -163,19 +167,20 @@ def bench_candle(model: str, gpus: str, log_dir: pathlib.Path,
     return result
 
 
-def bench_turbo(model: str, gpus: str, log_dir: pathlib.Path,
-                timeout: int, reps: int, keys: set[str]) -> dict:
-    bin_path = f"{TURBO_BIN_DIR}/llama-bench"
-    log = log_dir / "turbo.log"
+def bench_llama_bench(tag: str, bin_dir: str, model: str, gpus: str,
+                      log_dir: pathlib.Path, timeout: int, reps: int,
+                      keys: set[str]) -> dict:
+    bin_path = f"{bin_dir}/llama-bench"
+    log = log_dir / f"{tag}.log"
     log.write_text("")
     result: dict = {k: None for k in ALL_KEYS}
     result["sub_errors"] = {}
     result["log"] = str(log)
-    logger.info("[turbo] gpus=%s reps=%d", gpus, reps)
+    logger.info("[%s] gpus=%s reps=%d", tag, gpus, reps)
     env = env_for_gpus(gpus, extra={
         "LD_LIBRARY_PATH":
-            f"{ROCM_LIB}:{ROCM_EXTRA_LIB}:{TURBO_BIN_DIR}:"
-            f"{TURBO_BIN_DIR}/../src:{TURBO_BIN_DIR}/../ggml/src"
+            f"{ROCM_LIB}:{ROCM_EXTRA_LIB}:{bin_dir}:"
+            f"{bin_dir}/../src:{bin_dir}/../ggml/src"
     })
 
     pp_prompts = [str(p) for k, p, _, tp in SUBBENCHES
@@ -203,7 +208,7 @@ def bench_turbo(model: str, gpus: str, log_dir: pathlib.Path,
                         result["pp2048"] = rec["avg_ts"]
             for key in ("pp128", "pp512", "pp2048"):
                 if key in keys and result[key] is not None:
-                    logger.info("[turbo %s] %.1f t/s", key, result[key])
+                    logger.info("[%s %s] %.1f t/s", tag, key, result[key])
                 elif key in keys:
                     result["sub_errors"][key] = extract_err(out, rc)
         else:
@@ -221,7 +226,7 @@ def bench_turbo(model: str, gpus: str, log_dir: pathlib.Path,
             for rec in _parse_llama_bench_json(out):
                 if rec.get("n_gen") == 64:
                     result["tg64"] = rec["avg_ts"]
-                    logger.info("[turbo tg64] %.1f t/s", rec["avg_ts"])
+                    logger.info("[%s tg64] %.1f t/s", tag, rec["avg_ts"])
                     break
             if result["tg64"] is None:
                 result["sub_errors"]["tg64"] = extract_err(out, rc)
@@ -231,22 +236,27 @@ def bench_turbo(model: str, gpus: str, log_dir: pathlib.Path,
     return result
 
 
-def render_md(candle: dict, turbo: dict, keys: list[str],
-              model: str, elapsed: float) -> str:
+def render_md(results: dict[str, dict], keys: list[str],
+              model: str, elapsed: float, candle_gpus: str,
+              llama_gpus: str) -> str:
     lines: list[str] = []
     lines.append(f"# gemma-2gpu bench — {pathlib.Path(model).name}  ({elapsed:.1f}s)")
     lines.append("")
-    lines.append("| bench  | candle (0,1) | turbo (2,3) | c/turbo |")
-    lines.append("|--------|--------------|-------------|---------|")
+    header = f"| bench  | candle ({candle_gpus}) | llama.cpp ({llama_gpus}) | turbo ({llama_gpus}) | c/llama | c/turbo |"
+    sep = "|--------|---------------|----------------|---------------|---------|---------|"
+    lines.append(header)
+    lines.append(sep)
     for k in keys:
-        c = candle.get(k)
-        t = turbo.get(k)
-        ratio = f"{c/t:.2f}×" if (c and t) else "—"
-        c_s = f"{c:>7.1f}" if c else f"{'—':>7}"
-        t_s = f"{t:>7.1f}" if t else f"{'—':>7}"
-        lines.append(f"| {k:<6} | {c_s}      | {t_s}     | {ratio:>7} |")
+        c = results.get("candle", {}).get(k)
+        ll = results.get("llamacpp", {}).get(k)
+        tu = results.get("turbo", {}).get(k)
+        def cell(v): return f"{v:>7.1f}" if v else f"{'—':>7}"
+        def ratio(a, b):
+            return f"{a/b:.2f}×" if (a and b) else "—"
+        lines.append(f"| {k:<6} | {cell(c)}       | {cell(ll)}        | {cell(tu)}       | "
+                     f"{ratio(c, ll):>7} | {ratio(c, tu):>7} |")
     errs = []
-    for name, r in (("candle", candle), ("turbo", turbo)):
+    for name, r in results.items():
         for k, v in r.get("sub_errors", {}).items():
             errs.append(f"- **{name}/{k}**: {v}")
     if errs:
@@ -262,10 +272,12 @@ def main() -> int:
     p.add_argument("--reps", type=int, default=2)
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--candle-gpus", default="0,1")
-    p.add_argument("--turbo-gpus", default="2,3")
+    p.add_argument("--llama-gpus", default="2,3",
+                   help="GPUs shared by vanilla llama.cpp + turbo (sequential)")
     p.add_argument("--keys", default=",".join(ALL_KEYS),
                    help="Comma-separated subset of: " + ",".join(ALL_KEYS))
-    p.add_argument("--only", choices=["candle", "turbo"], default=None)
+    p.add_argument("--only", choices=["candle", "llamacpp", "turbo"],
+                   default=None)
     p.add_argument("--out-dir", default=None)
     args = p.parse_args()
 
@@ -281,34 +293,47 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(out_dir)
     logger.info("start ts=%s  model=%s", ts, args.model)
-    logger.info("candle_gpus=%s turbo_gpus=%s reps=%d keys=%s",
-                args.candle_gpus, args.turbo_gpus, args.reps, sorted(keys))
+    logger.info("candle_gpus=%s llama_gpus=%s reps=%d keys=%s",
+                args.candle_gpus, args.llama_gpus, args.reps, sorted(keys))
+
+    def run_llama_sequence() -> dict[str, dict]:
+        out: dict[str, dict] = {}
+        if args.only in (None, "llamacpp"):
+            out["llamacpp"] = bench_llama_bench(
+                "llamacpp", LLAMACPP_BIN_DIR, args.model, args.llama_gpus,
+                out_dir, args.timeout, args.reps, keys)
+        if args.only in (None, "turbo"):
+            out["turbo"] = bench_llama_bench(
+                "turbo", TURBO_BIN_DIR, args.model, args.llama_gpus,
+                out_dir, args.timeout, args.reps, keys)
+        return out
 
     t0 = time.time()
-    backends: dict[str, concurrent.futures.Future] = {}
+    results: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-        if args.only != "turbo":
-            backends["candle"] = ex.submit(bench_candle, args.model,
-                                           args.candle_gpus, out_dir,
-                                           args.timeout, args.reps, keys)
-        if args.only != "candle":
-            backends["turbo"] = ex.submit(bench_turbo, args.model,
-                                          args.turbo_gpus, out_dir,
+        futures: dict[str, concurrent.futures.Future] = {}
+        if args.only in (None, "candle"):
+            futures["candle"] = ex.submit(bench_candle, args.model,
+                                          args.candle_gpus, out_dir,
                                           args.timeout, args.reps, keys)
-        results = {name: fut.result() for name, fut in backends.items()}
+        if args.only in (None, "llamacpp", "turbo"):
+            futures["_llama_seq"] = ex.submit(run_llama_sequence)
+        for name, fut in futures.items():
+            if name == "_llama_seq":
+                results.update(fut.result())
+            else:
+                results[name] = fut.result()
     elapsed = time.time() - t0
     logger.info("wall: %.1fs", elapsed)
 
-    candle = results.get("candle", {k: None for k in ALL_KEYS})
-    turbo = results.get("turbo",   {k: None for k in ALL_KEYS})
-    md = render_md(candle, turbo, [k for k in ALL_KEYS if k in keys],
-                   args.model, elapsed)
+    md = render_md(results, [k for k in ALL_KEYS if k in keys],
+                   args.model, elapsed, args.candle_gpus, args.llama_gpus)
     print("\n" + md)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     (RESULTS_DIR / "gemma_2gpu_latest.md").write_text(md)
     summary = {"ts": ts, "model": args.model, "elapsed": elapsed,
-               "candle": candle, "turbo": turbo}
+               **{name: r for name, r in results.items()}}
     (RESULTS_DIR / "gemma_2gpu_latest.json").write_text(
         json.dumps(summary, indent=2))
     with (RESULTS_DIR / "gemma_2gpu_history.jsonl").open("a") as f:
