@@ -5664,17 +5664,182 @@ static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_fast(
 // emitting 2 waves. Bumping to (64, 2) made no measurable difference
 // (4042 µs/call before vs after), kept for documentation.
 //
-// Real bottleneck for further speedup is non-coalesced X reads:
-// adjacent lanes read adjacent rows, but rows are blocks_per_row*18
-// bytes apart → 64 cachelines per wave per K-block. Phase I proper
-// would reorder X storage to row-major-within-K-block at load time
-// (or stage X into LDS via cooperative loads). Both are major
-// refactors not done in this session.
+// Real bottleneck is non-coalesced X reads (rows are blocks_per_row*18
+// bytes apart → 64 cachelines per wave per K-block). The repacked
+// variant below is Phase I1's attack on this.
 extern "C" __global__ void __launch_bounds__(64, 2)
 mul_mat_q4_0_gfx906_v2f_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q4_0_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// =============================================================================
+// Phase I1 — Repacked-X variant. Reads X from a row-tile-major layout
+// where, for each K-block index `ib`, the 64 rows of one row tile are
+// stored contiguously as 64*18 = 1152 bytes.
+//
+// Repack rule (input shape (M, K) Q4_0, M divisible by 64):
+//   original_block_idx(row, ib) = row * blocks_per_row + ib
+//   repacked_block_idx(row, ib) = (ib * (M/64) + row/64) * 64 + (row % 64)
+//
+// Same total bytes, just permuted. Adjacent lanes (0..63) within a wave
+// now read adjacent 18-byte chunks → 18 cachelines per K-block per wave
+// instead of 64. Y reads are unchanged (Y is broadcast across lanes
+// already in the original kernel, so it was never the bottleneck).
+//
+// Caller responsibilities:
+//   - Repack the Q4_0 weight matrix at GGUF load time (one-time cost).
+//   - Launch with grid.x = M / WARP_SIZE (one block per row tile).
+//   - M must be a multiple of WARP_SIZE = 64. (E4B's hidden=2048,
+//     ffn_inner=10240, and all GQA head dims are multiples of 64.)
+//   - Y layout is unchanged; same as the non-repacked kernel.
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_0_gfx906_impl_repacked(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int row_tile = blockIdx.x;             // 0..M/64
+    const int tile_m   = row_tile * WARP_SIZE;
+    const int tile_n   = blockIdx.y * TILE_N;
+    const int lane     = threadIdx.x;            // 0..63
+    const int row      = tile_m + lane;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_0 * x = (const block_q4_0 *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK4_0;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+    const int M_tile_count = (nrows_x + WARP_SIZE - 1) / WARP_SIZE;
+
+    // Split accumulators for ILP (same as non-repacked variant).
+    float sums_a[TILE_N] = {0.0f};
+    float sums_b[TILE_N] = {0.0f};
+
+    // K-loop unrolled by 2.
+    int ib = 0;
+    for (; ib + 1 < blocks_per_row_x; ib += 2) {
+        // --- K-block 0 (even): X[ib][row_tile][lane] ---
+        // Address arithmetic uses the repacked layout. With M_tile_count
+        // and WARP_SIZE constant per-call, the multiply collapses to a
+        // single MAD, matching the non-repacked kernel's instruction
+        // count. The win is in the *cacheline footprint* of the 64-lane
+        // wave: 18 lines vs 64.
+        int x_lo0[4], x_hi0[4];
+        float scale_x0 = 0.0f;
+        if (row_valid) {
+            const block_q4_0 * bx =
+                &x[(ib * M_tile_count + row_tile) * WARP_SIZE + lane];
+            scale_x0 = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = get_int_from_uint8(bx->qs, j);
+                x_lo0[j] = p & 0x0F0F0F0F;
+                x_hi0[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        // --- K-block 1 (odd) ---
+        int x_lo1[4], x_hi1[4];
+        float scale_x1 = 0.0f;
+        if (row_valid) {
+            const block_q4_0 * bx =
+                &x[((ib + 1) * M_tile_count + row_tile) * WARP_SIZE + lane];
+            scale_x1 = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = get_int_from_uint8(bx->qs, j);
+                x_lo1[j] = p & 0x0F0F0F0F;
+                x_hi1[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            // Even K-block → sums_a
+            {
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+                const float2 ds8f = __half22float2(by->ds);
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo0[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi0[j], y_packed[j + 4], sumi);
+                }
+                sums_a[c] += scale_x0 * (sumi * ds8f.x - 8.0f * ds8f.y);
+            }
+            // Odd K-block → sums_b
+            {
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib + 1];
+                const float2 ds8f = __half22float2(by->ds);
+                const int * y_packed = (const int *) by->qs;
+                int sumi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi = ggml_cuda_dp4a(x_lo1[j], y_packed[j],     sumi);
+                    sumi = ggml_cuda_dp4a(x_hi1[j], y_packed[j + 4], sumi);
+                }
+                sums_b[c] += scale_x1 * (sumi * ds8f.x - 8.0f * ds8f.y);
+            }
+        }
+    }
+
+    // Remainder if blocks_per_row_x is odd.
+    if (ib < blocks_per_row_x) {
+        int x_lo[4] = {0, 0, 0, 0};
+        int x_hi[4] = {0, 0, 0, 0};
+        float scale_x = 0.0f;
+        if (row_valid) {
+            const block_q4_0 * bx =
+                &x[(ib * M_tile_count + row_tile) * WARP_SIZE + lane];
+            scale_x = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int p = get_int_from_uint8(bx->qs, j);
+                x_lo[j] = p & 0x0F0F0F0F;
+                x_hi[j] = (p >> 4) & 0x0F0F0F0F;
+            }
+        }
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            const int col = tile_n + c;
+            const block_q8_1 * by = &y[col * blocks_per_col_y + ib];
+            const float2 ds8f = __half22float2(by->ds);
+            const int * y_packed = (const int *) by->qs;
+            int sumi = 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sumi = ggml_cuda_dp4a(x_lo[j], y_packed[j],     sumi);
+                sumi = ggml_cuda_dp4a(x_hi[j], y_packed[j + 4], sumi);
+            }
+            sums_a[c] += scale_x * (sumi * ds8f.x - 8.0f * ds8f.y);
+        }
+    }
+
+    // Combine + write back.
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        const float total = sums_a[c] + sums_b[c];
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = total;
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 2)
+mul_mat_q4_0_gfx906_v2f_tile32_repacked(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_0_gfx906_impl_repacked<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
 // =============================================================================
