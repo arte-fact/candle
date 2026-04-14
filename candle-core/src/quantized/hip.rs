@@ -576,7 +576,11 @@ fn mul_mat_q40q41_turbo(
     total_b: usize,
     dev: &HipDevice,
 ) -> Result<Option<HipStorage>> {
-    const MMQ_Y: usize = 128;
+    const MMQ_Y_DEFAULT: usize = 128;
+    // U1: Q8_0 uses mmq_y=64 so two blocks/CU fit in 64 KB LDS (x_qs is 2×
+    // larger per row than Q4_0/Q4_1 and would otherwise push total to
+    // 46 720 B/block — 2 blocks = 93 KB, over the 64 KB gfx906 limit).
+    const MMQ_Y_Q8: usize = 64;
     const MMQ_NWARPS: u32 = 4;
     const MMQ_TILE_NE_K: usize = 32;
     const Q8_1_MMQ_BYTES: usize = 144;
@@ -588,6 +592,11 @@ fn mul_mat_q40q41_turbo(
         GgmlDType::Q4_1 => "q4_1",
         GgmlDType::Q8_0 => "q8_0",
         _ => return Ok(None),
+    };
+
+    let mmq_y: usize = match dtype {
+        GgmlDType::Q8_0 => MMQ_Y_Q8,
+        _ => MMQ_Y_DEFAULT,
     };
 
     if total_b == 0 {
@@ -616,7 +625,7 @@ fn mul_mat_q40q41_turbo(
     // for at least one valid row past the last legitimate one — true
     // because Q4_0/Q4_1 weight buffers are PaddedHipSlice-sized to
     // dtype-block alignment.
-    let need_check = nrows % MMQ_Y != 0;
+    let need_check = nrows % mmq_y != 0;
 
     // Pick mmq_x adaptive to batch.  Temporary: env override for debug.
     let mmq_x: usize = if let Ok(s) = std::env::var("CANDLE_MMQ_TURBO_X") {
@@ -686,14 +695,13 @@ fn mul_mat_q40q41_turbo(
         raw.div_ceil(pad) * pad
     };
     // Q8_0 LDS has 2× x_qs (full int per 4 values, not 0.5 int per 4 nibble-
-    // pairs); x_df size matches Q4_0 by coincidence.
+    // pairs) but mmq_y=64 halves the row count → total x_qs 16 640 B (vs Q4_0
+    // 16 896 B). x_df formula is mmq_y*8 + mmq_y/4 in all cases.
     let x_qs_ints = match dtype {
-        GgmlDType::Q8_0 => MMQ_Y * (2 * MMQ_TILE_NE_K + 1),
-        _ => MMQ_Y * (MMQ_TILE_NE_K + 1),
+        GgmlDType::Q8_0 => mmq_y * (2 * MMQ_TILE_NE_K + 1),
+        _ => mmq_y * (MMQ_TILE_NE_K + 1),
     };
-    // QI4_0 == QI4_1 == 4, QI8_0 == 8; x_df formula is mmq_y*8 + mmq_y/4
-    // either way (for mmq_y=128 that's 1056 floats).
-    let x_df_flts = MMQ_Y * 8 + MMQ_Y / 4;
+    let x_df_flts = mmq_y * 8 + mmq_y / 4;
     let shared_mem_bytes = (tile_y_ints + x_qs_ints) * 4 + x_df_flts * 4;
 
     // Launch the MMQ kernel.
@@ -701,7 +709,7 @@ fn mul_mat_q40q41_turbo(
     let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
     let cfg = hipdarc::driver::LaunchConfig {
         grid_dim: (
-            ceil_div(nrows, MMQ_Y) as u32,
+            ceil_div(nrows, mmq_y) as u32,
             ceil_div(total_b, mmq_x) as u32,
             1,
         ),

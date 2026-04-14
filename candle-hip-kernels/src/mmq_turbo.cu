@@ -86,6 +86,12 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "block_q8_1_mmq size");
 #ifndef MMQ_Y
 #define MMQ_Y 128
 #endif
+// Q8_0 uses a smaller M-axis tile (64 rows/block) because x_qs is 2× larger
+// per row than Q4_0 (8 ints/block vs 4 after nibble-pack), so MMQ_Y=128 would
+// push total LDS to 46 720 B/block — 2 blocks/CU would overflow gfx906's
+// 64 KB LDS and silently drop to 1 block/CU (half occupancy). With
+// MMQ_Y_Q8=64, x_qs shrinks to 16 640 B and 2 blocks/CU fits in 55 936 B.
+#define MMQ_Y_Q8 64
 #ifndef MMQ_NWARPS
 #define MMQ_NWARPS 4
 #endif
@@ -106,11 +112,11 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "block_q8_1_mmq size");
 #define X_QS_INTS (MMQ_Y * (MMQ_TILE_NE_K + 1))
 #define X_DF_FLTS (MMQ_Y * (MMQ_TILE_NE_K / QI4_0) + MMQ_Y / QI4_0)
 
-// Q8_0 has 2× K per row in x_qs (each int is a full 4 int8s, not 2 nibble-pairs),
-// so x_qs is 128 × 65 = 8320 ints (vs Q4_0's 128 × 33 = 4224).  x_df size
-// matches Q4_0 by coincidence (both come out to 1056 floats for mmq_y=128).
-#define X_QS_INTS_Q8_0 (MMQ_Y * (2 * MMQ_TILE_NE_K + 1))
-#define X_DF_FLTS_Q8_0 (MMQ_Y * (2 * MMQ_TILE_NE_K / QI8_0) + MMQ_Y / (QI8_0 / 2))
+// Q8_0 uses MMQ_Y_Q8=64 (see note above).  At 64-row tile:
+//   x_qs = 64 * 65     = 4160 ints (16 640 B)
+//   x_df = 64 * 8 + 16 =  528 flts ( 2 112 B)
+#define X_QS_INTS_Q8_0 (MMQ_Y_Q8 * (2 * MMQ_TILE_NE_K + 1))
+#define X_DF_FLTS_Q8_0 (MMQ_Y_Q8 * (2 * MMQ_TILE_NE_K / QI8_0) + MMQ_Y_Q8 / (QI8_0 / 2))
 
 // Pad Y tile size up to a multiple of nwarps*warp_size to match turbo's
 // cooperative-load stride.
@@ -707,7 +713,7 @@ static __device__ __forceinline__ void load_tiles_q8_0(
     const int kbx_hi_safe = (kbx_hi < kb_remaining) ? kbx_hi : (kb_remaining - 1);
 
 #pragma unroll
-    for (int i0 = 0; i0 < MMQ_Y; i0 += nrows * MMQ_NWARPS) {
+    for (int i0 = 0; i0 < MMQ_Y_Q8; i0 += nrows * MMQ_NWARPS) {
         int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         if (need_check) {
             i = (i < i_max) ? i : i_max;
@@ -725,7 +731,7 @@ static __device__ __forceinline__ void load_tiles_q8_0(
     const int kbxd_safe = kbxd_valid ? kbxd : 0;
 
 #pragma unroll
-    for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS * rows_per_warp) {
+    for (int i0 = 0; i0 < MMQ_Y_Q8; i0 += MMQ_NWARPS * rows_per_warp) {
         int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
         if (need_check) {
             i = (i < i_max) ? i : i_max;
@@ -760,7 +766,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_dp4a(
         for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
             const int j = j0 + threadIdx.y;
 #pragma unroll
-            for (int i0 = 0; i0 < MMQ_Y; i0 += WARP_SIZE) {
+            for (int i0 = 0; i0 < MMQ_Y_Q8; i0 += WARP_SIZE) {
                 const int i = i0 + threadIdx.x;
 
                 const int * v = &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0];
@@ -771,7 +777,7 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_dp4a(
                 const int sub = (k0 / QI8_1) % (MMQ_TILE_NE_K / QI8_1);
                 const float d_y = __low2float(y_ds[j * MMQ_TILE_Y_K + sub]);
 
-                sum[(j0 / MMQ_NWARPS) * (MMQ_Y / WARP_SIZE) + i0 / WARP_SIZE] +=
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y_Q8 / WARP_SIZE) + i0 / WARP_SIZE] +=
                     q8_0_q8_1_dp4a_8(v, u, d_x, d_y);
             }
         }
@@ -802,7 +808,7 @@ static __device__ void mul_mat_q8_0_turbo_impl(
     const int it = blockIdx.x;
     const int jt = blockIdx.y;
 
-    constexpr int sum_slots = mmq_x * MMQ_Y / (MMQ_NWARPS * WARP_SIZE);
+    constexpr int sum_slots = mmq_x * MMQ_Y_Q8 / (MMQ_NWARPS * WARP_SIZE);
     float sum[sum_slots];
 #pragma unroll
     for (int s = 0; s < sum_slots; ++s) sum[s] = 0.0f;
@@ -812,7 +818,7 @@ static __device__ void mul_mat_q8_0_turbo_impl(
     const int n_blocks_x = ncols_x / QK8_0;
     const int kb0_stop = (n_blocks_x + blocks_per_iter - 1)
                          / blocks_per_iter * blocks_per_iter;
-    const int i_max = nrows_x - it * MMQ_Y - 1;
+    const int i_max = nrows_x - it * MMQ_Y_Q8 - 1;
 
     for (int kb0 = 0; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         const int kb_remaining =
@@ -821,7 +827,7 @@ static __device__ void mul_mat_q8_0_turbo_impl(
         load_tiles_q8_0<need_check>(
             (const char *) vx,
             x_qs, x_df,
-            it * MMQ_Y * stride_row_x + kb0,
+            it * MMQ_Y_Q8 * stride_row_x + kb0,
             (need_check ? i_max : 0),
             kb_remaining,
             stride_row_x);
@@ -859,12 +865,12 @@ static __device__ void mul_mat_q8_0_turbo_impl(
         const int col_g = jt * mmq_x + j;
         if (col_g >= ncols_y) return;
 #pragma unroll
-        for (int i0 = 0; i0 < MMQ_Y; i0 += WARP_SIZE) {
+        for (int i0 = 0; i0 < MMQ_Y_Q8; i0 += WARP_SIZE) {
             const int i = i0 + threadIdx.x;
-            const int row_g = it * MMQ_Y + i;
+            const int row_g = it * MMQ_Y_Q8 + i;
             if (need_check && row_g >= nrows_x) continue;
             dst[(size_t)col_g * nrows_dst + row_g] =
-                sum[(j0 / MMQ_NWARPS) * (MMQ_Y / WARP_SIZE) + i0 / WARP_SIZE];
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y_Q8 / WARP_SIZE) + i0 / WARP_SIZE];
         }
     }
 }
