@@ -698,6 +698,122 @@ Community observations worth noting before porting:
 **Effort:** 2-3 days. Gated on Phase Q1 (KV layout changes during S
 would collide with G2 plan capture if Q1 isn't done first).
 
+### Phase T — G2/G3 maturation (close the regression vs default)
+
+After Phase R1 (split-L_k attention) raised default-path decode to
+65 t/s short / 63 t/s long, G2/G3 is *slower* than default (57-59 t/s).
+Five issues identified by code review + AMD documentation cross-check.
+See the G2/G3 review at the end of `MEMORY.md` (project_phase_t_g23.md)
+for full citations.
+
+#### T1 — Stabilise split-L_k grid for G2/G3 capture *(correctness foot-gun)*
+
+`flash_attn.rs:1563` computes `n_chunks = (l_k_iter + 31) / 32`. Within
+a single pad window, `l_k_iter` advances by 1 per token but `n_chunks`
+can step at chunk boundaries. The captured graph node freezes the
+recording-time grid; runtime mismatch silently produces wrong output
+or skips chunks. Scratch buffer pointer captured at recording time is
+freed/reused on subsequent calls.
+
+**Fix:** compute `n_chunks` from `l_k_alloc` (the padded extent —
+constant across the pad window). The split kernel already early-exits
+chunks where `t0 >= L_k`, so excess chunks pay only ~5 µs launch
+overhead each. Allocate scratch sized for the max n_chunks once per
+pad window.
+
+**Effort:** ~1 hour. **Risk:** low. **Wall-clock impact:** 0 (it's a
+correctness fix); unlocks accurate G2/G3 benchmarking for T2-T5.
+
+#### T2 — Collapse Counter args to a device-resident counter slot
+
+Memory says we have "432 Counter args advancing" — these are per-op
+copies of `index_pos` / dynamic-L_k slots that we re-patch via
+`hipGraphExecKernelNodeSetParams` on every replay. AMD's
+[performance guidelines](https://rocm.docs.amd.com/projects/HIP/en/latest/how-to/performance_guidelines.html)
+explicitly call this pattern out: *"applications that require updates
+to only a small subset of nodes might experience excessive overhead."*
+ROCm 7.2.0 added [AQL packet batching for set_kernel_node_params](https://rocm.docs.amd.com/en/docs-7.2.0/about/release-notes.html);
+we're on 7.1.1 and don't get that.
+
+**Fix:** allocate a tiny device buffer (`__device__ uint32_t
+g2_counters[N]`) and replace each Counter arg with an indirect read
+inside the kernel body (or pass the buffer pointer once at capture,
+read by-index per op). Per-replay update becomes a single
+`hipMemcpyHtoDAsync` to push the latest counter values, instead of
+~130 `set_kernel_node_params` calls.
+
+**Effort:** ~half day. **Risk:** medium (touches every kernel that
+uses index_pos as an arg — probably 5-10 kernels). **Wall-clock
+impact:** −200 to −400 µs/tok = +1.5-3 % decode throughput.
+
+#### T3 — Drag prelude (CPU embed + per_layer model_proj) into the captured plan
+
+`quantized_gemma4.rs:780-803, 832-859` runs the prelude under
+`with_recording_paused` so its kernels don't enter the captured plan.
+Two reasons it has to be paused today:
+
+- **CPU→GPU embed memcpy** can't be replayed by `hipStreamBeginCapture`
+  (memcpy sources aren't captured). Fix: use [`hipGraphAddMemcpyNode1D`](https://rocm.docs.amd.com/projects/HIP/en/latest/doxygen/html/group___graph.html)
+  explicitly during graph build, with the host buffer pointer as a
+  graph node parameter. Update via `hipGraphExecMemcpyNodeSetParams1D`
+  per replay, similar pattern to kernel node updates.
+- **per_layer `model_proj`** is rocBLAS F16 (Cijk_Alik_Bljk... at 463
+  µs/call). rocBLAS calls bypass `LaunchArgs::launch` so the launch
+  recorder never sees them; they have to run paused. Fix paths:
+  - (a) **Replace with a custom MMVQ kernel** so it goes through the
+    recorder. Memory K13 says we tried Q8_0 requantize and it
+    "throws decode_alloc cursor out of sync" — that was a tooling
+    issue (un-paused decode_alloc + extra quantize_q8_1 buffer per
+    call). Do it with the recording paused state explicitly managed
+    around the requantize.
+  - (b) **Manually add the rocBLAS call as a graph node** — rocBLAS
+    has a stream API; if we capture the rocBLAS call inside
+    `hipStreamBeginCapture(stream, hipStreamCaptureModeRelaxed)`
+    instead of Global, it should record into the graph. (Relaxed
+    mode allows operations Global rejects.)
+
+**Effort:** ~1 day. **Risk:** medium (rocBLAS-vs-graph interaction is
+not well documented). **Wall-clock impact:** −1 ms/tok = +6 %
+decode throughput, *if* it works.
+
+#### T4 — Switch to `hipStreamCaptureModeRelaxed` and instrument
+
+[HIP API 7.0 changes](https://rocm.docs.amd.com/projects/HIP/en/latest/hip-7-changes.html)
+restricted some APIs to Relaxed mode only. We use `Global`. AMD does
+**not raise errors for illegal stream-capture operations** the way CUDA
+does ([pytorch#155684](https://github.com/pytorch/pytorch/issues/155684)),
+so any silent drops have been silently dropping all session.
+
+**Fix:** flip `hipdarc/src/driver.rs:476` to `HIP_STREAM_CAPTURE_MODE_RELAXED`,
+re-bench. If perf changes (better or worse), Global was dropping
+ops; investigate which.
+
+**Effort:** ~1 hour to flip + bench. **Risk:** low. **Wall-clock
+impact:** unknown; primarily diagnostic. Might unblock T3(b).
+
+#### T5 — Multi-stream graph topology
+
+[ROCm release notes](https://rocm.docs.amd.com/en/docs-6.4.0/about/release-notes.html)
+mention the runtime has an "optimized doorbell ring mechanism for
+certain topologies." Linear-chain captures (our case) likely don't
+qualify. Independent kernels (e.g., quantize_q8_1 for Q/K/V before
+their projections, fast_argmax during the previous token's residual
+add) could capture onto separate streams within the same graph. AMD
+supports cross-stream capture via Global mode.
+
+**Fix:** identify independent kernel chains in the gemma4 forward,
+capture them on auxiliary streams. The graph builder will track the
+cross-stream dependencies and emit a forked-and-joined graph topology
+that AMD's runtime can recognise.
+
+**Effort:** 1-2 days. **Risk:** high (model-forward refactor +
+careful scope of which ops are truly independent). **Wall-clock
+impact:** unknown; conditional on AMD's optimizer recognising the
+emitted topology.
+
+**Effort total for Phase T:** 3-4 days. T1 alone is a same-session fix.
+T2 + T3 are the high-value items. T4 is diagnostic. T5 is exploratory.
+
 ## Order of attack
 
 Updated 2026-04-13 after `SURVEY-GFX906-FORKS-2026-04-13.md`. Phases
@@ -708,29 +824,43 @@ completeness only.
 [DONE: H (n_kv pad + flash-attn-v2 on gemma4)]
 [DONE: K (G2/G3 on gemma4, decode correctness)]
 [DONE: P Stage 1 (T-major K + mat-vec decode, opt-in)]
+[DONE: J redo (DPP re-enable, +8-11% — turbo-pattern s_nop 4)]
+[DONE: B3 redo (Q4_K/Q5_K warp-coop pair-layout fix)]
+[DONE: Q2 (float2 loads + V-prefetch in gqa_decode_mv)]
+[DONE: R1 (split-L_k attention default-on, +31% long-prompt decode)]
+       ↓
+STEP T (next):  Phase T G2/G3 maturation — close the regression vs
+                default and unlock launch-overhead savings on every
+                model (not just E4B). Subphases:
+                T1: split-L_k grid stability (1h, correctness)
+                T2: device-resident counters (½ day, +1.5-3%)
+                T3: prelude into captured plan (1 day, +6% if works)
+                T4: capture-mode flip (1h, diagnostic)
+                T5: multi-stream topology (1-2 days, exploratory)
+                Order: T1 → T4 → T2 → T3 → T5.
        ↓
 STEP 1: ROCm 7.2.1 + Tensile migration
         (see ROADMAP-ROCM-722-MIGRATION-2026-04-13.md)
-        → unblocks Phase J DPP reductions (≈40% on reduction hotpath)
-        → unblocks Phase B3 K-quant warp-coop (decode Q4_K faster)
-        → unblocks Phase O rocBLAS sgemv (probably obsolete post-P)
+        — withdrawn finding: tensile bundle has ZERO new files vs our
+        7.1.1; only the AQL batching for set_kernel_node_params (T2's
+        fallback) gives us anything. Lower priority post-T2.
        ↓
-STEP 2: Phase R (LDS +1 padding) + Phase Q2 (mat-vec kernel tuning)
-        (parallel; neither blocks the other)
-        → Phase R:  flash-attn-v2 LDS tiles +1 pad → +10-20% per call
-        → Phase Q2: 128-thread block, float2 loads, split-K, strided
-                    K args → 73 μs → ~30 μs per gqa_decode_mv call
-        Combined expected: Gemma4-E4B decode 54 → 62-65 t/s
+STEP 2: Phase R LDS padding (was Phase R; now R2 since R1 = split-L_k)
+        — `+1` padding on flash-attn-v2 k_lds/v_lds tiles. Already
+        analysed; no clear bank-conflict target in our current code.
+        Re-survey post-T to confirm.
        ↓
-STEP 3: Phase Q1 (G2 + Phase P integration)
-        → flip Phase P from opt-in to default without regressing G2
-        → so everyone gets the decode win transparently
+STEP 3: Phase S (TurboQuant KV port)
+        → 5× KV memory compression, long-context unlock
+        → halves the bandwidth cost of the Q4_0 MMVQ grid=655360
+          bucket (currently 40% of decode GPU)
+        Expected: another +10-15% wall-clock decode IF G2/G3 (post-T)
+        already eliminated CPU-side overhead.
        ↓
-STEP 4: Phase I (MMQ rewrite) + Phase S (TurboQuant KV) + Phase N (prefill)
-        — tracks are independent, pick by schedule / model priority.
-        → I: prefill 2-3× across every Q4_0 model (TinyLlama 801 → 2k)
-        → S: 5× KV memory compression, long-context unlock
-        → N: fused attention for prefill (also needs Phase Q4 — d=512
+STEP 4: Phase I (MMQ rewrite) + Phase N (prefill)
+        — tracks are independent.
+        → I: prefill 2-3× across every Q4_0 model
+        → N: fused attention for prefill (needs Phase Q4 — d=512
              K_TRANS=false kernel)
 ```
 
@@ -738,13 +868,14 @@ STEP 4: Phase I (MMQ rewrite) + Phase S (TurboQuant KV) + Phase N (prefill)
 
 Target evolves per step (numbers track Gemma4-E4B Q4_0 single-MI50 decode):
 
-| Step | Gemma4-E4B decode | TinyLlama decode | Qwen3.5 decode | Gemma4 prefill |
+| Step | Gemma4-E4B decode (long) | TinyLlama decode | Qwen3.5 decode | Gemma4 prefill |
 |---|---|---|---|---|
-| Today (post-P Stage 1 opt-in) | 54 | 267 | broken | 244 |
-| +STEP 1 (ROCm 7.2.1) | 55 | 275 | broken | 250 |
-| +STEP 2 (Phase R+Q2) | **62-65** | 275 | — | 260 |
-| +STEP 3 (Phase Q1 → P default on) | 62-65 (+G2 working) | 275 | — | 260 |
-| +STEP 4 (Phase I prefill rewrite) | 65 | 275 | 55 (after J) | **~500** |
+| 2026-04-14 actual (post-R1) | **63** | ≥203 | 40 | 542 |
+| +Phase T1 (split-L_k stable) | 63 | 203 | 40 | 542 |
+| +Phase T2 (counter slot)     | 64-65 | — | — | — |
+| +Phase T3 (prelude in plan)  | **67-70** if works | — | — | — |
+| +Phase R2 (LDS pad) + S      | **70-73** | 220 | 45 (after rocBLAS workaround) | 560 |
+| +Phase I (MMQ rewrite)       | 73 | 280 | 55 | **~500** |
 
 Turbo's 75 t/s on E4B decode remains the ceiling at batch=1 (`SURVEY
 §7`); closing the last 10 t/s requires either TurboQuant KV (memory-
