@@ -183,29 +183,70 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
 
     const int L_k_effective = (L_k_iter >= 0) ? L_k_iter : L_k;
     const int n_chunks = (L_k_effective + BC - 1) / BC;
+
+    // Phase U1 — float4 fast path for standard layout (!K_TRANS).
+    // When K_TRANS=false the call site never passes strided V either
+    // (`_fwd_d{N}_f32` family always uses default vs_d=1, vs_j=D).
+    // In that case both K and V are stride-1 along the contiguous d
+    // axis: load 4 floats per thread per VMEM transaction = 4× fewer
+    // global_load instructions vs the scalar dwordx1 path. K_TRANS=true
+    // (kt / ktvs variants) keeps the scalar loop because K's stride
+    // along d is L_k, not vectorizable.
+    constexpr bool VECTORIZE = (!K_TRANS) && (D % 4 == 0);
+    constexpr int VEC = 4;
+    constexpr int TILE_QUADS = TILE_ELEMS / VEC;
+    constexpr int LOADS_PER_THREAD_QUAD =
+        (TILE_QUADS + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    constexpr int D_QUADS = D / VEC;
+
     for (int chunk = 0; chunk < n_chunks; ++chunk) {
         const int k_start = chunk * BC;
 
         // ---- Cooperative load of K/V tile into LDS. ----
-        // Threads stride through [0, BC*D) in steps of THREADS_PER_BLOCK.
-        #pragma unroll
-        for (int il = 0; il < LOADS_PER_THREAD; ++il) {
-            const int idx = tid + il * THREADS_PER_BLOCK;
-            if (idx < TILE_ELEMS) {
-                const int j = idx / D;
-                const int d = idx % D;
-                const int row = k_start + j;
-                const bool valid = (row < L_k_effective);
-                // K layout:
-                //   standard (L_k, D) contiguous → k[row*D + d]
-                //   transposed (D, L_k) default  → k[d*L_k + row]
-                //   transposed + explicit strides → k[d*ks_d + row*ks_j]
-                if (K_TRANS) {
-                    k_lds[idx] = valid ? k_ptr[d * ks_d + row * ks_j] : 0.0f;
-                } else {
-                    k_lds[idx] = valid ? k_ptr[row * D + d] : 0.0f;
+        if constexpr (VECTORIZE) {
+            // Threads stride through TILE_QUADS in steps of THREADS_PER_BLOCK,
+            // each iteration reads one 16-byte chunk of K and one of V.
+            #pragma unroll
+            for (int il = 0; il < LOADS_PER_THREAD_QUAD; ++il) {
+                const int qidx = tid + il * THREADS_PER_BLOCK;
+                if (qidx < TILE_QUADS) {
+                    const int j = qidx / D_QUADS;
+                    const int d_base = (qidx % D_QUADS) * VEC;
+                    const int row = k_start + j;
+                    const bool valid = (row < L_k_effective);
+                    const float4 zero4 = {0.0f, 0.0f, 0.0f, 0.0f};
+                    const float4 k4 = valid
+                        ? *reinterpret_cast<const float4 *>(&k_ptr[row * D + d_base])
+                        : zero4;
+                    const float4 v4 = valid
+                        ? *reinterpret_cast<const float4 *>(&v_ptr[row * vs_j + d_base])
+                        : zero4;
+                    *reinterpret_cast<float4 *>(&k_lds[j * D + d_base]) = k4;
+                    *reinterpret_cast<float4 *>(&v_lds[j * D + d_base]) = v4;
                 }
-                v_lds[idx] = valid ? v_ptr[row * vs_j + d * vs_d] : 0.0f;
+            }
+        } else {
+            // Scalar fallback: K_TRANS=true (strided K) or D not multiple of 4.
+            // Threads stride through [0, BC*D) in steps of THREADS_PER_BLOCK.
+            #pragma unroll
+            for (int il = 0; il < LOADS_PER_THREAD; ++il) {
+                const int idx = tid + il * THREADS_PER_BLOCK;
+                if (idx < TILE_ELEMS) {
+                    const int j = idx / D;
+                    const int d = idx % D;
+                    const int row = k_start + j;
+                    const bool valid = (row < L_k_effective);
+                    // K layout:
+                    //   standard (L_k, D) contiguous → k[row*D + d]
+                    //   transposed (D, L_k) default  → k[d*L_k + row]
+                    //   transposed + explicit strides → k[d*ks_d + row*ks_j]
+                    if (K_TRANS) {
+                        k_lds[idx] = valid ? k_ptr[d * ks_d + row * ks_j] : 0.0f;
+                    } else {
+                        k_lds[idx] = valid ? k_ptr[row * D + d] : 0.0f;
+                    }
+                    v_lds[idx] = valid ? v_ptr[row * vs_j + d * vs_d] : 0.0f;
+                }
             }
         }
         __syncthreads();

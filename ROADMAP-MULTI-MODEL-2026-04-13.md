@@ -814,6 +814,158 @@ emitted topology.
 **Effort total for Phase T:** 3-4 days. T1 alone is a same-session fix.
 T2 + T3 are the high-value items. T4 is diagnostic. T5 is exploratory.
 
+### Phase U — Triton-inspired prefill kernel optimisations (2026-04-14)
+
+Prefill kernels `flash_attn_v2_fwd_ktvs_d{64,128,256,512}_f32` are
+hand-tuned for gfx906 (DPP warp reduce from `gfx906_primitives.cuh`,
+Q-in-registers, 32 KiB LDS at occupancy=2, `s_nop 4` EXEC hazard
+correctness from commit 460f3e7a). A review of vLLM's
+`triton_unified_attention.py` (Apache-2.0, the default AMD FA2 backend)
+against our kernel identified four algorithmic ideas worth absorbing
+as C++/HIP changes.
+
+**Not a Triton toolchain port.** `nlzy/triton-gfx906` is archived
+2026-02-20, AOTriton [explicitly excludes gfx906](https://github.com/ROCm/TheRock/issues/1925),
+[ROCm 7.0.2 drops gfx906 from the supported list](https://rocm.docs.amd.com/en/docs-7.0.2/about/release-notes.html),
+and Triton's `__shfl_xor → ds_bpermute` lowering pays ~8–16 cycles per
+warp reduction vs our DPP path. Triton also doesn't know about gfx906's
+5-cycle EXEC→DPP hazard. The realistic port outcome would be
+parity-to-slower. Instead: keep our kernel, steal the ideas.
+
+Current prefill baseline (inspection of `flash_attn_v2.cu`):
+- Scalar `float` (dwordx1) LDS staging at lines 189–210 — **not** even
+  float2 like our decode path at line 604
+- No in-kernel causal / SWA logic; caller bakes dense `(L_q × L_k)`
+  additive mask — wastes QK/softmax/PV on all-`-inf` tiles
+- f32 throughout; `v_dot2_f32_f16` (documented Vega packed-dot, ~2×
+  throughput of scalar FMA for fp16) unused despite the instruction
+  being available and our MMVQ already using the integer sibling
+  `v_dot4_i8_i32`
+- LDS single-buffered (K double-buffer tried on decode at commit
+  19ae3bdf, regressed occupancy 4→3; **prefill starts at occupancy=2
+  so VGPR headroom is different and was never retested**)
+
+#### U1 — Vectorize LDS staging to `float4` (dwordx4)
+
+Rewrite the K/V LDS staging loop (lines 189–210) and the Q register
+load to `float4` (128-bit) reads when `D % 4 == 0`. Fall back to
+`float2` for strided-V (Gemma4 SWA) where `v_stride_t % 4 != 0`.
+
+**Why.** On gfx906 `global_load_dwordx4` issues one VMEM transaction
+for 16 bytes vs four for dwordx1. The VMEM issue queue, not HBM
+bandwidth, is the binding constraint on the prefill inner loop.
+
+**Effort:** 1–2 days. **Risk:** low (decode already uses float2
+successfully). **Wall-clock impact:** +15–30% prefill t/s on long
+contexts; bit-exact numerics (no arithmetic reordering).
+
+#### U2 — Causal + SWA tile skipping
+
+Add kernel args `causal: i32`, `swa_window: i32`. Compute per block:
+```
+t_start = causal ? max(0, q_start - swa_window) : 0
+t_end   = causal ? min(L_k_effective, q_start + BR) : L_k_effective
+```
+Loop K chunks only in `[t_start, t_end)` instead of `[0, L_k_effective)`.
+Apply intra-tile causal mask only on the boundary tile. Allow the
+caller to pass `mask == nullptr` when `causal == 1`; stop building
+the `(L_q × L_k)` f32 mask tensor.
+
+**Why.** Long-context causal: ~50% of tiles skipped. Gemma4-E4B SWA
+layers at 32K context with W=4096: ~87% of tiles skipped. Also saves
+2 MiB of mask HBM traffic per layer at L_q=256, L_k=8192 (several
+RmsNorm's worth).
+
+**Effort:** 2–3 days. **Risk:** medium — boundary-tile correctness
+is subtle. Verify bit-exactness vs the dense-mask path at multiple
+seqlens. **Wall-clock impact:** negligible at 556-tok bench;
+**major on long prompts** (8K+) and Gemma4 SWA layers.
+
+**Files.** `flash_attn_v2.cu` + `candle-core/src/hip_backend/flash_attn.rs`
+(`flash_attn_v2_kt_strided_v` + `_dyn` — accept causal/swa args) +
+model call sites in `candle-transformers/src/models/{gemma4,qwen3,
+llama,tinyllama}.rs` (pass `causal=true` instead of pre-baking mask).
+
+#### U3 — fp16/bf16 prefill with `v_dot2_f32_f16`
+
+New kernel family `flash_attn_v2_fwd_ktvs_d{64,128,256,512}_{f16,bf16}`:
+native fp16/bf16 Q/K/V, f32 accumulators (softmax `m, l`, output `o`),
+QK and PV inner loops use `__builtin_amdgcn_fdot2(a_pair, b_pair, acc,
+false)` (one fdot2 = 2 fp16 multiplies + 1 f32 add per cycle). fp16 KV
+in LDS halves the per-tile footprint → room for BC doubling at
+occupancy=2.
+
+**Why.** FA2 at seqlen ≥ 2048 is deeply memory-bound on MI50 (AI ≈
+2 flop/byte vs HBM2 ridgeline 26.5 flop/byte; HBM2 peak 1.024 TB/s
+per [MI50 datasheet](https://www.amd.com/system/files/documents/radeon-instinct-mi50-datasheet.pdf)).
+fp16 KV halves HBM bytes → ~2× bandwidth-bound speedup. Packed-dot
+gives 2× compute throughput for short prompts (L_k ≤ 1024) that
+aren't memory-bound. LDS headroom from halved footprint unlocks
+larger BC = fewer softmax rescales per block.
+
+KV-cache side is already dtype-flexible: `candle-nn/src/kv_cache.rs`
+`Cache::append` allocates matching input tensor dtype; RmsNorm, RoPE,
+Linear proj, `Cache::append` are dtype-agnostic. The f32 gates are
+concentrated in `hip_backend/flash_attn.rs` (18 assertions) and
+`quantized_blocks/attention.rs` (6 dtype checks at lines 99, 232,
+377, 452, 457, 752).
+
+**Effort:** 4–5 days. **Risk:** medium — verify `hipcc` emits
+`v_dot2_f32_f16` for the builtin on gfx906 via `-S -emit-llvm` on
+a toy kernel; fall back to inline asm `v_dot2_f32_f16` if not
+(precedent: DPP inline-asm in `gfx906_primitives.cuh`). bf16 needs
+`v_cvt_f32_bf16` pair or load-time cast; verify Vega `v_pk_` bf16
+coverage. **Wall-clock impact:** +40–80% prefill t/s over U1 on
+memory-bound shapes.
+
+#### U4 — LDS K double-buffering on prefill (conditional, post-U3)
+
+Re-test K-tile double-buffer on prefill *after* U3's fp16 halves LDS
+footprint. At d=128 BC=32 fp16: K-dbl 16 KiB + V-single 8 KiB = 24
+KiB ≤ 32 KiB → occupancy=2 preserved. Compile one variant, read
+VGPR count via `llvm-readelf --notes`; abandon if occupancy drops to 1.
+
+**Why this can now work when the decode attempt regressed.** Decode
+was at occupancy=4 (wave/SIMD), so any extra VGPR dropped it. Prefill
+starts at occupancy=2, has more VGPR headroom, and U3 halves the LDS
+cost of the second buffer.
+
+**Effort:** 2 days. **Risk:** high (compiler already does implicit
+speculation at occupancy=2). Gate behind `#define
+CANDLE_FA2_DOUBLE_BUFFER_K` for A/B. **Wall-clock impact:** +0–10%
+if occupancy holds.
+
+#### U5 — Autotune (BR, BC) per (d, dtype, causal, swa)
+
+Parameterise the kernel on BR and BC. Sweep BR ∈ {2, 4, 8} × BC ∈
+{8, 16, 32, 64, 128} across seqlens {512, 2048, 8192, 32768} on MI50.
+Update Rust dispatch with per-tuple winners.
+
+**Effort:** 1 day (wall) + ~4 GPU-hours. **Risk:** low.
+**Wall-clock impact:** +0–5%; safety-net sweep.
+
+**Effort total for Phase U:** ~10 engineer-days. Combined realistic
+target: **~2× prefill throughput** on models that can use fp16 KV
+(TinyLlama, Qwen3.5, Gemma4-E4B); **~1.3–1.5×** on models locked
+to f32 (U1 + U2 only). Decode path untouched throughout (prefill
+changes only).
+
+**Order within Phase U:** U1 → U2 → U3 → U4 → U5. U1 is independent
+and low-risk; U2 unlocks long-context gains on current f32 path; U3
+is the headline win but needs the KV migration; U4/U5 are polish.
+
+**AMD-documented facts underwriting this phase:**
+- [Vega 7nm ISA manual](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/vega-7nm-shader-instruction-set-architecture.pdf):
+  LDS = 64 KiB per CU (our 32 KiB budget is the occupancy-2 ceiling —
+  headroom exists for U4 post-U3); `v_dot2_f32_f16` is documented in
+  the packed-math group
+- [GPUOpen GCN cross-lane ops](https://gpuopen.com/learn/amd-gcn-assembly-cross-lane-operations/):
+  5-cycle EXEC→DPP, 2-cycle VALU→DPP hazards — must preserve `s_nop 4`
+  pattern in any new DPP uses
+- [ROCm 7.0.2 release notes](https://rocm.docs.amd.com/en/docs-7.0.2/about/release-notes.html):
+  gfx906 dropped from supported Instinct list — underwrites the
+  "stay in hand C++/HIP, not Triton" decision
+
 ## Order of attack
 
 Updated 2026-04-13 after `SURVEY-GFX906-FORKS-2026-04-13.md`. Phases
