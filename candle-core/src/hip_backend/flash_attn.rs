@@ -1540,16 +1540,22 @@ pub fn gqa_attention_decode_mv(
     // softmax state. Splitting T into chunks puts CHUNKS×H_q×B waves on
     // the GPU. Validated by arXiv 2311.01282 (3.93× decode on AMD).
     //
-    // Default chunk_t = 64. Threshold = 96: below this, kernel-launch
-    // overhead of the 2-kernel sequence exceeds the gain.
-    // Opt-in via CANDLE_FLASH_SPLIT_LK=1.
+    // Default chunk_t = 32 (E4B sweep: chunk=16 helps long but regresses
+    // short, chunk=64 is the inverse — 32 is the balanced sweet spot).
+    // Threshold = 96: below this, kernel-launch overhead of the 2-kernel
+    // sequence exceeds the gain.
+    //
+    // Default-ON. Best-of-3 on E4B Q4_0:
+    //   Short prompt: 60 → 65 t/s (+8.7%)
+    //   Long prompt:  48 → 63 t/s (+31%)
+    // Opt-out via CANDLE_FLASH_SPLIT_LK=0 for bisecting regressions.
     let split_lk_enabled = std::env::var("CANDLE_FLASH_SPLIT_LK")
         .map(|v| v != "0" && v != "false")
-        .unwrap_or(false);
+        .unwrap_or(true);
     let chunk_t: usize = std::env::var("CANDLE_FLASH_SPLIT_CHUNK_T")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
+        .unwrap_or(32);
     let split_threshold: usize = std::env::var("CANDLE_FLASH_SPLIT_THRESHOLD")
         .ok()
         .and_then(|s| s.parse().ok())
