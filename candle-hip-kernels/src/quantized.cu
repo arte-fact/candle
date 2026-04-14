@@ -2642,6 +2642,12 @@ mul_mat_vec_q4_0_q8_1_cuda1(
         const int4 q8_lo = *((const int4 *)(bq8->qs));
         const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
 
+        // Single dp4a chain. Tested 2-way split accumulator (sumi_a/sumi_b)
+        // — produced ZERO measurable change at any grid size. The biggest
+        // grid bucket (grid=655360, 84 MB weights per call) is bandwidth-
+        // bound and the smaller buckets (grid<=131072) appear L2-fitting
+        // with the compiler already extracting ILP. Keep the simpler
+        // single-chain form.
         int sumi = 0;
         sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
         sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
