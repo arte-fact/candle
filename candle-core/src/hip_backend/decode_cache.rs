@@ -629,6 +629,35 @@ impl DecodePlan {
             ops.len(), fixed_count, dynamic_count, per_input
         );
 
+        // Phase T2 sub-diagnostic: which kernel NAMES contribute to the
+        // counter-only patch storm? Tells us how many distinct kernels
+        // would need a `const uint32_t* counter_buf` rewrite.
+        if std::env::var("CANDLE_G2_COUNTER_BREAKDOWN").is_ok() {
+            use std::collections::HashMap;
+            let mut by_kernel: HashMap<String, (usize, usize, usize)> = HashMap::new();
+            // (counter_only_op_count, external_op_count, total_dyn_args)
+            for (i, (args, kinds)) in dynamic_args.iter().zip(dynamic_kinds.iter()).enumerate() {
+                if args.is_empty() { continue; }
+                let name = ops[i].name.clone();
+                let entry = by_kernel.entry(name).or_insert((0, 0, 0));
+                let has_external = kinds.iter().any(|k| matches!(k, DynArgKind::External));
+                if has_external { entry.1 += 1; } else { entry.0 += 1; }
+                entry.2 += args.len();
+            }
+            let mut sorted: Vec<_> = by_kernel.iter().collect();
+            sorted.sort_by_key(|(_, (co, ext, _))| std::cmp::Reverse(co + ext));
+            eprintln!(
+                "[G2-counter-breakdown] {} distinct kernels with dynamic args:",
+                sorted.len()
+            );
+            for (name, (co, ext, total)) in sorted.iter().take(20) {
+                eprintln!(
+                    "  {:>40}  counter-only-ops={:>4} external-ops={:>3} total-dyn-args={:>4}",
+                    name, co, ext, total
+                );
+            }
+        }
+
         Some(Self {
             ops,
             dynamic_args,
@@ -1276,6 +1305,12 @@ impl DecodeGraph {
             &self.dynamic_ops
         };
 
+        // Phase T2 instrumentation: time the patch loop and the launch
+        // separately so we know how much wall-clock the per-replay
+        // hipGraphExecKernelNodeSetParams storm actually costs.
+        let bench = std::env::var("CANDLE_G3_PATCH_TIME").is_ok();
+        let t_patch_start = if bench { Some(std::time::Instant::now()) } else { None };
+
         for &op_i in patch_set {
             let op = &plan.ops[op_i];
             // Refresh the pointer storage — arg_values backing Vec should
@@ -1328,9 +1363,29 @@ impl DecodeGraph {
             }
         }
 
+        let t_launch_start = if bench {
+            let t_patch = t_patch_start.unwrap().elapsed();
+            eprintln!(
+                "[T2-time] patch loop ({} ops): {} µs",
+                patch_set.len(),
+                t_patch.as_micros()
+            );
+            Some(std::time::Instant::now())
+        } else { None };
+
         self.exec
             .launch(dev.stream())
             .map_err(|e| crate::Error::wrap(e))?;
+
+        if let Some(t) = t_launch_start {
+            // Don't sync — measure only the launch (CPU dispatch) cost,
+            // not GPU execution. That's what set_kernel_node_params would
+            // be amortised against.
+            eprintln!(
+                "[T2-time] hipGraphLaunch:        {} µs",
+                t.elapsed().as_micros()
+            );
+        }
         Ok(())
     }
 
