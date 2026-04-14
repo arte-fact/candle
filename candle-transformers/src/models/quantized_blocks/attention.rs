@@ -723,6 +723,98 @@ impl StandardAttention {
         Ok(Some((k, v)))
     }
 
+    /// Compute K, V, and Q projections with **fused rmsnorm + Q8_1 quantization**.
+    ///
+    /// Saves 1 quantize_q8_1 launch per layer/token by fusing the pre-attention
+    /// rmsnorm with the Q8 quantization: a single `rmsnorm_q8_fused` produces
+    /// both the f32 norm output (returned for fallback paths) and the Q8_1
+    /// buffer used by all three projections.
+    ///
+    /// Returns `Some((q, k, v, x_norm_f32))` if conditions met, else `None`.
+    /// Caller can use `x_norm_f32` for downstream fallback paths that need the
+    /// f32 normalized activation.
+    #[cfg(feature = "hip")]
+    pub fn compute_qkv_norm_q8_fused(
+        &self,
+        layer_in: &Tensor,
+        norm_weight: &Tensor,
+        norm_eps: f64,
+        offset: usize,
+    ) -> Result<Option<(Tensor, Tensor, Tensor, Tensor)>> {
+        use candle::quantized::hip::{pad, MATRIX_ROW_PADDING};
+        use candle::quantized::GgmlDType;
+
+        let (b_sz, seq_len, hidden) = layer_in.dims3()?;
+        let b_size = b_sz * seq_len;
+
+        // Same gating as compute_qkv_shared_q8 — small batch, all qtensors,
+        // HIP f32 contiguous input.
+        if b_size > 8
+            || !matches!(layer_in.device(), candle::Device::Hip(_))
+            || layer_in.dtype() != candle::DType::F32
+            || !layer_in.is_contiguous()
+        {
+            return Ok(None);
+        }
+        let wk = match &self.wk { Some(wk) => wk, None => return Ok(None) };
+        let wv = match &self.wv { Some(wv) => wv, None => return Ok(None) };
+        if !self.wq.is_qtensor() || !wk.is_qtensor() || !wv.is_qtensor() {
+            return Ok(None);
+        }
+        // The fused rmsnorm_q8_fused requires hidden to be a multiple of 32 (QK8_1).
+        if hidden % 32 != 0 {
+            return Ok(None);
+        }
+
+        // Single fused kernel: rmsnorm + quantize_q8_1. Returns the Q8 buffer
+        // and the f32 norm output (we keep both — fallbacks may need the f32).
+        let (q8_buf, x_norm_opt) = candle::hip_backend::rmsnorm_q8_fused(
+            layer_in, norm_weight, norm_eps, /*need_f32=*/true,
+        )?;
+        let x_norm = x_norm_opt.ok_or_else(|| candle::Error::Msg(
+            "compute_qkv_norm_q8_fused: rmsnorm_q8_fused returned no f32 tensor".into()
+        ))?;
+        let q8_view = q8_buf.slice(0..q8_buf.len());
+
+        let rhs_shape = layer_in.dims();
+
+        // Sanity-check: the q8 buffer must fit the projected blocks_per_row stride.
+        let _ncols_padded = pad(hidden, MATRIX_ROW_PADDING);
+        let _q8_bytes = b_size * _ncols_padded
+            * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
+
+        // Q
+        let q_raw = self.wq.forward_preq8(&q8_view, b_size, rhs_shape)?;
+        let mut q = q_raw
+            .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        if let Some(ref qn) = self.q_norm { q = qn.forward(&q)?; }
+        let q = self.rotary.apply_one(&q, offset)?;
+
+        // K
+        let k_raw = wk.forward_preq8(&q8_view, b_size, rhs_shape)?;
+        let k_3d = k_raw
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        // V
+        let v_raw = wv.forward_preq8(&q8_view, b_size, rhs_shape)?;
+        let v_pre = v_raw
+            .reshape((b_sz, seq_len, self.n_kv_head, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+
+        let k = if let Some(ref kn) = self.k_norm { kn.forward(&k_3d)? } else { k_3d };
+        let v = if let Some(eps) = self.v_norm_eps {
+            super::norms::v_norm(&v_pre, eps)?
+        } else { v_pre };
+        let k = self.rotary.apply_one(&k, offset)?;
+
+        Ok(Some((q, k, v, x_norm)))
+    }
+
     /// Compute K, V, and Q projections with **shared Q8_1 quantization**.
     ///
     /// When all three projections consume the same normalized activation

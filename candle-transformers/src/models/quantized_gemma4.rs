@@ -1312,19 +1312,36 @@ impl ModelWeights {
 
             // -------- attention block --------
             let residual = layer_in.clone();
-            let x_norm = self.layers[il].attn_norm.forward(&layer_in)?;
 
-            // D2 optimization: try shared Q8_1 quantization for Q/K/V projections.
-            // When x_norm feeds wq, wk, wv separately, pre-quantizing once saves
-            // 2 quantize_q8_1 kernel launches per layer.
+            // Try the fused norm+Q8_1 path first: replaces `attn_norm.forward`
+            // + `compute_qkv_shared_q8`'s internal quantize_q8_1 with a single
+            // `rmsnorm_q8_fused` kernel. Saves 1 launch per layer per token.
+            // Falls back to the unfused path when conditions aren't met
+            // (large batch, non-quantized weights, etc.).
             #[cfg(feature = "hip")]
-            let shared_qkv = if has_kv {
-                self.layers[il].attn.compute_qkv_shared_q8(&x_norm, index_pos)?
+            let (shared_qkv, x_norm) = if has_kv {
+                if let Some((q, k, v, x_norm)) = self.layers[il].attn
+                    .compute_qkv_norm_q8_fused(
+                        &layer_in,
+                        self.layers[il].attn_norm.weight(),
+                        self.layers[il].attn_norm.eps_f32() as f64,
+                        index_pos,
+                    )?
+                {
+                    (Some((q, k, v)), x_norm)
+                } else {
+                    let x_norm = self.layers[il].attn_norm.forward(&layer_in)?;
+                    let shared = self.layers[il].attn.compute_qkv_shared_q8(&x_norm, index_pos)?;
+                    (shared, x_norm)
+                }
             } else {
-                None
+                (None, self.layers[il].attn_norm.forward(&layer_in)?)
             };
             #[cfg(not(feature = "hip"))]
-            let shared_qkv: Option<(candle::Tensor, candle::Tensor, candle::Tensor)> = None;
+            let (shared_qkv, x_norm): (Option<(candle::Tensor, candle::Tensor, candle::Tensor)>, candle::Tensor) = (
+                None,
+                self.layers[il].attn_norm.forward(&layer_in)?,
+            );
 
             // Compute fresh K/V if this layer owns its cache and append
             // them to the pre-allocated `KvCache`.
