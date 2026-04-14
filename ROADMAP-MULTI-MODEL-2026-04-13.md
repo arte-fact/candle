@@ -108,26 +108,39 @@ multiple K-blocks at once, amortising the VMEM cost across more compute.
 Less effective than I1 because root cause (non-coalesced HBM reads)
 isn't fixed. **Effort:** ~1 day. **Confidence:** lower.
 
-#### I3 — Dequant-to-f16 + rocBLAS sgemm *(experimental)*
+#### I3 — Dequant-to-f16 + rocBLAS sgemm *(LANDED, NEGATIVE result)*
 
-For prefill where M, N, K are large, dequantize Q4_0 → f16 once, then
-let rocBLAS handle the gemm. rocBLAS has heavily-tuned Tensile kernels
-for f16/f32. On gfx906 there's no MFMA so the win isn't huge, but
-rocBLAS may still beat our hand-tuned kernel for skinny-tall shapes.
+Status (commit `dcdb9532`, 2026-04-14): bench landed
+(`examples/hip_mmq_rocblas_bench.rs`). **rocBLAS gemm_ex f16×f16→f32
+is 18 % SLOWER** than the custom MMQ Q4_0 on (M=14336, K=2048, N=874):
+  - Path A (MMQ Q4_0):      6356 µs/call,  18.5 MB HBM read
+  - Path B (rocBLAS f16):   7748 µs/call,  62.3 MB HBM read
 
-Worth a 1-day benchmark to know if this is a real path. Likely
-preferable for very long prefill where the dequant cost amortizes well.
+3.4× more bytes (f16=2 B/value vs Q4_0=0.56), no MFMA on gfx906 to
+recoup the bandwidth disadvantage, and dp4a (v_dot4_i32_i8) gives
+4 ops/cycle/lane vs scalar FMA's 2 ops/cycle/lane — the custom MMQ
+is on the better instruction. Tensile kernels for gfx906 are old/
+unmaintained.
 
-**Effort:** ~1 day for the bench + decision; integration depends on
-the result.
+**Conclusion: the MMQ Q4_0 kernel is at the gfx906 hardware ceiling.**
+I1 (4 % win) and I3 (18 % loss) together confirm it. Without MFMA,
+no straightforward path to bigger MMQ speedup.
 
-**Owner:** TBD. **Order (revised post-I1):** **I3 first** — I1 only
-yielded 4 % per-call so the dp4a-chain is the real ceiling. rocBLAS
-sgemm via dequant-to-f16 may break that ceiling entirely (Tensile
-kernels use f32-accum FMA pipelines which don't have the chain
-serialisation problem). If I3 is a clear win, integrate that and
-shelve I1's repack integration. I2 deprioritised (would attack the
-same already-not-bottleneck X cacheline issue).
+Future prefill speedup requires a different attack vector:
+  - Phase S (TurboQuant 3-bit) — halves the weight bytes per call;
+    helps the bandwidth-bound long-prefill MMQ regime directly.
+  - Phase U2 (causal/SWA tile skipping) — long-context attention only;
+    orthogonal to MMQ.
+  - Phase G2/G3 maturation (Phase T) — cuts CPU-side overhead, helps
+    short-prompt prefill where MMQ isn't the bottleneck yet.
+
+**Owner:** TBD. **Order (revised post-I3, 2026-04-14):** **Phase I
+DONE/SHELVED.** I1 (4 % win) and I3 (18 % loss) both confirmed: the
+custom MMQ Q4_0 kernel is at the gfx906 hardware ceiling. dp4a beats
+both (a) X-coalescing optimisations and (b) f16 GEMM with rocBLAS.
+No further kernel-level Phase I work planned. Pivot prefill speedup
+to Phase S (TurboQuant 3-bit) which attacks the same MMQ bucket via
+data-volume reduction, and Phase U2 / Phase T for orthogonal wins.
 
 ### Phase J — Fix Qwen3.5 correctness bug
 
