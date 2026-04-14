@@ -767,6 +767,37 @@ would collide with G2 plan capture if Q1 isn't done first).
 
 ### Phase T — G2/G3 maturation (close the regression vs default)
 
+> **Status update 2026-04-14 (end-of-Phase-T checkpoint):**
+> - **T1 DONE** (commit `c6642007`) — split-L_k grid stability fix. Correctness only.
+> - **T4 DONE** (commit `fbc8b240`) — Relaxed capture mode default. Diagnostic; perf-equivalent.
+> - **T2 PARTIAL** (commit `a5c5374c` first kernel pair, `b817182e`/`f0547286` diagnostics) —
+>   `g3_counters` infrastructure landed. `gqa_decode_mv_fast_d{256,512}_f32_ctr`
+>   converted = +5 % G3 decode (60.84 vs 58 t/s on E4B Q4_0 short prompt).
+>   Patches dropped 326 → 284. Per arg-position breakdown the remaining
+>   240 counter-only ops all have ≥1 8-byte pointer arg as a "Counter"
+>   (rope cos/sin pointer-strides; copy2d dst pointer; const_set unclear).
+>   Continuing T2 needs the deeper `(base_ptr, offset_table)` kernel-
+>   signature redesign — multi-day work, paused.
+> - **T3 NOT STARTED** — but actual measurement done via
+>   `CANDLE_G2_PHASE_TIME=1`: prelude costs **246 µs/tok** in G3 mode
+>   (li=55 µs CPU embed, pe=166 µs per_layer rocBLAS gemm, swa=25 µs
+>   mask). Total G3 forward = 1480 µs/tok; prelude = 17 % of that.
+>   Maximum theoretical T3 win = +20 % wall-clock IF all prelude moves
+>   into the graph. Phase K13 documented blocker on requantizing
+>   model_proj to Q8_0 (decode_alloc cursor desync). Solving needs a
+>   reserved-slot decode_alloc strategy or completely separate
+>   prelude-capture pipeline. Multi-day work.
+> - **T5 NOT STARTED** — exploratory multi-stream topology.
+>
+> **Realistic Phase T closure:** T1 + T4 + T2-first-kernel landed, with
+> +5 % wall-clock decode under G3. Default (66 t/s) still beats G3
+> (61 t/s); closing the gap needs T2-rest (~+3 % more) and T3 (~+20 %
+> if achievable) — both multi-day. The architectural infrastructure
+> (`g3_counters`, `_ctr` kernel pattern, per-replay slot refresh) is
+> in place for follow-up sessions.
+
+
+
 After Phase R1 (split-L_k attention) raised default-path decode to
 65 t/s short / 63 t/s long, G2/G3 is *slower* than default (57-59 t/s).
 Five issues identified by code review + AMD documentation cross-check.
