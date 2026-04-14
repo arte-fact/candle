@@ -189,9 +189,18 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
     // (`_fwd_d{N}_f32` family always uses default vs_d=1, vs_j=D).
     // In that case both K and V are stride-1 along the contiguous d
     // axis: load 4 floats per thread per VMEM transaction = 4× fewer
-    // global_load instructions vs the scalar dwordx1 path. K_TRANS=true
-    // (kt / ktvs variants) keeps the scalar loop because K's stride
-    // along d is L_k, not vectorizable.
+    // global_load instructions vs the scalar dwordx1 path.
+    //
+    // Phase U1b — K_TRANS coalesced thread mapping. For ktvs (K_TRANS=true
+    // + strided V) gemma4/Qwen prefill case, K is stored as (D, max_T)
+    // with ks_j=1 (stride-1 along row) and V mirrors with vs_j=1, vs_d=maxT.
+    // The original (j, d) thread mapping has adjacent threads on adjacent d
+    // → for K_TRANS that's `k_ptr[d*ks_d + row]` with ks_d = max_T (large) →
+    // each thread hits a different cacheline (64 cachelines per wave).
+    // Re-mapping to (d, j) order puts adjacent threads on adjacent row →
+    // stride-1 reads from K[d][row..row+W] = single cacheline per wave-quad.
+    // Same for V. Inner loop reads `k_lds[j*D + d]` are unchanged — only
+    // the *write* order to LDS swaps.
     constexpr bool VECTORIZE = (!K_TRANS) && (D % 4 == 0);
     constexpr int VEC = 4;
     constexpr int TILE_QUADS = TILE_ELEMS / VEC;
@@ -204,8 +213,7 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
 
         // ---- Cooperative load of K/V tile into LDS. ----
         if constexpr (VECTORIZE) {
-            // Threads stride through TILE_QUADS in steps of THREADS_PER_BLOCK,
-            // each iteration reads one 16-byte chunk of K and one of V.
+            // !K_TRANS: float4 along d. Both K and V row-major contiguous.
             #pragma unroll
             for (int il = 0; il < LOADS_PER_THREAD_QUAD; ++il) {
                 const int qidx = tid + il * THREADS_PER_BLOCK;
@@ -225,9 +233,44 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
                     *reinterpret_cast<float4 *>(&v_lds[j * D + d_base]) = v4;
                 }
             }
+        } else if constexpr (K_TRANS && D != 512) {
+            // K_TRANS coalesced path: re-map tid → (d, j) so adjacent
+            // threads have adjacent j (the stride-1 axis for K_TRANS K
+            // and for V when vs_j=1, the ktvs case). Reads coalesce into
+            // 1 cacheline per 16-thread group instead of 1 per thread.
+            //
+            // **Gated to D != 512** because at D=512 the wrappers run with
+            // __launch_bounds__(256, 1) — only 1 wave/EU. The (d, j) write
+            // pattern hits N-way LDS bank conflicts (N = lanes_per_d_group)
+            // because k_lds[j*D + d] with D=512 → bank = (4*j*D + 4*d) % 128
+            // = 4*d % 128 (D*j wraps mod 128 since D=512=4*128). All
+            // threads sharing the same d hit the same bank. With 1 wave/EU
+            // we can't hide the conflict latency, and the regression
+            // outweighs the K coalescing win. Profiling confirmed:
+            //   d256 (occupancy=2): -22% kernel time (1179→925 ms total)
+            //   d512 (occupancy=1): +18% kernel time (460→543 ms total) ← bad
+            // Falls through to scalar fallback at D=512.
+            //
+            // Falls through to runtime check on ks_j and vs_j; the
+            // gemma4/Qwen ktvs callers always pass ks_j=1, vs_j=1 so this
+            // is the dominant path. If either != 1 (some future caller),
+            // the access is still correct, just non-coalesced.
+            #pragma unroll
+            for (int il = 0; il < LOADS_PER_THREAD; ++il) {
+                const int idx = tid + il * THREADS_PER_BLOCK;
+                if (idx < TILE_ELEMS) {
+                    const int d = idx / BC;
+                    const int j = idx % BC;
+                    const int row = k_start + j;
+                    const bool valid = (row < L_k_effective);
+                    k_lds[j * D + d] = valid ? k_ptr[d * ks_d + row * ks_j] : 0.0f;
+                    v_lds[j * D + d] = valid ? v_ptr[row * vs_j + d * vs_d] : 0.0f;
+                }
+            }
         } else {
-            // Scalar fallback: K_TRANS=true (strided K) or D not multiple of 4.
-            // Threads stride through [0, BC*D) in steps of THREADS_PER_BLOCK.
+            // Original scalar fallback (D not multiple of 4 or some other
+            // pathological case). Adjacent threads → adjacent d; works
+            // for K_TRANS=false where K row-major along d.
             #pragma unroll
             for (int il = 0; il < LOADS_PER_THREAD; ++il) {
                 const int idx = tid + il * THREADS_PER_BLOCK;
@@ -236,15 +279,7 @@ static __device__ __forceinline__ void flash_attn_fwd_v2_impl(
                     const int d = idx % D;
                     const int row = k_start + j;
                     const bool valid = (row < L_k_effective);
-                    // K layout:
-                    //   standard (L_k, D) contiguous → k[row*D + d]
-                    //   transposed (D, L_k) default  → k[d*L_k + row]
-                    //   transposed + explicit strides → k[d*ks_d + row*ks_j]
-                    if (K_TRANS) {
-                        k_lds[idx] = valid ? k_ptr[d * ks_d + row * ks_j] : 0.0f;
-                    } else {
-                        k_lds[idx] = valid ? k_ptr[row * D + d] : 0.0f;
-                    }
+                    k_lds[idx] = valid ? k_ptr[row * D + d] : 0.0f;
                     v_lds[idx] = valid ? v_ptr[row * vs_j + d * vs_d] : 0.0f;
                 }
             }
