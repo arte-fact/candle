@@ -544,12 +544,16 @@ fn mul_mat_q_v2(
         .and_then(|s| s.parse().ok())
         .unwrap_or(32);
 
-    // MMQ turbo-port gate. Q4_0 (M2) and Q4_1 (M3a) covered.
+    // MMQ turbo-port gate. Q4_0 (M2), Q4_1 (M3a), Q8_0 (M3c) covered.
     // See candle-hip-kernels/src/mmq_turbo.cu.
     let turbo_on = std::env::var("CANDLE_MMQ_TURBO_PORT")
         .map(|v| v == "1")
         .unwrap_or(false);
-    if turbo_on && (dtype == GgmlDType::Q4_0 || dtype == GgmlDType::Q4_1) {
+    if turbo_on
+        && (dtype == GgmlDType::Q4_0
+            || dtype == GgmlDType::Q4_1
+            || dtype == GgmlDType::Q8_0)
+    {
         if let Some(out) = mul_mat_q40q41_turbo(data, y, dtype, ncols, nrows, total_b, dev)? {
             return Ok(Some(out));
         }
@@ -582,6 +586,7 @@ fn mul_mat_q40q41_turbo(
     let dtype_tag = match dtype {
         GgmlDType::Q4_0 => "q4_0",
         GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q8_0 => "q8_0",
         _ => return Ok(None),
     };
 
@@ -597,10 +602,12 @@ fn mul_mat_q40q41_turbo(
             dtype_tag, y.len()
         )
     }
-    // K must be a multiple of MMQ_ITER_K=256 (8 weight blocks, 2 mmq blocks
-    // per outer K-iter). The K-loop doesn't handle partial tails.
-    const MMQ_ITER_K: usize = 256;
-    if ncols % MMQ_ITER_K != 0 {
+    // K (ncols) only needs to be a multiple of QK=32 (the Q4_0/Q4_1 block
+    // size). M3b: the kernel handles non-multiple-of-256 K via in-kernel
+    // OOB clamp in load_tiles (kb_remaining param zeroes d/dm contributions
+    // for OOB blocks).
+    const QK: usize = 32;
+    if ncols % QK != 0 {
         return Ok(None);
     }
     // Non-aligned M (nrows): use the `_checked` kernel variant which
@@ -630,22 +637,29 @@ fn mul_mat_q40q41_turbo(
     };
 
     // Allocate + populate the turbo-layout Q8_1 buffer.
-    //   size = n_big_blocks * total_b_padded * 144 bytes
-    let n_big_blocks = ncols / BIG_BLOCK_ELEMS;
+    // n_big_blocks_real: ceil(K/128) — number of big-blocks the quantize
+    //   kernel will write (last one may have partial valid range; the
+    //   kernel's `ki < ncols` guard zeroes the K-tail).
+    // n_big_blocks_alloc: + 1 extra so the K-loop's "second half" read at
+    //   the last kb0 iter has a valid (zeroed) destination — the M3b
+    //   kernel reads big-blocks (kb0/4) and (kb0/4 + 1).
+    let n_big_blocks_real = ncols.div_ceil(BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
     let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
-    let y_mmq_size_bytes = n_big_blocks * total_b_padded * Q8_1_MMQ_BYTES;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_b_padded * Q8_1_MMQ_BYTES;
 
-    // Zero-fill so OOB cols (total_b..total_b_padded) contribute nothing.
+    // Zero-fill: OOB cols (total_b..total_b_padded) and the tail big-block
+    // both stay zero, contributing nothing to vec_dot.
     let mut y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
 
     // Quantize f32 y → block_q8_1_mmq laid out (big_block, col).
-    //   grid = (n_big_blocks, total_b, 1), block = (128, 1, 1).
+    //   grid = (n_big_blocks_real, total_b, 1), block = (128, 1, 1).
     let qkernel = dev.get_or_load_func(
         "quantize_q8_1_mmq_q4_0",
         &candle_hip_kernels::MMQ_TURBO,
     )?;
     let qcfg = hipdarc::driver::LaunchConfig {
-        grid_dim: (n_big_blocks as u32, total_b as u32, 1),
+        grid_dim: (n_big_blocks_real as u32, total_b as u32, 1),
         block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -671,14 +685,19 @@ fn mul_mat_q40q41_turbo(
         let pad = MMQ_NWARPS as usize * WARP_SIZE;
         raw.div_ceil(pad) * pad
     };
-    let x_qs_ints = MMQ_Y * (MMQ_TILE_NE_K + 1);
-    // QI4_0 == QI4_1 == 4 (4 ints per 32-element block).
-    const QI: usize = 4;
-    let x_df_flts = MMQ_Y * (MMQ_TILE_NE_K / QI) + MMQ_Y / QI;
+    // Q8_0 LDS has 2× x_qs (full int per 4 values, not 0.5 int per 4 nibble-
+    // pairs); x_df size matches Q4_0 by coincidence.
+    let x_qs_ints = match dtype {
+        GgmlDType::Q8_0 => MMQ_Y * (2 * MMQ_TILE_NE_K + 1),
+        _ => MMQ_Y * (MMQ_TILE_NE_K + 1),
+    };
+    // QI4_0 == QI4_1 == 4, QI8_0 == 8; x_df formula is mmq_y*8 + mmq_y/4
+    // either way (for mmq_y=128 that's 1056 floats).
+    let x_df_flts = MMQ_Y * 8 + MMQ_Y / 4;
     let shared_mem_bytes = (tile_y_ints + x_qs_ints) * 4 + x_df_flts * 4;
 
     // Launch the MMQ kernel.
-    let blocks_per_row_x = ncols / 32; // Q4_0 stride per X row (in blocks).
+    let blocks_per_row_x = ncols / 32; // Q4_0/Q4_1/Q8_0 all have 32 elems/block.
     let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
     let cfg = hipdarc::driver::LaunchConfig {
         grid_dim: (

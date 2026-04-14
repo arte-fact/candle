@@ -54,6 +54,16 @@ typedef struct {
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == 4 + QK4_1 / 2, "block_q4_1 size");
 
+// Q8_0: 32 int8 qs + half d, no -8 offset (already signed).
+#define QK8_0 32
+#define QR8_0 1
+#define QI8_0 (QK8_0 / (4 * QR8_0))   // 8 ints per Q8_0 block
+typedef struct {
+    half    d;
+    int8_t  qs[QK8_0];
+} block_q8_0;
+static_assert(sizeof(block_q8_0) == 2 + QK8_0, "block_q8_0 size");
+
 #define QK8_1 32
 #define QR8_1 1
 #define QI8_1 (QK8_1 / (4 * QR8_1))   // 8 ints per Q8_1 block
@@ -87,6 +97,7 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "block_q8_1_mmq size");
 #define MMQ_TILE_Y_K  (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)  // = 36 ints/col per Y half-tile
 #define MMQ_ITER_K    256                                // K elements consumed per outer iter
 #define VDR_Q4_0_Q8_1_MMQ 4
+#define VDR_Q8_0_Q8_1_MMQ 8
 
 // LDS layout sizes (DP4A path, per turbo MMQ_DP4A_TXS_Q4_0):
 //   x_qs: mmq_y*(MMQ_TILE_NE_K + 1)                 ints   (33 per row, +1 bank pad)
@@ -94,6 +105,12 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "block_q8_1_mmq size");
 //   y_qs: mmq_x * MMQ_TILE_Y_K                      ints   (36 per col)
 #define X_QS_INTS (MMQ_Y * (MMQ_TILE_NE_K + 1))
 #define X_DF_FLTS (MMQ_Y * (MMQ_TILE_NE_K / QI4_0) + MMQ_Y / QI4_0)
+
+// Q8_0 has 2× K per row in x_qs (each int is a full 4 int8s, not 2 nibble-pairs),
+// so x_qs is 128 × 65 = 8320 ints (vs Q4_0's 128 × 33 = 4224).  x_df size
+// matches Q4_0 by coincidence (both come out to 1056 floats for mmq_y=128).
+#define X_QS_INTS_Q8_0 (MMQ_Y * (2 * MMQ_TILE_NE_K + 1))
+#define X_DF_FLTS_Q8_0 (MMQ_Y * (2 * MMQ_TILE_NE_K / QI8_0) + MMQ_Y / (QI8_0 / 2))
 
 // Pad Y tile size up to a multiple of nwarps*warp_size to match turbo's
 // cooperative-load stride.
@@ -164,6 +181,22 @@ static __device__ __forceinline__ float q4_1_q8_1_dp4a_4(
     const float2 ds8f = __half22float2(ds8);
     // "QI8_1/(vdr*QR4_1) = 8/(4*2) = 1" so the divisor drops out.
     return sumi * (dm4f.x * ds8f.x) + (dm4f.y * ds8f.y);
+}
+
+// Port of turbo vecdotq.cuh:266-278 (vec_dot_q8_0_q8_1_impl<float, vdr=8>).
+// Q8_0 has no nibble split: straight 8 dp4a calls on 8 ints of v and u,
+// scaled by d_x * d_y.
+static __device__ __forceinline__ float q8_0_q8_1_dp4a_8(
+    const int * v,          // 8 ints of Q8_0 qs
+    const int * u,          // 8 ints of Q8_1 qs
+    const float d_x,        // Q8_0 delta
+    const float d_y) {      // Q8_1 delta
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sumi = dp4a_sdot4(v[i], u[i], sumi);
+    }
+    return d_x * d_y * (float) sumi;
 }
 
 // ================================================================
@@ -238,32 +271,37 @@ static __device__ __forceinline__ void load_tiles_q4_0(
     float *      __restrict__ x_df,   // LDS x_df (scales)
     const int kbx0,                   // starting Q4_0 block index for this tile's K-window
     const int i_max,                  // row upper bound (for need_check)
+    const int kb_remaining,           // # of valid blocks in this K-iter (1..8)
     const int stride_row_x) {         // Q4_0 blocks per X row
 
-    // tile_x row = MMQ_Y=128.  Each K-iter (ITER_K=256 elements = 8 Q4_0 blocks)
-    // loads 32 ints per row = 8 blocks × 4 ints/block.  threads_per_row = 32.
     constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_0);  // = 32
     constexpr int nrows           = WARP_SIZE / threads_per_row; // = 2
     const int txi  = threadIdx.x % threads_per_row;            // 0..31
     const int kbx  = txi / QI4_0;                              // 0..7 (block within K-iter)
     const int kqsx = txi % QI4_0;                              // 0..3 (int within block)
 
+    // K-OOB handling: for kbx >= kb_remaining, clamp the read to the last
+    // valid block. The qs values land in tile_x positions that the next
+    // load (x_df) zeros out via dm/d=0 for the same gk, so the contribution
+    // to vec_dot is 0 regardless of the (possibly-duplicated) qs.
+    const int kbx_safe = (kbx < kb_remaining) ? kbx : (kb_remaining - 1);
+
 #pragma unroll
     for (int i0 = 0; i0 < MMQ_Y; i0 += nrows * MMQ_NWARPS) {
-        // Each thread loads row i. Per-warp: rows [i0 + y*nrows .. +nrows-1].
         int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         if (need_check) {
             i = (i < i_max) ? i : i_max;
         }
-        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i * stride_row_x + kbx;
+        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i * stride_row_x + kbx_safe;
         const int qs0 = get_int_b2(bxi->qs, kqsx);
         x_qs[i * (MMQ_TILE_NE_K + 1) + txi] = qs0;
     }
 
-    // Scales x_df.  blocks_per_tile_x_row = 8 (one Q4_0 block per K-iter step=32).
     constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI4_0;   // = 8
     constexpr int rows_per_warp         = WARP_SIZE / blocks_per_tile_x_row; // = 8
     const int kbxd = threadIdx.x % blocks_per_tile_x_row;          // 0..7
+    const bool kbxd_valid = (kbxd < kb_remaining);
+    const int kbxd_safe = kbxd_valid ? kbxd : 0;
 
 #pragma unroll
     for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS * rows_per_warp) {
@@ -271,8 +309,9 @@ static __device__ __forceinline__ void load_tiles_q4_0(
         if (need_check) {
             i = (i < i_max) ? i : i_max;
         }
-        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i * stride_row_x + kbxd;
-        x_df[i * (MMQ_TILE_NE_K / QI4_0) + i / QI4_0 + kbxd] = __half2float(bxi->d);
+        const block_q4_0 * bxi = (const block_q4_0 *) x + kbx0 + i * stride_row_x + kbxd_safe;
+        const float d = kbxd_valid ? __half2float(bxi->d) : 0.0f;
+        x_df[i * (MMQ_TILE_NE_K / QI4_0) + i / QI4_0 + kbxd] = d;
     }
 }
 
@@ -370,17 +409,26 @@ static __device__ void mul_mat_q4_0_turbo_impl(
 
     // K-loop iterates in units of blocks_per_iter = MMQ_ITER_K / QK4_0 = 8 Q4_0 blocks.
     constexpr int blocks_per_iter = MMQ_ITER_K / QK4_0;  // = 8
-    const int kb0_stop = ncols_x / QK4_0;
+    const int n_blocks_x = ncols_x / QK4_0;              // real blocks per row
+    // Round kb0 stop up so we cover any partial tail.  load_tiles handles
+    // OOB blocks via kb_remaining; vec_dot's contribution from OOB is 0
+    // because d/d_y is zeroed for OOB.
+    const int kb0_stop = (n_blocks_x + blocks_per_iter - 1)
+                         / blocks_per_iter * blocks_per_iter;
 
     const int i_max = nrows_x - it * MMQ_Y - 1;
 
     for (int kb0 = 0; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int kb_remaining =
+            (n_blocks_x - kb0 < blocks_per_iter) ? (n_blocks_x - kb0)
+                                                 : blocks_per_iter;
         // Load X tile (128 rows × 8 Q4_0 blocks = 256 K-elements per row).
         load_tiles_q4_0<need_check>(
             (const char *) vx,
             x_qs, x_df,
             it * MMQ_Y * stride_row_x + kb0,
             (need_check ? i_max : 0),
+            kb_remaining,
             stride_row_x);
 
         // Load Y first half: mmq_x cols × 1 Q8_1_mmq block (128 K-elements).
@@ -447,6 +495,7 @@ static __device__ __forceinline__ void load_tiles_q4_1(
     half2 *      __restrict__ x_dm,
     const int kbx0,
     const int i_max,
+    const int kb_remaining,           // # of valid blocks in this K-iter (1..8)
     const int stride_row_x) {
 
     constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_1);  // = 32
@@ -455,13 +504,15 @@ static __device__ __forceinline__ void load_tiles_q4_1(
     const int kbx  = txi / QI4_1;
     const int kqsx = txi % QI4_1;
 
+    const int kbx_safe = (kbx < kb_remaining) ? kbx : (kb_remaining - 1);
+
 #pragma unroll
     for (int i0 = 0; i0 < MMQ_Y; i0 += nrows * MMQ_NWARPS) {
         int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         if (need_check) {
             i = (i < i_max) ? i : i_max;
         }
-        const block_q4_1 * bxi = (const block_q4_1 *) x + kbx0 + i * stride_row_x + kbx;
+        const block_q4_1 * bxi = (const block_q4_1 *) x + kbx0 + i * stride_row_x + kbx_safe;
         const int qs0 = get_int_b4(bxi->qs, kqsx);
         x_qs[i * (MMQ_TILE_NE_K + 1) + txi] = qs0;
     }
@@ -469,6 +520,8 @@ static __device__ __forceinline__ void load_tiles_q4_1(
     constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI4_1;   // = 8
     constexpr int rows_per_warp         = WARP_SIZE / blocks_per_tile_x_row; // = 8
     const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+    const bool kbxd_valid = (kbxd < kb_remaining);
+    const int kbxd_safe = kbxd_valid ? kbxd : 0;
 
 #pragma unroll
     for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS * rows_per_warp) {
@@ -476,8 +529,9 @@ static __device__ __forceinline__ void load_tiles_q4_1(
         if (need_check) {
             i = (i < i_max) ? i : i_max;
         }
-        const block_q4_1 * bxi = (const block_q4_1 *) x + kbx0 + i * stride_row_x + kbxd;
-        x_dm[i * (MMQ_TILE_NE_K / QI4_1) + i / QI4_1 + kbxd] = bxi->dm;
+        const block_q4_1 * bxi = (const block_q4_1 *) x + kbx0 + i * stride_row_x + kbxd_safe;
+        const half2 dm = kbxd_valid ? bxi->dm : __floats2half2_rn(0.0f, 0.0f);
+        x_dm[i * (MMQ_TILE_NE_K / QI4_1) + i / QI4_1 + kbxd] = dm;
     }
 }
 
@@ -562,15 +616,21 @@ static __device__ void mul_mat_q4_1_turbo_impl(
 
     const int * y_base = (const int *) vy + jt * mmq_x * Q8_1_MMQ_INTS;
     constexpr int blocks_per_iter = MMQ_ITER_K / QK4_1;  // = 8
-    const int kb0_stop = ncols_x / QK4_1;
+    const int n_blocks_x = ncols_x / QK4_1;
+    const int kb0_stop = (n_blocks_x + blocks_per_iter - 1)
+                         / blocks_per_iter * blocks_per_iter;
     const int i_max = nrows_x - it * MMQ_Y - 1;
 
     for (int kb0 = 0; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int kb_remaining =
+            (n_blocks_x - kb0 < blocks_per_iter) ? (n_blocks_x - kb0)
+                                                 : blocks_per_iter;
         load_tiles_q4_1<need_check>(
             (const char *) vx,
             x_qs, x_dm,
             it * MMQ_Y * stride_row_x + kb0,
             (need_check ? i_max : 0),
+            kb_remaining,
             stride_row_x);
 
         const int * by0 =
@@ -596,6 +656,199 @@ static __device__ void mul_mat_q4_1_turbo_impl(
         __syncthreads();
 
         vec_dot_q4_1_q8_1_dp4a<mmq_x>(x_qs, x_dm, tile_y, sum, MMQ_TILE_NE_K);
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+        const int j = j0 + threadIdx.y;
+        const int col_g = jt * mmq_x + j;
+        if (col_g >= ncols_y) return;
+#pragma unroll
+        for (int i0 = 0; i0 < MMQ_Y; i0 += WARP_SIZE) {
+            const int i = i0 + threadIdx.x;
+            const int row_g = it * MMQ_Y + i;
+            if (need_check && row_g >= nrows_x) continue;
+            dst[(size_t)col_g * nrows_dst + row_g] =
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y / WARP_SIZE) + i0 / WARP_SIZE];
+        }
+    }
+}
+
+// ================================================================
+// load_tiles_q8_0
+// Port of turbo mmq.cuh:695-776 (DP4A path; software-pipeline stripped).
+// Each thread loads 2 Q8_0 blocks (kbx and kbx+4) into LDS because
+// each Q8_0 block is 8 ints (vs Q4_0's 4 after nibble packing).
+// ================================================================
+
+template <bool need_check>
+static __device__ __forceinline__ void load_tiles_q8_0(
+    const char * __restrict__ x,
+    int *        __restrict__ x_qs,
+    float *      __restrict__ x_df,
+    const int kbx0,
+    const int i_max,
+    const int kb_remaining,         // 1..8 valid Q8_0 blocks this K-iter
+    const int stride_row_x) {
+
+    constexpr int threads_per_row = 32;
+    constexpr int nrows           = WARP_SIZE / threads_per_row;  // = 2
+    const int txi  = threadIdx.x % threads_per_row;               // 0..31
+    const int kbx  = txi / QI8_0;                                 // 0..3 (lo block)
+    const int kqsx = txi % QI8_0;                                 // 0..7 (int within block)
+
+    // Each thread covers 2 blocks per outer K-iter: kbx (lo half) and
+    // kbx+4 (hi half).  K-OOB: clamp the read to the last valid block
+    // if either is past kb_remaining; zero-out their scales in the d-loop.
+    const int kbx_lo_safe = (kbx < kb_remaining) ? kbx : (kb_remaining - 1);
+    const int kbx_hi      = kbx + MMQ_TILE_NE_K / QI8_0;          // kbx + 4
+    const int kbx_hi_safe = (kbx_hi < kb_remaining) ? kbx_hi : (kb_remaining - 1);
+
+#pragma unroll
+    for (int i0 = 0; i0 < MMQ_Y; i0 += nrows * MMQ_NWARPS) {
+        int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        if (need_check) {
+            i = (i < i_max) ? i : i_max;
+        }
+        const block_q8_0 * bxi_lo = (const block_q8_0 *) x + kbx0 + i * stride_row_x + kbx_lo_safe;
+        const block_q8_0 * bxi_hi = (const block_q8_0 *) x + kbx0 + i * stride_row_x + kbx_hi_safe;
+        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + 0             + txi] = get_int_b2(bxi_lo->qs, kqsx);
+        x_qs[i * (2 * MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = get_int_b2(bxi_hi->qs, kqsx);
+    }
+
+    constexpr int blocks_per_tile_x_row = 2 * MMQ_TILE_NE_K / QI8_0;     // = 8
+    constexpr int rows_per_warp         = WARP_SIZE / blocks_per_tile_x_row; // = 8
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;                // 0..7
+    const bool kbxd_valid = (kbxd < kb_remaining);
+    const int kbxd_safe = kbxd_valid ? kbxd : 0;
+
+#pragma unroll
+    for (int i0 = 0; i0 < MMQ_Y; i0 += MMQ_NWARPS * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+        if (need_check) {
+            i = (i < i_max) ? i : i_max;
+        }
+        const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + i * stride_row_x + kbxd_safe;
+        const float d = kbxd_valid ? __half2float(bxi->d) : 0.0f;
+        x_df[i * (2 * MMQ_TILE_NE_K / QI8_0) + i / (QI8_0 / 2) + kbxd] = d;
+    }
+}
+
+// ================================================================
+// vec_dot_q8_0_q8_1_dp4a
+// Port of turbo mmq.cuh:982-1012 (DP4A branch).
+// Reads d_y from the half2 low-half because our quantize writes the
+// DS4 layout (half2(d, sum)) — Q8_0 only needs d, so we __low2float it.
+// ================================================================
+
+template <int mmq_x>
+static __device__ __forceinline__ void vec_dot_q8_0_q8_1_dp4a(
+    const int *   __restrict__ x_qs,
+    const float * __restrict__ x_df,
+    const int *   __restrict__ tile_y,
+    float *       __restrict__ sum,
+    const int k00) {
+
+    const int   * y_qs = tile_y + 4;
+    const half2 * y_ds = (const half2 *) tile_y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += VDR_Q8_0_Q8_1_MMQ) {
+        const int k0 = k00 + k01;
+#pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+            const int j = j0 + threadIdx.y;
+#pragma unroll
+            for (int i0 = 0; i0 < MMQ_Y; i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+
+                const int * v = &x_qs[i * (2 * MMQ_TILE_NE_K + 1) + k0];
+                const int * u = &y_qs[j * MMQ_TILE_Y_K + (k0 % MMQ_TILE_NE_K)];
+
+                const float d_x =
+                    x_df[i * (2 * MMQ_TILE_NE_K / QI8_0) + i / (QI8_0 / 2) + k0 / QI8_0];
+                const int sub = (k0 / QI8_1) % (MMQ_TILE_NE_K / QI8_1);
+                const float d_y = __low2float(y_ds[j * MMQ_TILE_Y_K + sub]);
+
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y / WARP_SIZE) + i0 / WARP_SIZE] +=
+                    q8_0_q8_1_dp4a_8(v, u, d_x, d_y);
+            }
+        }
+    }
+}
+
+// ================================================================
+// mul_mat_q8_0_turbo_impl
+// ================================================================
+
+template <int mmq_x, bool need_check>
+static __device__ void mul_mat_q8_0_turbo_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float *      __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_y,
+    const int stride_col_y,
+    const int stride_row_x,
+    const int nrows_dst) {
+
+    extern __shared__ int shared_buf[];
+    int *   tile_y = shared_buf;
+    int *   x_qs   = tile_y + GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+    float * x_df   = (float *) (x_qs + X_QS_INTS_Q8_0);
+
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+
+    constexpr int sum_slots = mmq_x * MMQ_Y / (MMQ_NWARPS * WARP_SIZE);
+    float sum[sum_slots];
+#pragma unroll
+    for (int s = 0; s < sum_slots; ++s) sum[s] = 0.0f;
+
+    const int * y_base = (const int *) vy + jt * mmq_x * Q8_1_MMQ_INTS;
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK8_0;  // = 8
+    const int n_blocks_x = ncols_x / QK8_0;
+    const int kb0_stop = (n_blocks_x + blocks_per_iter - 1)
+                         / blocks_per_iter * blocks_per_iter;
+    const int i_max = nrows_x - it * MMQ_Y - 1;
+
+    for (int kb0 = 0; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int kb_remaining =
+            (n_blocks_x - kb0 < blocks_per_iter) ? (n_blocks_x - kb0)
+                                                 : blocks_per_iter;
+        load_tiles_q8_0<need_check>(
+            (const char *) vx,
+            x_qs, x_df,
+            it * MMQ_Y * stride_row_x + kb0,
+            (need_check ? i_max : 0),
+            kb_remaining,
+            stride_row_x);
+
+        const int * by0 =
+            y_base + (size_t)stride_col_y * (kb0 / 4) * Q8_1_MMQ_INTS;
+#pragma unroll
+        for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            tile_y[l] = by0[l];
+        }
+        __syncthreads();
+
+        vec_dot_q8_0_q8_1_dp4a<mmq_x>(x_qs, x_df, tile_y, sum, 0);
+
+        __syncthreads();
+
+        const int * by1 =
+            y_base + (size_t)stride_col_y * ((kb0 / 4) * Q8_1_MMQ_INTS + Q8_1_MMQ_INTS);
+#pragma unroll
+        for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            tile_y[l] = by1[l];
+        }
+        __syncthreads();
+
+        vec_dot_q8_0_q8_1_dp4a<mmq_x>(x_qs, x_df, tile_y, sum, MMQ_TILE_NE_K);
 
         __syncthreads();
     }
@@ -644,6 +897,19 @@ static __device__ void mul_mat_q4_1_turbo_impl(
         const int ncols_y, const int stride_col_y,                       \
         const int stride_row_x, const int nrows_dst) {                   \
         mul_mat_q4_1_turbo_impl<MMQ_X, CHECK>(                           \
+            vx, vy, dst, ncols_x, nrows_x, ncols_y,                      \
+            stride_col_y, stride_row_x, nrows_dst);                      \
+    }                                                                     \
+    extern "C" __global__                                                \
+    __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                         \
+    void mul_mat_q8_0_turbo_x##MMQ_X##_##SUFFIX(                         \
+        const void * __restrict__ vx,                                    \
+        const void * __restrict__ vy,                                    \
+        float      * __restrict__ dst,                                   \
+        const int ncols_x, const int nrows_x,                            \
+        const int ncols_y, const int stride_col_y,                       \
+        const int stride_row_x, const int nrows_dst) {                   \
+        mul_mat_q8_0_turbo_impl<MMQ_X, CHECK>(                           \
             vx, vy, dst, ncols_x, nrows_x, ncols_y,                      \
             stride_col_y, stride_row_x, nrows_dst);                      \
     }

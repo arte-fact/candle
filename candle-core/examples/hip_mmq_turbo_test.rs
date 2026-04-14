@@ -57,6 +57,13 @@ fn main() -> Result<()> {
         // Non-aligned K: gates out (M3b TODO). Should land ~0 diff because
         // the dispatcher routes to baseline.
         ("Q4_1 m13  k2880 n2880", GgmlDType::Q4_1, 13, 2880, 2880),
+        // Q8_0 (M3c).  Covers lm_head-ish dims (K=4096), full-attn dims
+        // (K=4096, N=small) and a non-aligned K case.
+        ("Q8_0 m13  k4096 n2048",  GgmlDType::Q8_0, 13, 4096, 2048),
+        ("Q8_0 m128 k4096 n512",   GgmlDType::Q8_0, 128, 4096, 512),
+        ("Q8_0 m513 k4096 n2048",  GgmlDType::Q8_0, 513, 4096, 2048),
+        ("Q8_0 m513 k12288 n4096", GgmlDType::Q8_0, 513, 12288, 4096),
+        ("Q8_0 m13  k2880 n2880",  GgmlDType::Q8_0, 13, 2880, 2880),
     ];
 
     for (label, dtype, m, k, n) in shapes {
