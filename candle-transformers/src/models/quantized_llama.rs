@@ -87,7 +87,15 @@ fn fused_q4_0_ffn_decode(
         _ => candle::bail!("fused_q4_0_ffn_decode: x must be HIP"),
     };
     let x = if x.is_contiguous() { x.clone() } else { x.contiguous()? };
-    let (_intermediate_dim, hidden_dim) = w_gate.shape().dims2()?;
+    // W_gate is (intermediate_dim, hidden_dim).  Bind both — the Step 4
+    // hidden → Q8 quantize MUST use `intermediate_dim` (the silu*up
+    // output width = W_down's cols), not `hidden_dim`.  The original
+    // code shadowed `hidden_dim` to mean W_gate's cols (= hidden_size,
+    // = residual width) and accidentally passed it as `k` to the
+    // hidden quantize call, writing only `hidden_size` Q8_1 elements
+    // of an `intermediate_size` vector and leaving the rest as garbage
+    // for W_down to read.  That was the silent fused-FFN regression.
+    let (intermediate_dim, hidden_dim) = w_gate.shape().dims2()?;
     // Step 1: rmsnorm + quantize_q8_1(x_norm) → (x_q8_buf, _).
     let (x_q8_buf, _) = hip_backend::rmsnorm_q8_fused(
         &x, ffn_norm.weight(), ffn_norm.eps_f32() as f64, false,
@@ -125,12 +133,25 @@ fn fused_q4_0_ffn_decode(
             .ok_or_else(|| candle::Error::Msg("non-contig hidden".into()))?;
         h_slice.slice(lo..hi)
     };
-    let k = hidden_dim; // columns of W_down
+    // FIX (T3.1): k must be `intermediate_dim` (W_down's cols and the
+    // length of the silu*up vector), NOT `hidden_dim`.  Original code
+    // shadowed `hidden_dim` with the wrong meaning (it held W_gate's
+    // cols = hidden_size = residual width), so quantize_q8_1 only
+    // wrote `hidden_size` elements of an `intermediate_size` vector,
+    // and W_down read `intermediate_size - hidden_size` bytes of
+    // garbage past the end → 5e-2-ish numerical drift, then garbage
+    // tokens.  This was the silent failure that caused T3 to demote
+    // the entire fused FFN path.
+    let k = intermediate_dim;
     let ky = 1; // b*m
     let kx_padded = qhip::pad(k, qhip::MATRIX_ROW_PADDING);
-    let num_blocks = (kx_padded + qhip::CUDA_QUANTIZE_BLOCK_SIZE - 1) / qhip::CUDA_QUANTIZE_BLOCK_SIZE;
+    let _num_blocks = (kx_padded + qhip::CUDA_QUANTIZE_BLOCK_SIZE - 1) / qhip::CUDA_QUANTIZE_BLOCK_SIZE;
     let q8_bytes = ky * (kx_padded / 32) * 36;
-    let mut hidden_q8_buf = unsafe { dev.alloc::<u8>(q8_bytes)? };
+    // alloc_zeros so the trailing (kx_padded - k) bytes per row are
+    // zero — matches the standard `mul_mat_via_q8_1` invariant
+    // (hip.rs:1064) so MMVQ kernels read zeros past the valid range
+    // instead of uninit memory.
+    let mut hidden_q8_buf = dev.alloc_zeros::<u8>(q8_bytes)?;
     qhip::quantize_q8_1(&h_view, &mut hidden_q8_buf, k, ky, &dev)?;
     drop(h_st);
     let hidden_q8_view = hidden_q8_buf.slice(0..hidden_q8_buf.len());
@@ -1262,19 +1283,18 @@ impl ModelWeights {
             // Fused Q4_0 decode FFN path: uses two fused kernels
             //   gate_up_fused:  gate MMVQ + up MMVQ in one launch (shared x_q8)
             //   down_residual:  down MMVQ + residual add in one launch
-            // T3 finding (2026-04-15): the Rust-orchestrated fused path
-            // produces NUMERICALLY BROKEN output on TinyLlama Q4_0 at
-            // identical wall-time vs the unfused path (both ~237 t/s,
-            // unfused output is "For experiencing the best of Paris...",
-            // fused output is "colonial , Quint always Sat Rep ...").
-            // Demoted to opt-in (`CANDLE_FFN_FUSED=1`) until the
-            // numerical regression is root-caused; the speed win never
-            // materialised on TinyLlama anyway. Old opt-out
-            // (`CANDLE_FFN_FUSED_OFF=1`) is now a no-op.
+            // T3.1 (2026-04-15): the broken fused-FFN regression that
+            // T3 mitigated (by demoting the path to opt-in) is now
+            // ROOT-CAUSED AND FIXED — see commit comment on
+            // `fused_q4_0_ffn_decode` for the variable-shadowing bug
+            // (intermediate_dim was misnamed `hidden_dim` and the
+            // hidden→Q8 quantize used the wrong width, leaving most of
+            // the buffer uninitialised for W_down to read).  Restored
+            // as default-on; opt-out via `CANDLE_FFN_FUSED_OFF=1`.
             #[cfg(feature = "hip")]
             let ffn_fused: Option<Tensor> = if seq_len == 1
                 && matches!(x.device(), Device::Hip(_))
-                && std::env::var("CANDLE_FFN_FUSED").is_ok()
+                && std::env::var("CANDLE_FFN_FUSED_OFF").is_err()
             {
                 if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
                     if let Some((w_gate, w_up, w_down)) = mlp.as_q4_0_trio() {
