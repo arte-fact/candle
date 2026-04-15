@@ -589,6 +589,115 @@ pub fn l2_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
     ))
 }
 
+/// Fused MoE router pre-amble: `out = v_norm(x, eps) * (1/sqrt(n_embd)) * gate_s`.
+///
+/// Phase T1.1 — replaces 5 separate launches in
+/// `quantized_gemma4.rs:1745-1752`:
+///   1. `v_norm(attn_out, eps)`     (sqr + mean_keepdim + add + sqrt + bdiv)
+///   2. `normed * (1/sqrt(n_embd))` (scalar mul)
+///   3. `scaled.broadcast_mul(gate_s)` (per-channel mul)
+/// with a single fused kernel `gemma4_router_prep_f32`.
+///
+/// On Gemma-4-26B-A4B 4-GPU decode, the T1 profile measured the router
+/// pre-amble at ~227 µs/layer × 30 layers = 6.8 ms/token (33 % of MoE
+/// FFN time). Each saved launch removes ~50 µs of HIP dispatch
+/// overhead, so collapsing 5 → 1 nominally saves 4 launches × 30 layers
+/// × 50 µs ≈ 6 ms/token (~20 % decode speedup).
+///
+/// # Requirements
+/// - `x` and `gate_s` must be on the same HIP device, f32, contiguous.
+/// - `gate_s` length must equal `x`'s last dim (== `n_embd`).
+pub fn gemma4_router_prep_fused(x: &Tensor, gate_s: &Tensor, eps: f64) -> Result<Tensor> {
+    let dev = match x.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("gemma4_router_prep_fused: input must be HIP"),
+    };
+    if x.dtype() != DType::F32 || gate_s.dtype() != DType::F32 {
+        crate::bail!(
+            "gemma4_router_prep_fused: x ({:?}) and gate_s ({:?}) must be f32",
+            x.dtype(), gate_s.dtype()
+        );
+    }
+    if !x.is_contiguous() {
+        crate::bail!("gemma4_router_prep_fused: x must be contiguous");
+    }
+    if !gate_s.is_contiguous() {
+        crate::bail!("gemma4_router_prep_fused: gate_s must be contiguous");
+    }
+    if x.rank() < 1 {
+        crate::bail!("gemma4_router_prep_fused: x must have rank >= 1");
+    }
+
+    let row_len = *x.dims().last().unwrap();
+    if gate_s.elem_count() != row_len {
+        crate::bail!(
+            "gemma4_router_prep_fused: gate_s len ({}) != x last dim ({})",
+            gate_s.elem_count(), row_len
+        );
+    }
+    let n_rows = x.elem_count() / row_len;
+    if row_len == 0 || n_rows == 0 {
+        return x.clone().contiguous();
+    }
+
+    let (x_st, x_l) = x.storage_and_layout();
+    let x_hip = match &*x_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gemma4_router_prep_fused: x storage not HIP"),
+    };
+    let x_slice = x_hip.as_hip_slice::<f32>()?;
+    let x_view = match x_l.contiguous_offsets() {
+        Some((lo, hi)) => x_slice.slice(lo..hi),
+        None => crate::bail!("gemma4_router_prep_fused: non-contiguous storage"),
+    };
+
+    let (gs_st, gs_l) = gate_s.storage_and_layout();
+    let gs_hip = match &*gs_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gemma4_router_prep_fused: gate_s storage not HIP"),
+    };
+    let gs_slice = gs_hip.as_hip_slice::<f32>()?;
+    let gs_view = match gs_l.contiguous_offsets() {
+        Some((lo, hi)) => gs_slice.slice(lo..hi),
+        None => crate::bail!("gemma4_router_prep_fused: non-contiguous gate_s"),
+    };
+
+    // SAFETY: populated by the kernel below.
+    let out = unsafe { dev.alloc::<f32>(x.elem_count())? };
+
+    let func = dev.get_or_load_func("gemma4_router_prep_f32", &kernels::UNARY)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (WARP_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let row_len_arg = row_len;
+    let eps_f32 = eps as f32;
+    let inv_sqrt_n: f32 = 1.0_f32 / (row_len as f32).sqrt();
+    let mut builder = func.builder();
+    builder.arg(&row_len_arg);
+    builder.arg(&eps_f32);
+    builder.arg(&inv_sqrt_n);
+    builder.arg(&x_view);
+    builder.arg(&gs_view);
+    builder.arg(&out);
+    // SAFETY: ffi — shapes/dtype/contig validated above.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(x_st);
+    drop(gs_st);
+
+    let out_storage = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        <Shape as From<Vec<usize>>>::from(x.dims().to_vec()),
+        BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
 /// Fused RMSNorm + Scale + Q8_1 quantize.
 ///
 /// Combines three operations into a single kernel launch:

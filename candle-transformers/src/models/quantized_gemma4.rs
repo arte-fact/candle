@@ -1768,13 +1768,45 @@ impl ModelWeights {
                 // Custom router logits:
                 //   tmp = rms_norm(attn_out) / sqrt(n_embd) * gate_inp_s
                 //   logits = gate_inp @ tmp
+                //
+                // T1.1: when on HIP with f32 contiguous attn_out, drop into
+                // a single fused kernel `gemma4_router_prep_f32` instead of
+                // the 5-launch (sqr+mean+add+sqrt+bdiv → mul → bmul) chain.
+                // Opt-out via `CANDLE_GEMMA4_ROUTER_FUSED_OFF=1` for A/B
+                // bisect.
                 let router_input = {
-                    let normed = crate::models::quantized_blocks::norms::v_norm(
-                        &attn_out,
-                        moe_branch.eps as f64,
-                    )?;
-                    let scaled = (normed * (1.0 / (moe_branch.n_embd as f64).sqrt()))?;
-                    scaled.broadcast_mul(&moe_branch.gate_inp_s)?
+                    #[cfg(feature = "hip")]
+                    {
+                        if matches!(attn_out.device(), candle::Device::Hip(_))
+                            && attn_out.dtype() == candle::DType::F32
+                            && attn_out.is_contiguous()
+                            && moe_branch.gate_inp_s.dtype() == candle::DType::F32
+                            && moe_branch.gate_inp_s.is_contiguous()
+                            && std::env::var("CANDLE_GEMMA4_ROUTER_FUSED_OFF").is_err()
+                        {
+                            candle::hip_backend::gemma4_router_prep_fused(
+                                &attn_out,
+                                &moe_branch.gate_inp_s,
+                                moe_branch.eps as f64,
+                            )?
+                        } else {
+                            let normed = crate::models::quantized_blocks::norms::v_norm(
+                                &attn_out,
+                                moe_branch.eps as f64,
+                            )?;
+                            let scaled = (normed * (1.0 / (moe_branch.n_embd as f64).sqrt()))?;
+                            scaled.broadcast_mul(&moe_branch.gate_inp_s)?
+                        }
+                    }
+                    #[cfg(not(feature = "hip"))]
+                    {
+                        let normed = crate::models::quantized_blocks::norms::v_norm(
+                            &attn_out,
+                            moe_branch.eps as f64,
+                        )?;
+                        let scaled = (normed * (1.0 / (moe_branch.n_embd as f64).sqrt()))?;
+                        scaled.broadcast_mul(&moe_branch.gate_inp_s)?
+                    }
                 };
                 let router_logits = moe_branch.gate_inp.forward(&router_input)?;
                 let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;

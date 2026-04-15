@@ -399,3 +399,58 @@ extern "C" __global__ void FN_NAME(                                            \
 }
 
 L2_NORM_OP(float, l2_norm_f32, sqrtf)
+
+// ---------------------------------------------------------------------------
+// Fused MoE router pre-amble (Phase T1.1):
+//     out[r,i] = x[r,i] / sqrt(mean(x[r,:]^2) + eps) * inv_sqrt_n * gate_s[i]
+//
+// Combines the 5-kernel chain in
+// `candle-transformers/src/models/quantized_gemma4.rs:1745-1752`
+//   1. v_norm(x, eps)             — sqr + mean_keepdim + add_eps + sqrt + bdiv
+//   2. (normed * inv_sqrt_n)      — scalar mul
+//   3. scaled.broadcast_mul(gate_s) — per-channel mul
+// into a single kernel.
+//
+// The router runs once per MoE layer (×30 layers on Gemma-4-26B-A4B), so
+// each saved launch removes 30 dispatch overheads per token. Profile said
+// router was 33% of MoE FFN time at 6.8 ms/token (T1 finding); collapsing
+// 5 launches into 1 should drop most of the per-launch overhead.
+//
+// Block = 64 threads (one Wave64). Grid = one block per row.
+// inv_sqrt_n is precomputed host-side as `1/sqrt(n_embd)` and folded
+// into the inverse norm at the end.
+
+extern "C" __global__ void gemma4_router_prep_f32(
+    const size_t row_len,                  // == hidden_size (n_embd)
+    const float eps,
+    const float inv_sqrt_n,                // 1 / sqrt(n_embd) — host-precomputed
+    const float *__restrict__ in,          // (n_rows, row_len)
+    const float *__restrict__ gate_s,      // (row_len,) per-channel scale
+    float *__restrict__ out                // (n_rows, row_len)
+) {
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float *row_in  = in  + (size_t)row * row_len;
+    float       *row_out = out + (size_t)row * row_len;
+
+    // Pass 1: Σ x² across the row.
+    float partial = 0.f;
+    for (size_t i = lane; i < row_len; i += blockDim.x) {
+        const float v = row_in[i];
+        partial += v * v;
+    }
+    // gfx906 wavefront reduction (64 lanes).
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        partial += __shfl_xor(partial, mask);
+    }
+    // mean(x²) = Σ x² / row_len.
+    // Combined inverse norm: 1 / sqrt(mean + eps) * inv_sqrt_n.
+    const float mean_sq = partial / (float)row_len;
+    const float inv_norm = inv_sqrt_n / sqrtf(mean_sq + eps);
+
+    // Pass 2: scale-and-store, folding in the per-channel gate weight.
+    for (size_t i = lane; i < row_len; i += blockDim.x) {
+        row_out[i] = row_in[i] * inv_norm * gate_s[i];
+    }
+}
