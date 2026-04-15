@@ -1111,6 +1111,20 @@ impl DecodePlan {
                         idx, src_dev, rc
                     );
                 }
+                // V2-1 diag finding: `hipMemcpy` syncs the DEFAULT
+                // stream only, not candle's per-device user stream.
+                // On dense 31B 4-GPU we saw `hipErrorNotReady` from
+                // the DtoH below because dev N's producer kernels are
+                // still running on its user stream when the bounce
+                // fires.  Sync the whole device explicitly — cheap
+                // (1 call per cross-device boundary, ≤4 per replay).
+                let rc = hipdarc::sys::hipDeviceSynchronize();
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    crate::bail!(
+                        "decode_cache replay: memcpy op[{}] pre-DtoH sync src={} failed with {:?}",
+                        idx, src_dev, rc
+                    );
+                }
                 let rc = hipdarc::sys::hipMemcpy(
                     staging.as_mut_ptr() as *mut c_void,
                     src_ptr,
