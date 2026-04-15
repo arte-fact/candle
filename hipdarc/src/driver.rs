@@ -1183,12 +1183,29 @@ fn decode_alloc_try_take(size: usize, device_ordinal: i32) -> Option<sys::hipDev
             return None;
         }
         let tbl = state.tables.get_mut(&device_ordinal)?;
-        if tbl.cursor < tbl.entries.len() {
+        // V2-3c: scan forward for the first entry whose padded size
+        // exactly matches this request's padded size.
+        //
+        // Rationale: with V2-3b the main-loop (inter-forward) alloc
+        // is safely outside the table, but entries from prior
+        // recording phases (notably the INITIAL main-loop alloc
+        // between token 1 and token 2 when decode_alloc first entered
+        // Recording mode) can still sit at cursor=0 with the wrong
+        // size for the first in-forward alloc.  Simple `>= size` let
+        // a 1024-byte mask request grab a 4-byte input slot's padded
+        // container; simple `cursor+=1` on size mismatch lost the
+        // subsequent allocs' slots too.  Exact-padded-size scan-
+        // forward skips non-matching entries (advancing cursor past
+        // them) so the current request lands on its correctly-sized
+        // recorded slot.
+        let want = pad_decode_size(size);
+        while tbl.cursor < tbl.entries.len() {
             let (entry_size, ptr) = tbl.entries[tbl.cursor];
-            if entry_size >= size {
+            if entry_size == want {
                 tbl.cursor += 1;
                 return Some(ptr);
             }
+            tbl.cursor += 1;
         }
         None
     })
