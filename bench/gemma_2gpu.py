@@ -122,15 +122,18 @@ def extract_err(out: str, rc: int) -> str:
 
 
 def bench_candle(model: str, gpus: str, log_dir: pathlib.Path,
-                 timeout: int, reps: int, keys: set[str]) -> dict:
-    bin_path = str(CANDLE_ROOT / "target" / "release" / "examples" / "quantized-gemma4")
+                 timeout: int, reps: int, keys: set[str],
+                 bin_name: str = "quantized-gemma4",
+                 extra_args: Optional[list[str]] = None) -> dict:
+    bin_path = str(CANDLE_ROOT / "target" / "release" / "examples" / bin_name)
     log = log_dir / "candle.log"
     log.write_text("")
     result: dict = {k: None for k in ALL_KEYS}
     result["sub_errors"] = {}
     result["log"] = str(log)
     n_gpus = len(gpus.split(","))
-    logger.info("[candle] gpus=%s (n_gpus=%d) reps=%d", gpus, n_gpus, reps)
+    logger.info("[candle] bin=%s gpus=%s (n_gpus=%d) reps=%d",
+                bin_name, gpus, n_gpus, reps)
     env = env_for_gpus(gpus, extra={"CANDLE_MMQ_TURBO_PORT": "1"})
 
     for key, prompt_len, sample_len, _ in SUBBENCHES:
@@ -143,6 +146,8 @@ def bench_candle(model: str, gpus: str, log_dir: pathlib.Path,
             cmd = [bin_path, "--model", model, "--prompt", prompt,
                    "--sample-len", str(sample_len), "--temperature", "0",
                    "--n-gpus", str(n_gpus)]
+            if extra_args:
+                cmd.extend(extra_args)
             rc, out = run(cmd, env, timeout)
             with log.open("a") as f:
                 f.write(f"[{key} rep{rep}] rc={rc}\n{out}\n---\n")
@@ -278,6 +283,11 @@ def main() -> int:
                    help="Comma-separated subset of: " + ",".join(ALL_KEYS))
     p.add_argument("--only", choices=["candle", "llamacpp", "turbo"],
                    default=None)
+    p.add_argument("--candle-bin", default="quantized-gemma4",
+                   help="Candle example binary name "
+                        "(e.g. quantized-gemma4, quantized-qwen35).")
+    p.add_argument("--candle-extra", default="",
+                   help="Extra CLI args for candle (whitespace-separated).")
     p.add_argument("--out-dir", default=None)
     args = p.parse_args()
 
@@ -308,6 +318,8 @@ def main() -> int:
                 out_dir, args.timeout, args.reps, keys)
         return out
 
+    extra_args = args.candle_extra.split() if args.candle_extra else []
+
     t0 = time.time()
     results: dict[str, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
@@ -315,7 +327,8 @@ def main() -> int:
         if args.only in (None, "candle"):
             futures["candle"] = ex.submit(bench_candle, args.model,
                                           args.candle_gpus, out_dir,
-                                          args.timeout, args.reps, keys)
+                                          args.timeout, args.reps, keys,
+                                          args.candle_bin, extra_args)
         if args.only in (None, "llamacpp", "turbo"):
             futures["_llama_seq"] = ex.submit(run_llama_sequence)
         for name, fut in futures.items():

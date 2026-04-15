@@ -25,6 +25,7 @@ HF_BASE="https://huggingface.co"
 CATALOG=$(cat <<'EOF'
 Devstral-Small-2-24B-Instruct-2512-UD-Q4_K_XL.gguf	unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF	14506151072
 Qwen3-Coder-30B-A3B-Instruct-1M-Q4_0.gguf	unsloth/Qwen3-Coder-30B-A3B-Instruct-1M-GGUF	17379990880
+Qwen3-Coder-Next-Q4_0.gguf	unsloth/Qwen3-Coder-Next-GGUF	45330098208
 Qwen3.5-9B-BF16.gguf	unsloth/Qwen3.5-9B-GGUF	17920697312
 Qwen3.5-27B-Q4_1.gguf	unsloth/Qwen3.5-27B-GGUF	17182934944
 Qwen3.5-35B-A3B-MXFP4_MOE.gguf	unsloth/Qwen3.5-35B-A3B-GGUF	21587638912
