@@ -1809,6 +1809,37 @@ impl ModelWeights {
                     }
                 };
                 let router_logits = moe_branch.gate_inp.forward(&router_input)?;
+
+                // T1.2: fused softmax + topk + normalise via single GPU
+                // kernel. Replaces the 7-step chain (softmax → CPU
+                // arg_sort → narrow → HtoD → gather → sum_keepdim →
+                // bdiv) with one launch. Produces compact
+                // `(tokens, topk)` ids + weights directly. Opt-out via
+                // `CANDLE_GEMMA4_TOPK_FUSED_OFF=1` for A/B bisect.
+                let topk_fused: Option<(Tensor, Tensor)> = {
+                    #[cfg(feature = "hip")]
+                    {
+                        if matches!(router_logits.device(), candle::Device::Hip(_))
+                            && router_logits.dtype() == candle::DType::F32
+                            && router_logits.is_contiguous()
+                            && std::env::var("CANDLE_GEMMA4_TOPK_FUSED_OFF").is_err()
+                        {
+                            // router_logits shape is (b, seq, n_experts); flatten to (b*seq, n_experts).
+                            let n_experts_dim = router_logits.dim(candle::D::Minus1)?;
+                            let flat = router_logits.reshape(((), n_experts_dim))?;
+                            match candle::hip_backend::topk_moe_norm_fused(
+                                &flat,
+                                moe_branch.num_experts_used,
+                            ) {
+                                Ok(pair) => Some(pair),
+                                Err(_) => None,
+                            }
+                        } else { None }
+                    }
+                    #[cfg(not(feature = "hip"))]
+                    { None }
+                };
+
                 let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
                 #[cfg(feature = "hip")]
@@ -1819,30 +1850,37 @@ impl ModelWeights {
                 #[cfg(feature = "hip")]
                 let _t_topk_start = std::time::Instant::now();
 
-                // TopK selection (route through CPU for argsort).
+                // TopK selection. T1.2 fast path (above) emits compact
+                // `(tokens, topk)` ids + weights directly; fallback is
+                // the legacy CPU arg_sort chain.
                 let device = routing_weights.device().clone();
                 let (b_sz_ff, seq_len_ff, _hidden) = moe_in.dims3()?;
                 let flat_tokens = b_sz_ff * seq_len_ff;
                 let n_experts = routing_weights.dim(candle::D::Minus1)?;
                 let rw_flat = routing_weights.reshape((flat_tokens, n_experts))?;
-                let topk_ids = {
-                    let rw_cpu = rw_flat.to_device(&candle::Device::Cpu)?;
-                    let ids = rw_cpu
-                        .arg_sort_last_dim(false)?
-                        .narrow(candle::D::Minus1, 0, moe_branch.num_experts_used)?
-                        .contiguous()?;
-                    // A3 / EPLB diagnostic — observe routing while ids live
-                    // on CPU.  No-op when CANDLE_EPLB_PRINT / _DUMP unset.
-                    if let Ok(v) = ids.flatten_all()?.to_vec1::<u32>() {
-                        crate::models::quantized_blocks::eplb::observe(&v, il);
-                    }
-                    ids.to_device(&device)?
+                let (topk_ids, topk_weights) = if let Some((w, ids)) = topk_fused {
+                    (ids, w)
+                } else {
+                    let topk_ids = {
+                        let rw_cpu = rw_flat.to_device(&candle::Device::Cpu)?;
+                        let ids = rw_cpu
+                            .arg_sort_last_dim(false)?
+                            .narrow(candle::D::Minus1, 0, moe_branch.num_experts_used)?
+                            .contiguous()?;
+                        // A3 / EPLB diagnostic — observe routing while ids live
+                        // on CPU.  No-op when CANDLE_EPLB_PRINT / _DUMP unset.
+                        if let Ok(v) = ids.flatten_all()?.to_vec1::<u32>() {
+                            crate::models::quantized_blocks::eplb::observe(&v, il);
+                        }
+                        ids.to_device(&device)?
+                    };
+                    let topk_weights = rw_flat.gather(&topk_ids, candle::D::Minus1)?;
+                    let topk_weights = (&topk_weights
+                        / topk_weights
+                            .sum_keepdim(candle::D::Minus1)?
+                            .broadcast_as(topk_weights.shape())?)?;
+                    (topk_ids, topk_weights)
                 };
-                let topk_weights = rw_flat.gather(&topk_ids, candle::D::Minus1)?;
-                let topk_weights = (&topk_weights
-                    / topk_weights
-                        .sum_keepdim(candle::D::Minus1)?
-                        .broadcast_as(topk_weights.shape())?)?;
 
                 #[cfg(feature = "hip")]
                 if layer_profile {

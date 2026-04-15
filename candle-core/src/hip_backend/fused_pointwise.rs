@@ -589,6 +589,125 @@ pub fn l2_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
     ))
 }
 
+/// Phase T1.2 — fused MoE topk: softmax + top-k argmax + normalise in
+/// a single kernel.
+///
+/// Replaces the 7-step Rust chain at
+/// `quantized_gemma4.rs:1762-1779`:
+///   softmax → to_device(Cpu) → arg_sort_last_dim → narrow → to_device(Hip)
+///          → gather → sum_keepdim → broadcast_div
+///
+/// Kernel ports turbo's `topk_moe_cuda` (gemma4-specialised: with_norm=
+/// true, no bias, no sigmoid).  Outputs are COMPACT
+/// `(n_rows × n_expert_used)` rather than turbo's full-strided layout.
+///
+/// # Args
+/// - `router_logits`: `(n_rows, n_experts)` f32 contiguous on HIP.
+///   `n_experts` MUST match a compiled instantiation (currently 64,
+///   128, 512).
+/// - `n_expert_used`: top-k value (≤ n_experts; for gemma4 this is 8).
+///
+/// # Returns
+/// `(weights, ids)` — both `(n_rows, n_expert_used)`:
+///   * `weights`: f32 normalised top-k routing probabilities (sum=1
+///     per row).
+///   * `ids`: u32 expert indices (`unsigned int` on the HIP side).
+pub fn topk_moe_norm_fused(
+    router_logits: &Tensor,
+    n_expert_used: usize,
+) -> Result<(Tensor, Tensor)> {
+    let dev = match router_logits.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("topk_moe_norm_fused: input must be HIP"),
+    };
+    if router_logits.dtype() != DType::F32 {
+        crate::bail!(
+            "topk_moe_norm_fused: input must be f32, got {:?}",
+            router_logits.dtype()
+        );
+    }
+    if !router_logits.is_contiguous() {
+        crate::bail!("topk_moe_norm_fused: input must be contiguous");
+    }
+    if router_logits.rank() < 1 {
+        crate::bail!("topk_moe_norm_fused: input must have rank >= 1");
+    }
+    let n_experts = *router_logits.dims().last().unwrap();
+    let n_rows = router_logits.elem_count() / n_experts;
+    if n_expert_used == 0 || n_expert_used > n_experts {
+        crate::bail!(
+            "topk_moe_norm_fused: n_expert_used={} out of (0, n_experts={}]",
+            n_expert_used, n_experts
+        );
+    }
+
+    // Pick the compiled kernel instance.
+    let kernel_name = match n_experts {
+        64 => "topk_moe_norm_f32_n64",
+        128 => "topk_moe_norm_f32_n128",
+        512 => "topk_moe_norm_f32_n512",
+        _ => crate::bail!(
+            "topk_moe_norm_fused: no compiled kernel for n_experts={} (have 64, 128, 512)",
+            n_experts
+        ),
+    };
+
+    let (logits_st, logits_l) = router_logits.storage_and_layout();
+    let logits_hip = match &*logits_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("topk_moe_norm_fused: logits storage not HIP"),
+    };
+    let logits_slice = logits_hip.as_hip_slice::<f32>()?;
+    let logits_view = match logits_l.contiguous_offsets() {
+        Some((lo, hi)) => logits_slice.slice(lo..hi),
+        None => crate::bail!("topk_moe_norm_fused: non-contiguous logits"),
+    };
+
+    // Output buffers: weights f32, ids u32; both (n_rows, n_expert_used).
+    // SAFETY: kernel writes every (row, k).
+    let weights_out = unsafe { dev.alloc::<f32>(n_rows * n_expert_used)? };
+    let ids_out = unsafe { dev.alloc::<u32>(n_rows * n_expert_used)? };
+
+    let func = dev.get_or_load_func(kernel_name, &kernels::TOPK_MOE)?;
+
+    // Grid: ceil(n_rows / 4) blocks, each block has 4 wavefronts.
+    const WARPS_PER_BLOCK: u32 = 4;
+    let cfg = LaunchConfig {
+        grid_dim: (((n_rows as u32) + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK, 1, 1),
+        block_dim: (WARP_SIZE, WARPS_PER_BLOCK, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_rows_arg = n_rows as i32;
+    let n_used_arg = n_expert_used as i32;
+    let mut builder = func.builder();
+    builder.arg(&logits_view);
+    builder.arg(&weights_out);
+    builder.arg(&ids_out);
+    builder.arg(&n_rows_arg);
+    builder.arg(&n_used_arg);
+    // SAFETY: ffi — shapes/dtype validated above.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(logits_st);
+
+    let out_shape = vec![n_rows, n_expert_used];
+    let weights_storage = HipStorage::wrap_hip_slice(weights_out, dev.clone());
+    let ids_storage = HipStorage::wrap_hip_slice(ids_out, dev);
+    let weights = Tensor::from_storage(
+        Storage::Hip(weights_storage),
+        <Shape as From<Vec<usize>>>::from(out_shape.clone()),
+        BackpropOp::none(),
+        false,
+    );
+    let ids = Tensor::from_storage(
+        Storage::Hip(ids_storage),
+        <Shape as From<Vec<usize>>>::from(out_shape),
+        BackpropOp::none(),
+        false,
+    );
+    Ok((weights, ids))
+}
+
 /// Fused MoE router pre-amble: `out = v_norm(x, eps) * (1/sqrt(n_embd)) * gate_s`.
 ///
 /// Phase T1.1 — replaces 5 separate launches in
