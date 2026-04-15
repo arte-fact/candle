@@ -1087,6 +1087,10 @@ impl ModelWeights {
                             candle::hip_backend::g3_counters::CounterSlot::LkIter,
                             current_t as u32,
                         )?;
+                        // V2-1: same validator hook as Replay branch —
+                        // graph capture is driven by the same plan so
+                        // the same patch-integrity check applies.
+                        plan.validate_inputs(&fresh_inputs)?;
                         unsafe { graph.patch_and_launch(plan, &dev_for_replay)?; }
                         if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
                             let _ = dev_for_replay.stream().synchronize();
@@ -1129,6 +1133,10 @@ impl ModelWeights {
                             candle::hip_backend::g3_counters::CounterSlot::LkIter,
                             current_t_for_ctr as u32,
                         )?;
+                        // V2-1: validate external patching before we
+                        // launch — catches stale ptr / missed input_id
+                        // before the kernels crash on garbage addresses.
+                        plan.validate_inputs(&fresh_inputs)?;
                         unsafe { plan.replay(&dev_for_replay)?; }
                         // Phase-time: optional sync-here-to-measure-GPU.
                         // CANDLE_G2_SYNC_REPLAY=1 makes the fp timing

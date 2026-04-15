@@ -918,6 +918,87 @@ impl DecodePlan {
         self.external_patch_locs.len()
     }
 
+    /// V2-1: validate that external-input patching actually landed.
+    ///
+    /// Mirrors Aphrodite's `aphrodite/compilation/cuda_graph.py:119-175`
+    /// debug path that snapshots input tensor addresses at capture and
+    /// checks them on replay.  Here we verify, for every
+    /// `external_patch_locs` entry, that the captured arg now equals
+    /// `fresh_inputs[input_id] + captured_offset`.  Mismatches point at
+    /// one of three bugs:
+    ///   (a) `stage_inputs` didn't patch the slot (missed input_id),
+    ///   (b) the caller passed the wrong fresh_ptr for an input,
+    ///   (c) the offset baked at plan-build time is stale.
+    ///
+    /// Also dumps op[0]'s full arg list for diagnosis — when the first
+    /// op crashes at replay, this shows exactly what args the kernel
+    /// sees.
+    ///
+    /// Env-gated via `CANDLE_G2_VALIDATE_INPUTS=1`.  Returns `Err` if
+    /// any patch mismatched so callers can bail before launching
+    /// garbage-addressed kernels.
+    pub fn validate_inputs(&self, fresh_inputs: &[(usize, usize)]) -> crate::Result<()> {
+        if std::env::var("CANDLE_G2_VALIDATE_INPUTS").is_err() {
+            return Ok(());
+        }
+        let fresh_map: std::collections::HashMap<usize, usize> =
+            fresh_inputs.iter().copied().collect();
+        let mut bad = 0usize;
+        let has_offsets = !self.external_offsets.is_empty();
+        for (i, loc) in self.external_patch_locs.iter().enumerate() {
+            let input_id = self.external_input_ids.get(i).copied().unwrap_or(0);
+            let offset = if has_offsets { self.external_offsets[i] } else { 0 };
+            let live = *fresh_map.get(&input_id).unwrap_or(&0);
+            let expected = (live as i64) + offset;
+            let actual = self.ops[loc.op].arg_values[loc.arg] as i64;
+            if actual != expected {
+                eprintln!(
+                    "[V2-1] MISMATCH patch[{}] op[{}]={}@dev{} arg[{}] input_id={} offset={}: expected=0x{:x} actual=0x{:x} diff={}",
+                    i, loc.op, self.ops[loc.op].name, self.ops[loc.op].device_ordinal,
+                    loc.arg, input_id, offset,
+                    expected as u64, actual as u64,
+                    actual - expected,
+                );
+                bad += 1;
+            }
+        }
+        // Dump op[0]'s args for quick diagnosis when the first op crashes.
+        if let Some(op0) = self.ops.first() {
+            let args_str: Vec<String> = op0.arg_values.iter()
+                .zip(op0.arg_sizes.iter())
+                .enumerate()
+                .map(|(j, (v, s))| format!("[{}]sz={} 0x{:x}", j, s, v))
+                .collect();
+            eprintln!(
+                "[V2-1] op[0] {}@dev{} grid=({},{},{}) block=({},{},{}) args: {}",
+                op0.name, op0.device_ordinal,
+                op0.grid.0, op0.grid.1, op0.grid.2,
+                op0.block.0, op0.block.1, op0.block.2,
+                args_str.join(" "),
+            );
+        }
+        // Dump anchor snapshot for comparison.
+        for (i, a) in self.input_anchors.iter().enumerate() {
+            let live = fresh_map.get(&i).copied().unwrap_or(0);
+            eprintln!(
+                "[V2-1] anchor #{}: captured_ptr=0x{:x} bytes={} live_ptr=0x{:x}{}",
+                i, a.ptr, a.bytes, live,
+                if a.ptr == live { "" } else { " (MOVED)" },
+            );
+        }
+        eprintln!(
+            "[V2-1] replay #{} summary: {} patches, {} mismatched",
+            self.replay_count, self.external_patch_locs.len(), bad,
+        );
+        if bad > 0 {
+            crate::bail!(
+                "V2-1 validator: {} external patches did not match fresh inputs",
+                bad
+            );
+        }
+        Ok(())
+    }
+
     /// Replay the plan: launch every recorded kernel.
     ///
     /// # Safety
