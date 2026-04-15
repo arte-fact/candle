@@ -1,0 +1,728 @@
+{
+  "schema_version": 1,
+  "target": "gfx906",
+  "generated_at": "unix:1776279493",
+  "dtype": "q4_0_mmq",
+  "shapes": [
+    {
+      "shape": {
+        "b_size": 64,
+        "ncols_x": 2560,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 182.25,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 321.35,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 460.15,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 619.25,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 182.25,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 128,
+        "ncols_x": 2560,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 213.0,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 377.85,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 507.15,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 675.35,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 213.0,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 256,
+        "ncols_x": 2560,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 300.2,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 454.8,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 555.8,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 807.65,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 300.2,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 512,
+        "ncols_x": 2560,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 596.45,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 722.75,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 1110.45,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 947.9,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 596.45,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 64,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 433.7,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 429.9,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 564.5,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 724.9,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 429.9,
+      "speedup_vs_cuda1": 1.0088392649453362
+    },
+    {
+      "shape": {
+        "b_size": 128,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 788.4,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 710.6,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 1095.95,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 867.65,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 710.6,
+      "speedup_vs_cuda1": 1.1094849423022797
+    },
+    {
+      "shape": {
+        "b_size": 256,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 1897.75,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 1218.8,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 1676.7,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 1487.35,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 1218.8,
+      "speedup_vs_cuda1": 1.5570643255661307
+    },
+    {
+      "shape": {
+        "b_size": 512,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 4178.25,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 2503.3,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 3407.95,
+          "correct": false,
+          "max_rel_err": 0.007525510204081633
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 2542.65,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 2503.3,
+      "speedup_vs_cuda1": 1.6690967922342506
+    },
+    {
+      "shape": {
+        "b_size": 64,
+        "ncols_x": 10240,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 771.65,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 1448.8,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 2283.3,
+          "correct": false,
+          "max_rel_err": 0.0111731843575419
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 2859.5,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 771.65,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 128,
+        "ncols_x": 10240,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 810.7,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 1579.55,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 2291.1,
+          "correct": false,
+          "max_rel_err": 0.0111731843575419
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 2905.1,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 810.7,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 256,
+        "ncols_x": 10240,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 1433.05,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 1900.7,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 2297.0,
+          "correct": false,
+          "max_rel_err": 0.0111731843575419
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 3263.55,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 1433.05,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 64,
+        "ncols_x": 5376,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 519.1,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 786.7,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 1260.0,
+          "correct": false,
+          "max_rel_err": 0.05263157894736842
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 1608.2,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2",
+      "winner_time_us": 519.1,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 128,
+        "ncols_x": 5376,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 1032.55,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 927.75,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 1276.9,
+          "correct": false,
+          "max_rel_err": 0.05263157894736842
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 1714.85,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 927.75,
+      "speedup_vs_cuda1": 1.112961465912153
+    },
+    {
+      "shape": {
+        "b_size": 256,
+        "ncols_x": 5376,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 1854.05,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 1570.55,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 2526.0,
+          "correct": false,
+          "max_rel_err": 0.05263157894736842
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 1946.45,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 1570.55,
+      "speedup_vs_cuda1": 1.1805100124160326
+    },
+    {
+      "shape": {
+        "b_size": 512,
+        "ncols_x": 5376,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 4428.5,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 2785.15,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 3815.2,
+          "correct": false,
+          "max_rel_err": 0.05263157894736842
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 3689.6,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 2785.15,
+      "speedup_vs_cuda1": 1.5900400337504264
+    },
+    {
+      "shape": {
+        "b_size": 128,
+        "ncols_x": 5376,
+        "nrows_x": 21504
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 5772.4,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 3978.1,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 3605.0,
+          "correct": false,
+          "max_rel_err": 0.05263157894736842
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 3547.9,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile32",
+      "winner_time_us": 3547.9,
+      "speedup_vs_cuda1": 1.6269906141661263
+    },
+    {
+      "shape": {
+        "b_size": 256,
+        "ncols_x": 5376,
+        "nrows_x": 21504
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 11943.3,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 7051.25,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 7236.65,
+          "correct": false,
+          "max_rel_err": 0.05263157894736842
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 5901.3,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile32",
+      "winner_time_us": 5901.3,
+      "speedup_vs_cuda1": 2.023842204260078
+    },
+    {
+      "shape": {
+        "b_size": 512,
+        "ncols_x": 5376,
+        "nrows_x": 21504
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 24366.7,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 13308.65,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 14493.4,
+          "correct": false,
+          "max_rel_err": 0.05263157894736842
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 11004.8,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile32",
+      "winner_time_us": 11004.8,
+      "speedup_vs_cuda1": 2.214188354172725
+    },
+    {
+      "shape": {
+        "b_size": 128,
+        "ncols_x": 21504,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 4053.05,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 3901.2,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 4795.8,
+          "correct": true,
+          "max_rel_err": 0.0008363031199569661
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 6590.6,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 3901.2,
+      "speedup_vs_cuda1": 1.0389239208448684
+    },
+    {
+      "shape": {
+        "b_size": 256,
+        "ncols_x": 21504,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2",
+          "time_us": 11250.4,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile16",
+          "time_us": 6300.6,
+          "correct": true,
+          "max_rel_err": 0.0
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2f_tile32",
+          "time_us": 9479.15,
+          "correct": true,
+          "max_rel_err": 0.0008363031199569661
+        },
+        {
+          "variant": "mul_mat_q4_0_gfx906_v2_tile32",
+          "time_us": 7751.4,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_q4_0_gfx906_v2_tile16",
+      "winner_time_us": 6300.6,
+      "speedup_vs_cuda1": 1.785607719899692
+    }
+  ]
+}

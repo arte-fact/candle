@@ -1,0 +1,27 @@
+[
+  { "b_size": 64,  "ncols_x": 2560, "nrows_x": 2560   },
+  { "b_size": 128, "ncols_x": 2560, "nrows_x": 2560   },
+  { "b_size": 256, "ncols_x": 2560, "nrows_x": 2560   },
+  { "b_size": 512, "ncols_x": 2560, "nrows_x": 2560   },
+
+  { "b_size": 64,  "ncols_x": 2560, "nrows_x": 10240  },
+  { "b_size": 128, "ncols_x": 2560, "nrows_x": 10240  },
+  { "b_size": 256, "ncols_x": 2560, "nrows_x": 10240  },
+  { "b_size": 512, "ncols_x": 2560, "nrows_x": 10240  },
+
+  { "b_size": 64,  "ncols_x": 10240, "nrows_x": 2560  },
+  { "b_size": 128, "ncols_x": 10240, "nrows_x": 2560  },
+  { "b_size": 256, "ncols_x": 10240, "nrows_x": 2560  },
+
+  { "b_size": 64,  "ncols_x": 5376,  "nrows_x": 5376  },
+  { "b_size": 128, "ncols_x": 5376,  "nrows_x": 5376  },
+  { "b_size": 256, "ncols_x": 5376,  "nrows_x": 5376  },
+  { "b_size": 512, "ncols_x": 5376,  "nrows_x": 5376  },
+
+  { "b_size": 128, "ncols_x": 5376,  "nrows_x": 21504 },
+  { "b_size": 256, "ncols_x": 5376,  "nrows_x": 21504 },
+  { "b_size": 512, "ncols_x": 5376,  "nrows_x": 21504 },
+
+  { "b_size": 128, "ncols_x": 21504, "nrows_x": 5376  },
+  { "b_size": 256, "ncols_x": 21504, "nrows_x": 5376  }
+]

@@ -79,6 +79,14 @@ struct Args {
     #[arg(long)]
     out: String,
 
+    /// Which kernel family to autotune.
+    ///   `q8_0_mmvq` = Q8_0 decode MMVQ (V1; negative-result baseline).
+    ///   `q4_0_mmq`  = Q4_0 prefill MMQ — tile_n ∈ {8, 16, 32}.
+    ///   `q4_1_mmq`  = Q4_1 prefill MMQ — tile_n ∈ {8, 16, 32, 64} × {v2f, v2d, legacy}.
+    ///   `q8_0_mmq`  = Q8_0 prefill MMQ — tile_n ∈ {8, 16, 32}.
+    #[arg(long, default_value = "q8_0_mmvq")]
+    kernel: String,
+
     /// Warmup iterations before each timed run.
     #[arg(long, default_value_t = 3)]
     warmup: usize,
@@ -111,7 +119,7 @@ fn main() -> Result<()> {
         _ => unreachable!("new_hip should return a Hip device"),
     };
     println!("HIP device: {:?}", device.location());
-    println!("benching {} shapes × {} variants", shapes.len(), 8 + 1);
+    println!("kernel: {}", args.kernel);
 
     let mut out_shapes: Vec<ShapeBench> = Vec::with_capacity(shapes.len());
 
@@ -120,10 +128,17 @@ fn main() -> Result<()> {
             "\n[{}/{}] shape b_size={} K={} N={}",
             i + 1, shapes.len(), shape.b_size, shape.ncols_x, shape.nrows_x,
         );
-        match bench_shape(*shape, &device, &dev_hip, args.warmup, args.reps, args.tol) {
+        let result = match args.kernel.as_str() {
+            "q8_0_mmvq" => bench_shape(*shape, &device, &dev_hip, args.warmup, args.reps, args.tol),
+            "q4_0_mmq" => bench_mmq(*shape, GgmlDType::Q4_0, &device, &dev_hip, args.warmup, args.reps, args.tol),
+            "q4_1_mmq" => bench_mmq(*shape, GgmlDType::Q4_1, &device, &dev_hip, args.warmup, args.reps, args.tol),
+            "q8_0_mmq" => bench_mmq(*shape, GgmlDType::Q8_0, &device, &dev_hip, args.warmup, args.reps, args.tol),
+            other => anyhow::bail!("unknown --kernel {other:?}"),
+        };
+        match result {
             Ok(b) => {
                 println!(
-                    "  → winner: {:<12} {:>7.1} µs/call ({:.2}× cuda1)",
+                    "  → winner: {:<40} {:>7.1} µs/call ({:.2}× ref)",
                     b.winner, b.winner_time_us, b.speedup_vs_cuda1,
                 );
                 out_shapes.push(b);
@@ -138,7 +153,7 @@ fn main() -> Result<()> {
         schema_version: 1,
         target: detect_target(&dev_hip).unwrap_or_else(|| "gfx906".to_string()),
         generated_at: chrono_like_ts(),
-        dtype: "q8_0_mmvq".to_string(),
+        dtype: args.kernel.clone(),
         shapes: out_shapes,
     };
     let json = serde_json::to_string_pretty(&out).context("encoding output")?;
@@ -423,6 +438,258 @@ fn launch_cfg_for(name: &str, b_size: usize, nrows: u32) -> LaunchConfig {
             shared_mem_bytes: 0,
         }
     }
+}
+
+/// Q4_0 / Q4_1 / Q8_0 MMQ (prefill) per-tile_n autotune. Mirrors the
+/// dispatcher at `candle-core/src/quantized/hip.rs:743-927`.
+///
+/// Variants per dtype come directly from that dispatcher's match block:
+///   Q4_0 → v2 (tile8), v2_tile16, v2f_tile32, v2_tile32 (legacy)
+///   Q4_1 → v2 (tile8), v2_tile16, v2f_tile32, v2d_tile32, v2_tile32, v2_tile64
+///   Q8_0 → v2 (tile8), v2_tile16, v2f_tile32, v2_tile32 (legacy)
+///
+/// For MMQ, `b_size` is interpreted as `total_b` (the M dimension / query
+/// count per forward, i.e. prompt-len × batch for prefill). Launch config
+/// is `grid=(ceil(nrows/TILE_M=64), ceil(total_b/tile_n), 1)`,
+/// `block=(64, 1, 1)`, `shared=0`. Y padded to `ceil(total_b/tile_n) * tile_n`.
+fn bench_mmq(
+    shape: Shape,
+    dtype: GgmlDType,
+    device: &Device,
+    dev_hip: &candle_core::hip_backend::HipDevice,
+    warmup: usize,
+    reps: usize,
+    tol: f64,
+) -> Result<ShapeBench> {
+    let k = shape.ncols_x;
+    let n = shape.nrows_x;
+    let total_b = shape.b_size;   // M dim for MMQ
+
+    // Variants: (kernel_name, tile_n).
+    let variants: Vec<(&str, usize)> = match dtype {
+        GgmlDType::Q4_0 => vec![
+            ("mul_mat_q4_0_gfx906_v2",         8),
+            ("mul_mat_q4_0_gfx906_v2_tile16",  16),
+            ("mul_mat_q4_0_gfx906_v2f_tile32", 32),
+            ("mul_mat_q4_0_gfx906_v2_tile32",  32),  // legacy
+        ],
+        GgmlDType::Q4_1 => vec![
+            ("mul_mat_q4_1_gfx906_v2",         8),
+            ("mul_mat_q4_1_gfx906_v2_tile16",  16),
+            ("mul_mat_q4_1_gfx906_v2f_tile32", 32),
+            ("mul_mat_q4_1_gfx906_v2d_tile32", 32),
+            ("mul_mat_q4_1_gfx906_v2_tile32",  32),
+            ("mul_mat_q4_1_gfx906_v2_tile64",  64),
+        ],
+        GgmlDType::Q8_0 => vec![
+            ("mul_mat_q8_0_gfx906_v2",         8),
+            ("mul_mat_q8_0_gfx906_v2_tile16",  16),
+            ("mul_mat_q8_0_gfx906_v2f_tile32", 32),
+            ("mul_mat_q8_0_gfx906_v2_tile32",  32),
+        ],
+        _ => anyhow::bail!("unsupported MMQ dtype {dtype:?}"),
+    };
+
+    // Weight: (N, K) f32 → quantize to `dtype`.
+    let weight_data: Vec<f32> = (0..n * k)
+        .map(|i| ((i.wrapping_mul(31).wrapping_add(7)) % 127) as f32 / 63.0 - 1.0)
+        .collect();
+    let weight = Tensor::new(weight_data.as_slice(), device)?.reshape((n, k))?;
+    let qweight = QTensor::quantize(&weight, dtype)?;
+    let q_host = qweight.data()?.to_vec();
+    let q_dev = unsafe { dev_hip.alloc::<u8>(q_host.len())? };
+    unsafe {
+        let rc = hipdarc::sys::hipMemcpy(
+            q_dev.device_ptr() as *mut std::ffi::c_void,
+            q_host.as_ptr() as *const std::ffi::c_void,
+            q_host.len(),
+            hipdarc::sys::hipMemcpyKind::hipMemcpyHostToDevice,
+        );
+        if rc != hipdarc::sys::hipError_t::hipSuccess {
+            anyhow::bail!("hipMemcpy weight: {:?}", rc);
+        }
+    }
+    let q_view = q_dev.slice(0..q_dev.len());
+
+    // Y input: (total_b, K) f32.
+    let y_data: Vec<f32> = (0..total_b * k)
+        .map(|i| ((i.wrapping_mul(17).wrapping_add(11)) % 31) as f32 / 15.0 - 1.0)
+        .collect();
+    let y_t = Tensor::new(y_data.as_slice(), device)?.reshape((total_b, k))?;
+    let (y_st, _y_l) = y_t.storage_and_layout();
+    let y_view_f32 = match &*y_st {
+        candle_core::Storage::Hip(s) => {
+            let sl = s.as_hip_slice::<f32>()?;
+            sl.slice(0..sl.len())
+        }
+        _ => anyhow::bail!("y not on HIP"),
+    };
+    use candle_core::quantized::hip::{quantize_q8_1, pad, MATRIX_ROW_PADDING};
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    const Q8_1_BLOCK_BYTES: usize = 36;
+    const QK8_1: usize = 32;
+
+    // Per-variant tile_n needs its OWN Y-padded buffer; we allocate the
+    // largest (tile_n=64 → total_b_padded=ceil(total_b/64)*64) once and
+    // reuse by writing only the in-range rows (padding rows stay zero
+    // since we alloc_zeros for the v2f safety).
+    let max_tile_n = variants.iter().map(|(_, t)| *t).max().unwrap();
+    let total_b_padded_max = total_b.div_ceil(max_tile_n) * max_tile_n;
+    let y_q8_bytes = total_b_padded_max * k_padded * Q8_1_BLOCK_BYTES / QK8_1;
+    // alloc_zeros so v2f OOB reads see zeros.
+    let mut y_q8 = dev_hip.alloc_zeros::<u8>(y_q8_bytes)?;
+    quantize_q8_1(&y_view_f32, &mut y_q8, k, total_b, dev_hip)?;
+    drop(y_st);
+    let y_view_q8 = y_q8.slice(0..y_q8.len());
+
+    // Dst: (total_b, N) f32.
+    let dst = unsafe { dev_hip.alloc::<f32>(total_b * n)? };
+    let dst_view = dst.slice(0..dst.len());
+
+    const TILE_M: u32 = 64;
+
+    let launch = |name: &str, tile_n: usize, timed: usize, warm: usize| -> Result<f64> {
+        let func = dev_hip.get_or_load_func(name, &candle_hip_kernels::QUANTIZED)?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (n as u32).div_ceil(TILE_M),
+                (total_b as u32).div_ceil(tile_n as u32),
+                1,
+            ),
+            block_dim: (WARP_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let ncols_x = k as i32;
+        let nrows_x = n as i32;
+        let ncols_y = total_b as i32;
+        let nrows_y = k_padded as i32;
+        let nrows_dst = n as i32;
+        for _ in 0..warm {
+            let mut bld = func.builder();
+            bld.arg(&q_view);
+            bld.arg(&y_view_q8);
+            bld.arg(&dst_view);
+            bld.arg(&ncols_x);
+            bld.arg(&nrows_x);
+            bld.arg(&ncols_y);
+            bld.arg(&nrows_y);
+            bld.arg(&nrows_dst);
+            unsafe { bld.launch(cfg) }.w()?;
+        }
+        let _ = dev_hip.stream().synchronize();
+        let t0 = std::time::Instant::now();
+        for _ in 0..timed {
+            let mut bld = func.builder();
+            bld.arg(&q_view);
+            bld.arg(&y_view_q8);
+            bld.arg(&dst_view);
+            bld.arg(&ncols_x);
+            bld.arg(&nrows_x);
+            bld.arg(&ncols_y);
+            bld.arg(&nrows_y);
+            bld.arg(&nrows_dst);
+            unsafe { bld.launch(cfg) }.w()?;
+        }
+        let _ = dev_hip.stream().synchronize();
+        Ok(t0.elapsed().as_micros() as f64 / timed as f64)
+    };
+
+    let snapshot = || -> Result<Vec<f32>> {
+        let mut host = vec![0f32; total_b * n];
+        unsafe {
+            let rc = hipdarc::sys::hipMemcpy(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                dst.device_ptr() as *const std::ffi::c_void,
+                host.len() * 4,
+                hipdarc::sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+            );
+            if rc != hipdarc::sys::hipError_t::hipSuccess {
+                anyhow::bail!("dst DtoH: {:?}", rc);
+            }
+        }
+        Ok(host)
+    };
+
+    // Reference = first variant.
+    let ref_name = variants[0].0;
+    let ref_tile = variants[0].1;
+    let _ = launch(ref_name, ref_tile, 1, 0)?;
+    let _ = dev_hip.stream().synchronize();
+    let reference = snapshot()?;
+
+    let mut results: Vec<VariantResult> = Vec::with_capacity(variants.len());
+    for (name, tile_n) in &variants {
+        let _ = launch(name, *tile_n, 1, 0)?;
+        let _ = dev_hip.stream().synchronize();
+        let got = match snapshot() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("    {name}: snapshot failed: {e}");
+                results.push(VariantResult {
+                    variant: name.to_string(),
+                    time_us: f64::INFINITY,
+                    correct: false,
+                    max_rel_err: f64::INFINITY,
+                });
+                continue;
+            }
+        };
+        let max_rel = max_rel_err(&reference, &got);
+        let correct = max_rel <= tol;
+        let t_us = match launch(name, *tile_n, reps, warmup) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("    {name}: timing failed: {e}");
+                results.push(VariantResult {
+                    variant: name.to_string(),
+                    time_us: f64::INFINITY,
+                    correct,
+                    max_rel_err: max_rel,
+                });
+                continue;
+            }
+        };
+        println!(
+            "    {:<40} {:>7.1} µs  max_rel_err={:>.2e}  {}",
+            name, t_us, max_rel, if correct { "ok" } else { "WRONG" }
+        );
+        results.push(VariantResult {
+            variant: name.to_string(),
+            time_us: t_us,
+            correct,
+            max_rel_err: max_rel,
+        });
+    }
+
+    let winner = results
+        .iter()
+        .filter(|v| v.correct)
+        .min_by(|a, b| a.time_us.partial_cmp(&b.time_us).unwrap())
+        .cloned()
+        .unwrap_or_else(|| VariantResult {
+            variant: ref_name.to_string(),
+            time_us: f64::INFINITY,
+            correct: false,
+            max_rel_err: f64::INFINITY,
+        });
+    let ref_time = results
+        .iter()
+        .find(|v| v.variant == ref_name)
+        .map(|v| v.time_us)
+        .unwrap_or(f64::NAN);
+    let speedup = if ref_time.is_finite() && winner.time_us > 0.0 {
+        ref_time / winner.time_us
+    } else {
+        1.0
+    };
+
+    Ok(ShapeBench {
+        shape,
+        winner: winner.variant.clone(),
+        winner_time_us: winner.time_us,
+        speedup_vs_cuda1: speedup,
+        variants: results,
+    })
 }
 
 fn max_rel_err(reference: &[f32], got: &[f32]) -> f64 {
