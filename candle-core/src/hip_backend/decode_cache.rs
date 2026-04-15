@@ -859,6 +859,18 @@ impl DecodePlan {
     /// advanced/patched before calling this.
     pub unsafe fn replay(&self, dev: &HipDevice) -> crate::Result<()> {
         let debug = std::env::var("CANDLE_G2_DEBUG").is_ok();
+        let trace_replay = std::env::var("CANDLE_G2_V1_TRACE").is_ok();
+        if trace_replay {
+            eprintln!(
+                "[V1-trace] replay #{} ENTRY ({} ops, first={}@dev{}, last={}@dev{})",
+                self.replay_count, self.ops.len(),
+                self.ops.first().map(|o| o.name.as_str()).unwrap_or(""),
+                self.ops.first().map(|o| o.device_ordinal).unwrap_or(-1),
+                self.ops.last().map(|o| o.name.as_str()).unwrap_or(""),
+                self.ops.last().map(|o| o.device_ordinal).unwrap_or(-1),
+            );
+        }
+        let t0 = std::time::Instant::now();
         // Per-kernel-name GPU-time profiler: when CANDLE_G2_OP_PROFILE=1,
         // sync the stream after each kernel and accumulate elapsed time
         // by kernel name. Prints a sorted summary at the end. This is
@@ -880,7 +892,38 @@ impl DecodePlan {
         let mut arg_ptrs: Vec<*mut c_void> = Vec::with_capacity(max_args);
 
         for (idx, op) in self.ops.iter().enumerate() {
+            if trace_replay && (idx < 8 || idx % 400 == 0 || idx == self.ops.len() - 1) {
+                eprintln!(
+                    "[V1-trace] replay[{:>4}/{}] dev={} kernel={}",
+                    idx, self.ops.len(), op.device_ordinal, op.name
+                );
+            }
             if op.device_ordinal != current_dev {
+                // Phase V1 fix: the normal (non-replay) forward path crosses
+                // devices via `Tensor::to_device` which routes HIP→HIP through
+                // a CPU round-trip (tensor.rs:2394-2398) — that produces an
+                // implicit sync barrier.  In the captured plan those memcpys
+                // are NOT recorded (decode_cache records kernel launches
+                // only), so without the barrier the downstream device would
+                // launch kernels that read data the upstream device hasn't
+                // finished producing.  Symptoms: async replay on multi-GPU
+                // MoE makes no forward progress (spins forever), while
+                // `CANDLE_G2_DEBUG=1` per-op sync "works" because each
+                // launch implicitly serialises.
+                //
+                // Sync the OLD device's stream before switching.  For MoE on
+                // 4 GPU that adds ~4 syncs per replay (once per cross-device
+                // boundary along the pipeline), trivial vs the 1874 launches.
+                if current_dev >= 0 {
+                    let _ = hipdarc::sys::hipSetDevice(current_dev);
+                    let rc = hipdarc::sys::hipDeviceSynchronize();
+                    if rc != hipdarc::sys::hipError_t::hipSuccess {
+                        crate::bail!(
+                            "decode_cache replay: pre-switch sync on device {} failed with {:?}",
+                            current_dev, rc
+                        );
+                    }
+                }
                 let rc = hipdarc::sys::hipSetDevice(op.device_ordinal);
                 if rc != hipdarc::sys::hipError_t::hipSuccess {
                     crate::bail!(
@@ -930,6 +973,42 @@ impl DecodePlan {
                     );
                 }
             }
+        }
+
+        if trace_replay {
+            eprintln!(
+                "[V1-trace] replay #{} launched {} kernels in {:.2} ms (dispatch only)",
+                self.replay_count, self.ops.len(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let t_sync = std::time::Instant::now();
+        // Phase V1: final multi-device sync.  The normal-flow Rust model
+        // code calls `Tensor::to_device` at every cross-device layer boundary,
+        // which goes through a CPU round-trip (tensor.rs:2394) and implicitly
+        // serialises devices.  Replay skips those CPU bounces, so after the
+        // last kernel we need to make every device's stream drain before
+        // returning — otherwise the Rust-side CPU code that consumes the
+        // replay output can race against in-flight GPU work on another
+        // device.  Cheap: at most 4 syncs per replay on 4 GPU.
+        for ord in 0..=current_dev.max(0) {
+            let _ = hipdarc::sys::hipSetDevice(ord);
+            let rc = hipdarc::sys::hipDeviceSynchronize();
+            if rc != hipdarc::sys::hipError_t::hipSuccess {
+                crate::bail!(
+                    "decode_cache replay: final sync on device {} failed with {:?}",
+                    ord, rc
+                );
+            }
+        }
+
+        if trace_replay {
+            eprintln!(
+                "[V1-trace] replay #{} final sync in {:.2} ms (total {:.2} ms)",
+                self.replay_count,
+                t_sync.elapsed().as_secs_f64() * 1000.0,
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
         }
 
         if op_profile {
