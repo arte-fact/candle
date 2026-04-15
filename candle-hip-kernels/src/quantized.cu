@@ -177,6 +177,18 @@ typedef struct {
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == sizeof(ggml_fp16_t) * 2 + QK4_1 / 2, "wrong q4_1 block size/padding");
 
+// MXFP4 (Microscaling FP4) — one E8M0 shared exponent + 32 4-bit e2m1 quants.
+// Used by qwen3next shared experts (ffn_gate_shexp / ffn_up_shexp).  Layout
+// matches `ggml-common.h:204-208`.  The 16 distinct dequantised values come
+// from the `mxfp4_kvalues_lut` below.
+#define QK_MXFP4 32
+#define QI_MXFP4 (QK_MXFP4 / (4 * 2)) /* 4 ints after nibble-pack, same as QI4_0 */
+typedef struct {
+    uint8_t e;
+    uint8_t qs[QK_MXFP4 / 2];
+} block_mxfp4;
+static_assert(sizeof(block_mxfp4) == 1 + QK_MXFP4 / 2, "wrong mxfp4 block size/padding");
+
 #define QK5_0 32
 #define QR5_0 2
 #define QI5_0 (QK5_0 / (4 * QR5_0))
@@ -2604,6 +2616,213 @@ template<int width>
 static __device__ __forceinline__ float gfx906_half_warp_reduce_sum(float x) {
     static_assert(width == 32, "DPP half-warp reduce only supports width=32");
     return gfx906_half_warp_reduce_sum_dpp(x);
+}
+
+// ---------------------------------------------------------------------------
+// MXFP4 MMVQ helpers
+// ---------------------------------------------------------------------------
+
+// E8M0 scale → fp32, with the implicit 0.5 factor baked in (matches
+// `ggml_e8m0_to_fp32_half` in ggml-impl.h:471 and candle's CPU impl).
+static __device__ __forceinline__ float mxfp4_e8m0_to_fp32_half(uint8_t e) {
+    uint32_t bits;
+    if (e < 2) {
+        // Denormal: 2^(-128) for e=0, 2^(-127) for e=1.
+        bits = 0x00200000u << e;
+    } else {
+        // Normal: 0.5 * 2^(e - 127) = 2^(e - 128) → biased exponent (e - 1).
+        bits = ((uint32_t) e - 1u) << 23;
+    }
+    return __uint_as_float(bits);
+}
+
+// Pack four 4-bit codes in the low 4 bits of each byte of `x` into four
+// int8 values looked up from the MXFP4 decode table.  Output packs the
+// four int8 lanes back into an int (little-endian) so the standard
+// `dp4a` chain (as used for Q4_0 / Q4_1) keeps working.
+//
+// Decode table (16 entries, matches `KVALUES_MXFP4` in k_quants.rs:131,
+// which itself matches ggml's lookup table × 2 so that the shared scale
+// is `0.5 * 2^e` instead of `2^e`):
+//     [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12]
+static __device__ __forceinline__ int mxfp4_decode4(int x) {
+    static constexpr int8_t KV[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    int out = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int nib = (x >> (8 * i)) & 0x0F;
+        const int8_t v = KV[nib];
+        out |= ((uint32_t) (uint8_t) v) << (8 * i);
+    }
+    return out;
+}
+
+// Warp-cooperative MXFP4 MMVQ — mirrors `mul_mat_vec_q4_0_q8_1_cuda1`
+// (gfx906 warp_coop, 64 threads / block = 2 rows; each half-warp sums
+// across `blocks_per_row` 32-elem blocks with the dp4a chain).  The
+// only differences vs Q4_0 are:
+//   (a) nibble → int8 goes through `mxfp4_decode4`, not the identity
+//       mask `& 0x0F0F0F0F` that Q4_0 uses.
+//   (b) the dequantised weight has no -8 offset, so the scale-back
+//       formula drops the `- 8 * ds8.y` term.
+//   (c) the weight scale is E8M0 decoded with the 0.5× baked in.
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_mxfp4_q8_1_cuda1(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK_MXFP4;
+    const block_mxfp4 * x = (const block_mxfp4 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_mxfp4 * bw  = x + ib;
+        const block_q8_1  * bq8 = y + ib;
+
+        int v0, v1, v2, v3;
+        memcpy(&v0, bw->qs +  0, 4);
+        memcpy(&v1, bw->qs +  4, 4);
+        memcpy(&v2, bw->qs +  8, 4);
+        memcpy(&v3, bw->qs + 12, 4);
+
+        const int4 q8_lo = *((const int4 *) (bq8->qs));
+        const int4 q8_hi = *((const int4 *) (bq8->qs + 16));
+
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v0 >> 0) & 0x0F0F0F0F), q8_lo.x, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v0 >> 4) & 0x0F0F0F0F), q8_hi.x, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v1 >> 0) & 0x0F0F0F0F), q8_lo.y, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v1 >> 4) & 0x0F0F0F0F), q8_hi.y, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v2 >> 0) & 0x0F0F0F0F), q8_lo.z, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v2 >> 4) & 0x0F0F0F0F), q8_hi.z, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v3 >> 0) & 0x0F0F0F0F), q8_lo.w, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v3 >> 4) & 0x0F0F0F0F), q8_hi.w, sumi);
+
+        const float  d_w = mxfp4_e8m0_to_fp32_half(bw->e);
+        const float2 ds8 = __half22float2(bq8->ds);
+        sumf += d_w * ((float) sumi * ds8.x);
+    }
+
+    sumf = gfx906_half_warp_reduce_sum<32>(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
+// Multi-column b_size ≥ 2 path.  Simple non-warp-coop kernel (one warp
+// per output row).  Grid = (nrows/nwarps, b_size, 1), block = (64, nwarps).
+template <int b_size_>
+static __device__ __forceinline__ void mul_mat_vec_mxfp4_q8_1_body(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+
+    const int tid = threadIdx.x;
+    const int wid = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int row = blockIdx.x * nwarps + wid;
+    const int col_batch = blockIdx.y;  // 0..b_size-1
+
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK_MXFP4;
+    const block_mxfp4 * x = (const block_mxfp4 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy + col_batch * blocks_per_row;
+
+    float sumf = 0.0f;
+    for (int ib = tid; ib < blocks_per_row; ib += WARP_SIZE) {
+        const block_mxfp4 * bw  = x + ib;
+        const block_q8_1  * bq8 = y + ib;
+
+        int v0, v1, v2, v3;
+        memcpy(&v0, bw->qs +  0, 4);
+        memcpy(&v1, bw->qs +  4, 4);
+        memcpy(&v2, bw->qs +  8, 4);
+        memcpy(&v3, bw->qs + 12, 4);
+
+        const int4 q8_lo = *((const int4 *) (bq8->qs));
+        const int4 q8_hi = *((const int4 *) (bq8->qs + 16));
+
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v0 >> 0) & 0x0F0F0F0F), q8_lo.x, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v0 >> 4) & 0x0F0F0F0F), q8_hi.x, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v1 >> 0) & 0x0F0F0F0F), q8_lo.y, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v1 >> 4) & 0x0F0F0F0F), q8_hi.y, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v2 >> 0) & 0x0F0F0F0F), q8_lo.z, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v2 >> 4) & 0x0F0F0F0F), q8_hi.z, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v3 >> 0) & 0x0F0F0F0F), q8_lo.w, sumi);
+        sumi = ggml_cuda_dp4a(mxfp4_decode4((v3 >> 4) & 0x0F0F0F0F), q8_hi.w, sumi);
+
+        const float  d_w = mxfp4_e8m0_to_fp32_half(bw->e);
+        const float2 ds8 = __half22float2(bq8->ds);
+        sumf += d_w * ((float) sumi * ds8.x);
+    }
+
+    // Warp reduce over 64 lanes.
+#pragma unroll
+    for (int m = 32; m > 0; m >>= 1) {
+        sumf += __shfl_xor(sumf, m, 64);
+    }
+    if (tid == 0) {
+        dst[col_batch * nrows_dst + row] = sumf;
+    }
+}
+
+extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda2(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_mxfp4_q8_1_body<2>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda3(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_mxfp4_q8_1_body<3>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda4(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_mxfp4_q8_1_body<4>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda5(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_mxfp4_q8_1_body<5>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda6(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_mxfp4_q8_1_body<6>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda7(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_mxfp4_q8_1_body<7>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
+}
+extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda8(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+    mul_mat_vec_mxfp4_q8_1_body<8>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
 extern "C" __global__ void __launch_bounds__(64, 1)

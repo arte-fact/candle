@@ -232,8 +232,7 @@ extern "C" __global__ void quantize_q8_1_mmq_q4_0(
     const int ki = b * 128 + tid;    // global K index
     const float xi = (ki < ncols) ? x[c * ncols + ki] : 0.0f;
 
-    // Reduce max|xi| and sum(xi) within the 32-lane sub-block.
-    // HIP __shfl_xor with width=32 keeps the lanes partitioned.
+    // (Shared tail with the gather variant below.)
     float amax = fabsf(xi);
     float ssum = xi;
 #pragma unroll
@@ -249,15 +248,56 @@ extern "C" __global__ void quantize_q8_1_mmq_q4_0(
 
     uint8_t * y_bytes = (uint8_t *) vy
                         + ((size_t)(b * total_b + c)) * Q8_1_MMQ_BYTES;
-
-    // qs[tid] is just the per-thread int8.
     ((int8_t *) (y_bytes + 16))[tid] = q;
+    if (lane_in_sub == 0) {
+        half2 * ds = (half2 *) y_bytes;
+        ds[sub] = __floats2half2_rn(d, ssum);
+    }
+}
 
-    // Lane 0 of each sub-block writes the (d, sum) half2.  ds8.y is the
-    // *raw* f32 sum of the sub-block (turbo quantize.cu:346 —
-    // `ds4[iqs/32] = make_half2(d, sum)`).  The vec_dot formula uses it
-    // as `d4 * (sumi*d_y - 8*sum_raw)` where 8*sum_raw ≈ 8*d_y*Σy_int8
-    // reverses the Q4_0 nibble-to-int8 offset.
+// ================================================================
+// MoE gather-quantize: same DS4 Q8_1 output, but the `c` grid-dim
+// indexes a BUCKET POSITION (sorted-by-expert) rather than a token.
+// Each thread reads the input row through `ids_src1[c]` so the output
+// tensor comes out **physically sorted**: all tokens for expert 0
+// first, then expert 1, etc. — exactly what llama.cpp does
+// (quantize.cu:195 `i01 = ids ? ids[i1] : i1`).  The MMQ-MoE kernel
+// can then read Y stride-1 with no indirection in the hot K-loop.
+// ================================================================
+
+extern "C" __global__ void quantize_q8_1_mmq_gather(
+    const float * __restrict__ x,        // [n_tokens_src, ncols] row-major
+    const int   * __restrict__ ids_src1, // [total_pos] bucket_pos -> source token
+    void *        __restrict__ vy,       // [n_big_blocks * total_pos] blocks of 144 B
+    const int ncols,                     // K dim
+    const int total_pos) {               // bucket count (= n_tokens * topk)
+
+    const int b   = blockIdx.x;
+    const int c   = blockIdx.y;          // bucket position (0..total_pos)
+    const int tid = threadIdx.x;
+    const int sub = tid / 32;
+    const int lane_in_sub = tid % 32;
+
+    const int src_row = ids_src1[c];     // gather source token for this bucket pos
+    const int ki = b * 128 + tid;
+    const float xi = (ki < ncols) ? x[src_row * ncols + ki] : 0.0f;
+
+    float amax = fabsf(xi);
+    float ssum = xi;
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, m, 32));
+        ssum = ssum + __shfl_xor(ssum, m, 32);
+    }
+
+    const float d = amax / 127.0f;
+    const int8_t q =
+        (amax == 0.0f) ? (int8_t)0
+                       : (int8_t)__float2int_rn(xi / d);
+
+    uint8_t * y_bytes = (uint8_t *) vy
+                        + ((size_t)(b * total_pos + c)) * Q8_1_MMQ_BYTES;
+    ((int8_t *) (y_bytes + 16))[tid] = q;
     if (lane_in_sub == 0) {
         half2 * ds = (half2 *) y_bytes;
         ds[sub] = __floats2half2_rn(d, ssum);
@@ -876,6 +916,277 @@ static __device__ void mul_mat_q8_0_turbo_impl(
 }
 
 // ================================================================
+// MoE bucket prep (M6a): three tiny helpers that turn `topk_ids`
+// (shape [n_tokens, topk], each entry ∈ [0, n_experts)) into:
+//   counts        [n_experts]       # tokens routed to each expert
+//   expert_bounds [n_experts + 1]   exclusive prefix sum of counts
+//   ids_src1      [n_tokens*topk]   bucket_pos  -> source token idx
+//   ids_dst       [n_tokens*topk]   bucket_pos  -> flat dst idx
+//                                   = token*topk + slot
+//
+// `bucket_pos` walks experts in order: for expert e, positions
+// [expert_bounds[e], expert_bounds[e+1]) hold the bucket of tokens
+// routed to e (in whatever atomic-order the scatter produces —
+// shape-equivalent to llama.cpp's mmid.cu).
+// ================================================================
+
+// Kernel 1: atomicAdd count per expert.  Grid (ceil(total/256), 1, 1).
+extern "C" __global__ void moe_bucket_count(
+    const unsigned int * __restrict__ topk_ids,
+    const int total_pos,
+    int * __restrict__ counts) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_pos) return;
+    atomicAdd(&counts[topk_ids[tid]], 1);
+}
+
+// Kernel 2: single-block Hillis-Steele scan (n_experts ≤ 512 for gemma4).
+// Input  : counts[n_experts]
+// Output : expert_bounds[n_experts + 1] = exclusive prefix sum (bounds[0]=0,
+//          bounds[i+1] = counts[0]+..+counts[i]).
+// Block  : 512 threads.
+extern "C" __global__ void moe_bucket_prefix(
+    const int * __restrict__ counts,
+    const int n_experts,
+    int * __restrict__ expert_bounds) {
+    __shared__ int tmp[512];
+    const int tid = threadIdx.x;
+    tmp[tid] = (tid < n_experts) ? counts[tid] : 0;
+    __syncthreads();
+    for (int off = 1; off < 512; off <<= 1) {
+        int v = (tid >= off) ? tmp[tid - off] : 0;
+        __syncthreads();
+        tmp[tid] += v;
+        __syncthreads();
+    }
+    if (tid == 0) expert_bounds[0] = 0;
+    if (tid < n_experts) expert_bounds[tid + 1] = tmp[tid];
+}
+
+// Kernel 3: scatter bucket positions.  `cursor` must be pre-zeroed.
+// For each topk entry (token, slot) assigned to expert e:
+//   bp = expert_bounds[e] + atomicAdd(&cursor[e], 1)
+//   ids_src1[bp] = token
+//   ids_dst [bp] = token * topk + slot
+extern "C" __global__ void moe_bucket_scatter(
+    const unsigned int * __restrict__ topk_ids,
+    const int total_pos,       // = n_tokens * topk
+    const int topk,
+    const int * __restrict__ expert_bounds,
+    int * __restrict__ cursor,
+    int * __restrict__ ids_src1,
+    int * __restrict__ ids_dst) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_pos) return;
+    const int token = tid / topk;
+    const int slot  = tid % topk;
+    const int e     = (int) topk_ids[tid];
+    const int bp    = expert_bounds[e] + atomicAdd(&cursor[e], 1);
+    ids_src1[bp] = token;
+    ids_dst [bp] = token * topk + slot;
+}
+
+// ================================================================
+// mul_mat_q_turbo_moe_impl — generic MoE MMQ kernel template (M7).
+// One template parameterised on dtype tag DT ∈ {MOE_Q4_0, MOE_Q4_1, MOE_Q8_0}.
+// Grid   : (ceil(nrows_x / MMQ_Y), ntx_max, n_experts)
+// Block  : (WARP_SIZE, MMQ_NWARPS, 1) = (64, 4, 1)
+//
+// Design mirrors llama.cpp's mul_mat_q (mmq.cuh:3594-3647 non-CDNA path,
+// 3608-3631 MoE branch):
+//   - Y is physically sorted by expert by the gather-quantize step
+//     (quantize_q8_1_mmq_gather above), laid out `[n_big_blocks, total_pos]`
+//     with bucket_pos walking experts in prefix-sum order.
+//   - Per block: read expert_bounds[zt] / [zt+1] to find this expert's
+//     bucket range, skip if empty or tile past bucket, pre-load the
+//     ids_dst indices for this tile into LDS.
+//   - Hot K-loop reads Y stride-1 from `vy + (col_low + jt*mmq_x) * sz`.
+//   - Write-back scatters via ids_dst_shared[j] to `[tokens, topk, n]`.
+//
+// NOTE on the Y-load bound guard: `mmq_x * MMQ_TILE_Y_K` (e.g. 8*36=288)
+// is not always a multiple of nwarps*warp_size (e.g. 4*64=256), so the
+// cooperative load has a tail iteration where `l >= mmq_x*MMQ_TILE_Y_K`.
+// Per-thread bound check skips the overshoot so we don't walk past
+// total_pos into foreign memory.
+//
+// Per-dtype specialisation (MMQ_Y, x-tile LDS size, load_tiles, vec_dot,
+// x_scales type) is picked by `if constexpr` — the compiler produces one
+// specialised kernel per (DT, mmq_x, need_check) triple from a single body.
+// ================================================================
+
+enum MoeDType : int {
+    MOE_Q4_0 = 0,
+    MOE_Q4_1 = 1,
+    MOE_Q8_0 = 2,
+};
+
+template <MoeDType DT> struct moe_dtype_traits;
+template <> struct moe_dtype_traits<MOE_Q4_0> {
+    static constexpr int  mmq_y        = MMQ_Y;
+    static constexpr int  x_qs_ints    = MMQ_Y * (MMQ_TILE_NE_K + 1);
+    static constexpr int  block_bytes  = sizeof(block_q4_0);    // 18
+    static constexpr bool half2_scales = false;                 // uses float x_df
+};
+template <> struct moe_dtype_traits<MOE_Q4_1> {
+    static constexpr int  mmq_y        = MMQ_Y;
+    static constexpr int  x_qs_ints    = MMQ_Y * (MMQ_TILE_NE_K + 1);
+    static constexpr int  block_bytes  = sizeof(block_q4_1);    // 20
+    static constexpr bool half2_scales = true;                  // uses half2 x_dm
+};
+template <> struct moe_dtype_traits<MOE_Q8_0> {
+    static constexpr int  mmq_y        = MMQ_Y_Q8;              // 64, not 128
+    static constexpr int  x_qs_ints    = MMQ_Y_Q8 * (2 * MMQ_TILE_NE_K + 1);
+    static constexpr int  block_bytes  = sizeof(block_q8_0);    // 34
+    static constexpr bool half2_scales = false;
+};
+
+template <MoeDType DT, int mmq_x, bool need_check>
+static __device__ void mul_mat_q_turbo_moe_impl(
+    const void  * __restrict__ vx,
+    const void  * __restrict__ vy,
+    const int   * __restrict__ ids_dst,
+    const int   * __restrict__ expert_bounds,
+    float       * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,                    // = n (rows per expert slab)
+    const int stride_col_y,               // = total_pos (big-block stride in Y)
+    const int stride_row_x,               // = blocks per X row = k/32
+    const int stride_expert_blocks,       // = nrows_x * stride_row_x
+    const int nrows_dst) {                // = n
+
+    using Tr = moe_dtype_traits<DT>;
+    constexpr int MMQ_Y_R   = Tr::mmq_y;
+    constexpr int X_QS_T    = Tr::x_qs_ints;
+
+    extern __shared__ int shared_buf[];
+    int   * tile_y = shared_buf;
+    int   * x_qs   = tile_y + GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+    // x_df (float) and x_dm (half2) occupy the same bytes — we pick the
+    // right alias per dtype.  Both sized `MMQ_Y_R * 8 + MMQ_Y_R / 4` 4-byte slots.
+    float * x_df   = (float *) (x_qs + X_QS_T);
+    half2 * x_dm   = (half2 *) (x_qs + X_QS_T);
+
+    const int expert   = blockIdx.z;
+    const int col_low  = expert_bounds[expert];
+    const int col_high = expert_bounds[expert + 1];
+    const int col_diff = col_high - col_low;
+
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+
+    if (col_diff <= 0)          return;
+    if (jt * mmq_x >= col_diff) return;
+
+    __shared__ int ids_dst_shared[64];
+    {
+        const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+        if (tid < mmq_x) {
+            const int local_j = jt * mmq_x + tid;
+            ids_dst_shared[tid] =
+                (local_j < col_diff) ? ids_dst[col_low + local_j] : -1;
+        }
+    }
+    __syncthreads();
+
+    // Weight base for this expert's row slab.
+    const char * vx_expert = (const char *) vx
+        + (size_t) expert * stride_expert_blocks * Tr::block_bytes;
+
+    const int * y_base = (const int *) vy + (col_low + jt * mmq_x) * Q8_1_MMQ_INTS;
+
+    constexpr int sum_slots = mmq_x * MMQ_Y_R / (MMQ_NWARPS * WARP_SIZE);
+    float sum[sum_slots];
+#pragma unroll
+    for (int s = 0; s < sum_slots; ++s) sum[s] = 0.0f;
+
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK8_0;  // 8 (same QK=32 for all)
+    const int n_blocks_x = ncols_x / QK8_0;
+    const int kb0_stop   = (n_blocks_x + blocks_per_iter - 1)
+                         / blocks_per_iter * blocks_per_iter;
+    const int i_max = nrows_x - it * MMQ_Y_R - 1;
+
+    constexpr int TILE_Y_INTS =
+        GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+
+    for (int kb0 = 0; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int kb_remaining =
+            (n_blocks_x - kb0 < blocks_per_iter) ? (n_blocks_x - kb0)
+                                                 : blocks_per_iter;
+        const int kbx0 = it * MMQ_Y_R * stride_row_x + kb0;
+        const int i_max_arg = need_check ? i_max : 0;
+
+        if constexpr (DT == MOE_Q4_0) {
+            load_tiles_q4_0<need_check>(
+                vx_expert, x_qs, x_df, kbx0, i_max_arg, kb_remaining, stride_row_x);
+        } else if constexpr (DT == MOE_Q4_1) {
+            load_tiles_q4_1<need_check>(
+                vx_expert, x_qs, x_dm, kbx0, i_max_arg, kb_remaining, stride_row_x);
+        } else {
+            load_tiles_q8_0<need_check>(
+                vx_expert, x_qs, x_df, kbx0, i_max_arg, kb_remaining, stride_row_x);
+        }
+
+        // Y first half (big_block = kb0/4).  Stride-1, no indirection.
+        const int * by0 =
+            y_base + (size_t) stride_col_y * (kb0 / 4) * Q8_1_MMQ_INTS;
+#pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) {
+                tile_y[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        if constexpr (DT == MOE_Q4_0) {
+            vec_dot_q4_0_q8_1_dp4a<mmq_x>(x_qs, x_df, tile_y, sum, 0);
+        } else if constexpr (DT == MOE_Q4_1) {
+            vec_dot_q4_1_q8_1_dp4a<mmq_x>(x_qs, x_dm, tile_y, sum, 0);
+        } else {
+            vec_dot_q8_0_q8_1_dp4a<mmq_x>(x_qs, x_df, tile_y, sum, 0);
+        }
+        __syncthreads();
+
+        // Y second half (big_block + 1).
+        const int * by1 =
+            y_base + (size_t) stride_col_y * ((kb0 / 4) * Q8_1_MMQ_INTS + Q8_1_MMQ_INTS);
+#pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) {
+                tile_y[l] = by1[l];
+            }
+        }
+        __syncthreads();
+        if constexpr (DT == MOE_Q4_0) {
+            vec_dot_q4_0_q8_1_dp4a<mmq_x>(x_qs, x_df, tile_y, sum, MMQ_TILE_NE_K);
+        } else if constexpr (DT == MOE_Q4_1) {
+            vec_dot_q4_1_q8_1_dp4a<mmq_x>(x_qs, x_dm, tile_y, sum, MMQ_TILE_NE_K);
+        } else {
+            vec_dot_q8_0_q8_1_dp4a<mmq_x>(x_qs, x_df, tile_y, sum, MMQ_TILE_NE_K);
+        }
+        __syncthreads();
+    }
+
+    // Scatter write-back: dst[ ids_dst_shared[j] * nrows_dst + row_g ].
+#pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+        const int j       = j0 + threadIdx.y;
+        const int local_j = jt * mmq_x + j;
+        if (local_j >= col_diff) continue;
+        const int dst_base = ids_dst_shared[j];
+        if (dst_base < 0) continue;
+#pragma unroll
+        for (int i0 = 0; i0 < MMQ_Y_R; i0 += WARP_SIZE) {
+            const int i     = i0 + threadIdx.x;
+            const int row_g = it * MMQ_Y_R + i;
+            if (need_check && row_g >= nrows_x) continue;
+            dst[(size_t) dst_base * nrows_dst + row_g] =
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y_R / WARP_SIZE) + i0 / WARP_SIZE];
+        }
+    }
+}
+
+// ================================================================
 // extern "C" entry points: one per (dtype × mmq_x × need_check).
 // ================================================================
 
@@ -930,3 +1241,40 @@ MMQ_TURBO_EXPORT(64, false, unchecked)
 MMQ_TURBO_EXPORT(64, true,  checked)
 
 #undef MMQ_TURBO_EXPORT
+
+// M7: MoE MMQ externs for Q4_0 / Q4_1 / Q8_0.  (No ids_src1 here — the
+// gather happened at quantize time; Y is already expert-sorted.)
+#define MMQ_TURBO_MOE_EXPORT_ONE(DTYPE_TAG, DT_ENUM, MMQ_X, CHECK, SUFFIX)   \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                            \
+    void mul_mat_##DTYPE_TAG##_turbo_moe_x##MMQ_X##_##SUFFIX(               \
+        const void  * __restrict__ vx,                                      \
+        const void  * __restrict__ vy,                                      \
+        const int   * __restrict__ ids_dst,                                 \
+        const int   * __restrict__ expert_bounds,                           \
+        float       * __restrict__ dst,                                     \
+        const int ncols_x, const int nrows_x,                               \
+        const int stride_col_y, const int stride_row_x,                     \
+        const int stride_expert_blocks, const int nrows_dst) {              \
+        mul_mat_q_turbo_moe_impl<DT_ENUM, MMQ_X, CHECK>(                    \
+            vx, vy, ids_dst, expert_bounds, dst,                            \
+            ncols_x, nrows_x, stride_col_y, stride_row_x,                   \
+            stride_expert_blocks, nrows_dst);                               \
+    }
+
+#define MMQ_TURBO_MOE_EXPORT(MMQ_X, CHECK, SUFFIX)                          \
+    MMQ_TURBO_MOE_EXPORT_ONE(q4_0, MOE_Q4_0, MMQ_X, CHECK, SUFFIX)          \
+    MMQ_TURBO_MOE_EXPORT_ONE(q4_1, MOE_Q4_1, MMQ_X, CHECK, SUFFIX)          \
+    MMQ_TURBO_MOE_EXPORT_ONE(q8_0, MOE_Q8_0, MMQ_X, CHECK, SUFFIX)
+
+MMQ_TURBO_MOE_EXPORT( 8, false, unchecked)
+MMQ_TURBO_MOE_EXPORT( 8, true,  checked)
+MMQ_TURBO_MOE_EXPORT(16, false, unchecked)
+MMQ_TURBO_MOE_EXPORT(16, true,  checked)
+MMQ_TURBO_MOE_EXPORT(32, false, unchecked)
+MMQ_TURBO_MOE_EXPORT(32, true,  checked)
+MMQ_TURBO_MOE_EXPORT(64, false, unchecked)
+MMQ_TURBO_MOE_EXPORT(64, true,  checked)
+
+#undef MMQ_TURBO_MOE_EXPORT
+#undef MMQ_TURBO_MOE_EXPORT_ONE
