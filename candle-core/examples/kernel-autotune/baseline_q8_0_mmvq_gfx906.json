@@ -1,0 +1,350 @@
+{
+  "schema_version": 1,
+  "target": "gfx906",
+  "generated_at": "unix:1776278786",
+  "dtype": "q8_0_mmvq",
+  "shapes": [
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 2560,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 18.233333333333334,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 18.233333333333334,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 84.23333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 84.23333333333333,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 10240,
+        "nrows_x": 2560
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 58.766666666666666,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 58.766666666666666,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 2560,
+        "nrows_x": 262144
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 1270.3333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 1270.3333333333333,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 4096,
+        "nrows_x": 4096
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 57.13333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 57.13333333333333,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 4096,
+        "nrows_x": 12288
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 125.9,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 125.9,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 12288,
+        "nrows_x": 4096
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 111.16666666666667,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 111.16666666666667,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 4096,
+        "nrows_x": 151936
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 1174.3333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 1174.3333333333333,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 5376,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 73.53333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 73.53333333333333,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 5376,
+        "nrows_x": 21504
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 253.6,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 253.6,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 21504,
+        "nrows_x": 5376
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 247.4,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 247.4,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 2816,
+        "nrows_x": 2048
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 16.3,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 16.3,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 1,
+        "ncols_x": 2048,
+        "nrows_x": 2816
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda1",
+          "time_us": 15.633333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda1",
+      "winner_time_us": 15.633333333333333,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 2,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda2",
+          "time_us": 46.2,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda2",
+      "winner_time_us": 46.2,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 4,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda4",
+          "time_us": 115.6,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda4",
+      "winner_time_us": 115.6,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 8,
+        "ncols_x": 2560,
+        "nrows_x": 10240
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda8",
+          "time_us": 183.03333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda8",
+      "winner_time_us": 183.03333333333333,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 2,
+        "ncols_x": 5376,
+        "nrows_x": 21504
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda2",
+          "time_us": 184.43333333333334,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda2",
+      "winner_time_us": 184.43333333333334,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 4,
+        "ncols_x": 5376,
+        "nrows_x": 21504
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda4",
+          "time_us": 363.7,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda4",
+      "winner_time_us": 363.7,
+      "speedup_vs_cuda1": 1.0
+    },
+    {
+      "shape": {
+        "b_size": 8,
+        "ncols_x": 5376,
+        "nrows_x": 21504
+      },
+      "variants": [
+        {
+          "variant": "mul_mat_vec_q8_0_q8_1_cuda8",
+          "time_us": 625.1333333333333,
+          "correct": true,
+          "max_rel_err": 0.0
+        }
+      ],
+      "winner": "mul_mat_vec_q8_0_q8_1_cuda8",
+      "winner_time_us": 625.1333333333333,
+      "speedup_vs_cuda1": 1.0
+    }
+  ]
+}
