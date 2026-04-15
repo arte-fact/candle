@@ -364,6 +364,7 @@ pub fn launch_mul_mat_vec_q8_1_chunk(
         GgmlDType::Q4K => "mul_mat_vec_q4_K_q8_1_cuda",
         GgmlDType::Q5K => "mul_mat_vec_q5_K_q8_1_cuda",
         GgmlDType::Q6K => "mul_mat_vec_q6_K_q8_1_cuda",
+        GgmlDType::Mxfp4 => "mul_mat_vec_mxfp4_q8_1_cuda",
         _ => crate::bail!("unsupported dtype for quantized matmul {dtype:?}"),
     };
     // Q4K/Q5K warp-coop are correct as of Phase B3-redo (2026-04-13).
@@ -398,7 +399,7 @@ pub fn launch_mul_mat_vec_q8_1_chunk(
         && (matches!(
                 dtype,
                 GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0
-                | GgmlDType::Q4K | GgmlDType::Q5K
+                | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Mxfp4
             )
             || (q6_warp_coop && matches!(dtype, GgmlDType::Q6K)));
     let cfg = if warp_coop {
@@ -1166,43 +1167,269 @@ fn indexed_moe_forward_f16_f32(
     ))
 }
 
-fn indexed_moe_forward_fused_q8_1_input(
+/// M6/M7: Gate Q4_0 / Q4_1 / Q8_0 MoE prefill through the turbo-tile MMQ
+/// kernel family (mul_mat_{q4_0,q4_1,q8_0}_turbo_moe_*) instead of the
+/// per-token MMVQ kernel.  Returns `Ok(Some(..))` when the fast path
+/// handled the call, else `Ok(None)`.
+///
+/// Entered when ALL of:
+///   CANDLE_MMQ_TURBO_PORT=1  (or just CANDLE_MMQ_TURBO_MOE=1 alone)
+///   w_dtype ∈ {Q4_0, Q4_1, Q8_0}
+///   input_dim1 == 1           (pre-topk activation, [tokens,1,k])
+///   k % 32 == 0               (shared QK block size)
+///   tokens * topk / n_experts >= MOE_MMQ_MIN_AVG_TOKENS (small batches go MMVQ)
+///
+/// Pipeline: bucket prep (count / prefix / scatter) → quantize_q8_1_mmq_gather
+/// (physically sorts Q8_1 by expert) → mul_mat_{dtype}_turbo_moe.
+/// Scatter kernel writes into the same `[tokens, topk, n]` row-major layout
+/// the MMVQ path produces, so this is a drop-in replacement.
+fn indexed_moe_forward_turbo_moe(
     weight: &HipView<'_, u8>,
-    w_shape: &crate::Shape, //[num_experts, n, k]
+    w_shape: &crate::Shape,     // [n_experts, n, k]
     w_dtype: GgmlDType,
-    input: &HipSlice<f32>,
-    in_shape: &crate::Shape, //[batch, topk or 1, k]
+    input: &HipSlice<f32>,      // raw f32 [tokens, 1, k] contiguous
+    in_shape: &crate::Shape,
+    ids: &HipView<'_, u32>,     // [tokens, topk]
+    idx_shape: &crate::Shape,
+    dev: &HipDevice,
+) -> Result<Option<(HipStorage, crate::Shape)>> {
+    const MOE_MMQ_MIN_AVG_TOKENS: usize = 4;
+    const MMQ_NWARPS: u32 = 4;
+    const MMQ_TILE_NE_K: usize = 32;
+    const MMQ_TILE_Y_K: usize = MMQ_TILE_NE_K + MMQ_TILE_NE_K / 8; // 36
+    const Q8_1_MMQ_BYTES: usize = 144;
+    const BIG_BLOCK_ELEMS: usize = 128;
+
+    // Per-dtype MMQ tile row count (see mmq_turbo.cu moe_dtype_traits).
+    // Q8_0 uses 64-row tile (U1 LDS fit); Q4_0/Q4_1 keep llama.cpp's 128.
+    let (dtype_tag, mmq_y_rows): (&str, usize) = match w_dtype {
+        GgmlDType::Q4_0 => ("q4_0", 128),
+        GgmlDType::Q4_1 => ("q4_1", 128),
+        GgmlDType::Q8_0 => ("q8_0", 64),
+        _ => return Ok(None),
+    };
+
+    // Gate: CANDLE_MMQ_TURBO_PORT=1 enables M2/M3/M6/M7; CANDLE_MMQ_TURBO_MOE=0
+    // can disable just the MoE path without disabling the regular MMQ port.
+    let port_on = std::env::var("CANDLE_MMQ_TURBO_PORT").map(|v| v == "1").unwrap_or(false);
+    let moe_on = std::env::var("CANDLE_MMQ_TURBO_MOE").map(|v| v != "0").unwrap_or(true);
+    if !(port_on && moe_on) {
+        return Ok(None);
+    }
+
+    let (n_experts, n, k) = w_shape.dims3()?;
+    let tokens = in_shape.dims()[0];
+    let input_dim1 = in_shape.dims()[1];
+    let topk = idx_shape.dims()[1];
+
+    // Shape constraints.  input_dim1==1 because gemma4/qwen reshape to
+    // [tokens,1,k] before this call; the bucket prep expects flat
+    // [tokens, topk] ids.
+    if input_dim1 != 1 || k % 32 != 0 || n_experts > 512 {
+        return Ok(None);
+    }
+    let total_pos = tokens * topk;
+    if total_pos == 0 {
+        // Empty — let caller handle.
+        return Ok(None);
+    }
+    // Average tokens per expert. Small batches (decode, b=1) benefit more
+    // from MMVQ (one block per output row with one token each).
+    if total_pos < MOE_MMQ_MIN_AVG_TOKENS * n_experts {
+        return Ok(None);
+    }
+
+    // Pick mmq_x based on expected bucket fill. Small fill wastes a tile;
+    // large fill shrinks grid. mmq_x=32 is a safe default at ~32 tok/expert.
+    let avg = total_pos / n_experts;
+    let mmq_x: usize = if avg >= 48 {
+        64
+    } else if avg >= 24 {
+        32
+    } else if avg >= 12 {
+        16
+    } else {
+        8
+    };
+
+    // ---- Bucket prep: counts / expert_bounds / ids_src1 / ids_dst ----
+    // counts[n_experts] — zero init via alloc_zeros (3 int atomics don't need warmup).
+    let counts = dev.alloc_zeros::<i32>(n_experts)?;
+    // total_pos fits comfortably in 256 threads per block.
+    {
+        let func = dev.get_or_load_func("moe_bucket_count", &candle_hip_kernels::MMQ_TURBO)?;
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (ceil_div(total_pos, 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(ids);
+        barg!(b, total_pos as i32);
+        b.arg(&counts);
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    // expert_bounds[n_experts+1]. Single-block scan (512 threads covers ≤ 512 experts).
+    let expert_bounds = dev.alloc_zeros::<i32>(n_experts + 1)?;
+    {
+        let func = dev.get_or_load_func("moe_bucket_prefix", &candle_hip_kernels::MMQ_TURBO)?;
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&counts);
+        barg!(b, n_experts as i32);
+        b.arg(&expert_bounds);
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    // ids_src1 / ids_dst / cursor (zeroed). Scatter via atomicAdd(cursor[e], 1).
+    let cursor = dev.alloc_zeros::<i32>(n_experts)?;
+    let ids_src1 = unsafe { dev.alloc::<i32>(total_pos)? };
+    let ids_dst = unsafe { dev.alloc::<i32>(total_pos)? };
+    {
+        let func = dev.get_or_load_func("moe_bucket_scatter", &candle_hip_kernels::MMQ_TURBO)?;
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (ceil_div(total_pos, 256) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(ids);
+        barg!(b, total_pos as i32, topk as i32);
+        b.arg(&expert_bounds);
+        b.arg(&cursor);
+        b.arg(&ids_src1);
+        b.arg(&ids_dst);
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    // ---- Gather-quantize f32 input → block_q8_1_mmq, PHYSICALLY SORTED by expert.
+    // One bucket_pos per output col; each reads the original token via
+    // `ids_src1[bucket_pos]` and writes to `Y[big_block, bucket_pos]`.  After
+    // this kernel, Y is contiguous per expert — the MMQ kernel reads stride-1.
+    // +1 trailing big-block is zeroed so the K-loop second-half read at the
+    // last kb0 iter lands on zero (harmless, d_y=0).
+    let n_big_blocks_real = ceil_div(k, BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_pos * Q8_1_MMQ_BYTES;
+    let y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+    {
+        let qkernel =
+            dev.get_or_load_func("quantize_q8_1_mmq_gather", &candle_hip_kernels::MMQ_TURBO)?;
+        let qcfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (n_big_blocks_real as u32, total_pos as u32, 1),
+            block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qkernel.builder();
+        let input_view = input.slice(0..input.len());
+        qb.arg(&input_view);
+        qb.arg(&ids_src1);
+        qb.arg(&y_mmq);
+        barg!(qb, k as i32, total_pos as i32);
+        unsafe { qb.launch(qcfg) }.w()?;
+    }
+
+    // ---- Output: [tokens, topk, n] row-major. Every (token, topk_slot, row)
+    // is written by the MMQ kernel via ids_dst scatter (one bucket pos per slot). ----
+    // SAFETY: the MoE MMQ kernel writes to every dst[ids_dst_shared[j] * n + row_g]
+    // for bucket_pos ∈ [0, total_pos) (the scatter covers all of ids_dst)
+    // and row_g ∈ [0, n); the `need_check` variant gates row_g < nrows_x for
+    // the last row-tile.
+    let outsize = tokens * topk * n;
+    let out = unsafe { dev.alloc::<f32>(outsize)? };
+
+    // ---- MMQ MoE launch ----
+    let need_check = n % mmq_y_rows != 0;
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let kernel_name = format!("mul_mat_{dtype_tag}_turbo_moe_x{mmq_x}_{suffix}");
+
+    let tile_y_ints = {
+        let raw = mmq_x * MMQ_TILE_Y_K;
+        let pad_u = MMQ_NWARPS as usize * WARP_SIZE;
+        raw.div_ceil(pad_u) * pad_u
+    };
+    // Q8_0 doubles x_qs per row (8 ints/block, not 4 after nibble pack);
+    // Q4_0 and Q4_1 use the compact layout.  See moe_dtype_traits in
+    // mmq_turbo.cu.
+    let x_qs_ints = if matches!(w_dtype, GgmlDType::Q8_0) {
+        mmq_y_rows * (2 * MMQ_TILE_NE_K + 1)
+    } else {
+        mmq_y_rows * (MMQ_TILE_NE_K + 1)
+    };
+    let x_df_flts = mmq_y_rows * 8 + mmq_y_rows / 4;
+    let shared_mem_bytes = (tile_y_ints + x_qs_ints) * 4 + x_df_flts * 4;
+
+    let blocks_per_row_x = k / 32;
+    let stride_expert_blocks = n * blocks_per_row_x;
+    let grid_y = ceil_div(total_pos, mmq_x) as u32;
+
+    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(n, mmq_y_rows) as u32,
+            grid_y,
+            n_experts as u32,
+        ),
+        block_dim: (WARP_SIZE as u32, MMQ_NWARPS, 1),
+        shared_mem_bytes: shared_mem_bytes as u32,
+    };
+    let mut builder = func.builder();
+    builder.arg(weight);
+    builder.arg(&y_mmq);
+    builder.arg(&ids_dst);
+    builder.arg(&expert_bounds);
+    builder.arg(&out);
+    barg!(
+        builder,
+        k as i32,
+        n as i32,
+        total_pos as i32,           // stride_col_y (big-block stride in Y = total bucket count)
+        blocks_per_row_x as i32,
+        stride_expert_blocks as i32,
+        n as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    let mut out_shape = in_shape.dims().to_vec();
+    out_shape.pop();
+    out_shape.push(n);
+    out_shape[1] = topk;
+    Ok(Some((
+        HipStorage::wrap_hip_slice(out, dev.clone()),
+        out_shape.into(),
+    )))
+}
+
+/// Launch the dtype-specific `indexed_moe_forward_*_q8_1` kernel given a
+/// pre-built Q8_1 activation buffer.  Shared between the public preq8 API
+/// (where the caller has already quantised the input — saves a kernel
+/// dispatch when the same activation feeds multiple matmuls, e.g. router +
+/// gate_up_exps in a MoE FFN) and `indexed_moe_forward_fused_q8_1_input`.
+///
+/// The Q8_1 layout is the standard per-row `block_q8_1` × `num_blocks_per_row`
+/// produced by `quantize_q8_1` — identical to what `fwd_with_preq8` consumes.
+#[allow(clippy::too_many_arguments)]
+fn launch_indexed_moe_forward_with_q8(
+    weight: &HipView<'_, u8>,
+    w_shape: &crate::Shape,
+    w_dtype: GgmlDType,
+    input_q8_1: &HipView<'_, u8>,
+    in_shape: &crate::Shape,           // [batch, topk_or_1, k]
     ids: &HipView<'_, u32>,
-    idx_shape: &crate::Shape, //[batch, topk]
+    idx_shape: &crate::Shape,          // [batch, topk]
     dev: &HipDevice,
 ) -> Result<(HipStorage, crate::Shape)> {
     let (_, n, k) = w_shape.dims3()?;
     let batch = in_shape.dims()[0];
     let input_dim1 = in_shape.dims()[1];
-
     let topk = idx_shape.dims()[1];
-    assert!(batch == idx_shape.dims()[0], "batch dim not match!");
-
-    // Quantize input into q8_1.
-    let total_rows = batch * input_dim1;
     let k_padded = pad(k, MATRIX_ROW_PADDING);
-    // Get Q8_1 metadata.
-    let q8_1_block_size = GgmlDType::Q8_1.block_size();
-    let q8_1_type_size = GgmlDType::Q8_1.type_size();
 
-    // Calculate the size of the output buffer in bytes.
-    let num_blocks_per_row = k_padded / q8_1_block_size;
-    let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
-    let y_size_in_bytes = total_rows * dst_row_size_bytes;
-    // quantize_q8_1 writes every block (tail cols past `k` land on 0 via
-    // the in-kernel gate), so we can skip the zero fill.
-    // SAFETY: quantize_q8_1 fully writes input_quant on the next line.
-    let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
-
-    let input_view = input.slice(0..input.len());
-    quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
-
-    // Output buffer [batch, topk, n]: fully written by the kernel.
     // SAFETY: indexed_moe_forward_*_q8_1 writes every element of `out`.
     let outsize = batch * topk * n;
     let out = unsafe { dev.alloc::<f32>(outsize)? };
@@ -1230,10 +1457,9 @@ fn indexed_moe_forward_fused_q8_1_input(
 
     let mut builder = func.builder();
     builder.arg(weight);
-    builder.arg(&input_quant);
+    builder.arg(input_q8_1);
     builder.arg(ids);
     builder.arg(&out);
-
     barg!(
         builder,
         n as i32,
@@ -1253,6 +1479,54 @@ fn indexed_moe_forward_fused_q8_1_input(
         HipStorage::wrap_hip_slice(out, dev.clone()),
         out_shape.into(),
     ))
+}
+
+fn indexed_moe_forward_fused_q8_1_input(
+    weight: &HipView<'_, u8>,
+    w_shape: &crate::Shape, //[num_experts, n, k]
+    w_dtype: GgmlDType,
+    input: &HipSlice<f32>,
+    in_shape: &crate::Shape, //[batch, topk or 1, k]
+    ids: &HipView<'_, u32>,
+    idx_shape: &crate::Shape, //[batch, topk]
+    dev: &HipDevice,
+) -> Result<(HipStorage, crate::Shape)> {
+    let (_, n, k) = w_shape.dims3()?;
+    let batch = in_shape.dims()[0];
+    let input_dim1 = in_shape.dims()[1];
+
+    let topk = idx_shape.dims()[1];
+    assert!(batch == idx_shape.dims()[0], "batch dim not match!");
+
+    // M6/M7: Q4_0 / Q4_1 / Q8_0 MoE MMQ fast path (turbo-tile gather-by-expert).
+    // Bypasses the MMVQ per-token kernels for prefill-shaped MoE calls.  Returns
+    // None when the path is disabled or the shape doesn't qualify — fall through.
+    if matches!(w_dtype, GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0) {
+        if let Some(out) = indexed_moe_forward_turbo_moe(
+            weight, w_shape, w_dtype, input, in_shape, ids, idx_shape, dev,
+        )? {
+            return Ok(out);
+        }
+    }
+
+    // Quantize input into q8_1.
+    let total_rows = batch * input_dim1;
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+    let q8_1_type_size = GgmlDType::Q8_1.type_size();
+    let q8_1_block_size = GgmlDType::Q8_1.block_size();
+    let num_blocks_per_row = k_padded / q8_1_block_size;
+    let dst_row_size_bytes = num_blocks_per_row * q8_1_type_size;
+    let y_size_in_bytes = total_rows * dst_row_size_bytes;
+
+    // SAFETY: quantize_q8_1 fully writes input_quant.
+    let mut input_quant = unsafe { dev.alloc::<u8>(y_size_in_bytes)? };
+    let input_view = input.slice(0..input.len());
+    quantize_q8_1(&input_view, &mut input_quant, k, total_rows, dev)?;
+
+    let q8_view = input_quant.slice(0..input_quant.len());
+    launch_indexed_moe_forward_with_q8(
+        weight, w_shape, w_dtype, &q8_view, in_shape, ids, idx_shape, dev,
+    )
 }
 
 impl QHipStorage {
@@ -1310,6 +1584,55 @@ impl QHipStorage {
                 self.dtype()
             );
         }
+    }
+
+    /// MoE matmul that consumes a pre-quantized Q8_1 activation buffer
+    /// (Phase O1 — saves the per-call `quantize_q8_1` dispatch when the
+    /// same activation feeds multiple matmuls, e.g. router + gate + up).
+    ///
+    /// The Q8_1 layout matches `quantize_q8_1`: `(batch * input_dim1)` rows
+    /// of `k_padded / QK8_1` blocks of 36 bytes each.  Caller is responsible
+    /// for producing it (e.g. via `quantize_q8_1` on `x_flat`) and ensuring
+    /// `k` matches `self_shape`'s last dim.
+    ///
+    /// Falls back to the regular re-quantising path for F16 weights and
+    /// returns an error for any other unsupported dtype.
+    pub fn indexed_moe_forward_preq8(
+        &self,
+        self_shape: &crate::Shape,
+        input_q8_1: &HipView<'_, u8>,
+        in_shape: &crate::Shape,
+        ids: &HipView<'_, u32>,
+        idx_shape: &crate::Shape,
+    ) -> Result<(HipStorage, crate::Shape)> {
+        if !matches!(
+            self.dtype(),
+            GgmlDType::Q4_0
+                | GgmlDType::Q4_1
+                | GgmlDType::Q5_0
+                | GgmlDType::Q5_1
+                | GgmlDType::Q8_0
+                | GgmlDType::Q2K
+                | GgmlDType::Q3K
+                | GgmlDType::Q4K
+                | GgmlDType::Q5K
+                | GgmlDType::Q6K
+        ) {
+            crate::bail!(
+                "indexed_moe_forward_preq8: dtype {:?} not supported (use indexed_moe_forward)",
+                self.dtype()
+            );
+        }
+        launch_indexed_moe_forward_with_q8(
+            &self.data.inner.slice(0..self.data.inner.len()),
+            self_shape,
+            self.dtype(),
+            input_q8_1,
+            in_shape,
+            ids,
+            idx_shape,
+            &self.device,
+        )
     }
 
     pub fn zeros(device: &HipDevice, el_count: usize, dtype: GgmlDType) -> Result<Self> {
@@ -1758,11 +2081,33 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         std::slice::from_raw_parts(data.as_ptr() as *const u8, core::mem::size_of_val(data))
     };
     let dtype = T::DTYPE;
-    let padded_len = data.len() + MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
-    let mut inner = device.alloc_zeros::<u8>(padded_len)?;
-    device
-        .stream()
-        .memcpy_htod(&mut inner, data).w()?;
+    let tail_len = MATRIX_ROW_PADDING * dtype.type_size() / dtype.block_size();
+    let padded_len = data.len() + tail_len;
+    // Phase O3: alloc_uninit + targeted tail zero-fill.  The body (data.len()
+    // bytes) is immediately overwritten by `memcpy_htod`, so zeroing it was
+    // pure waste (the rocprofv3 trace showed `__amd_rocclr_fillBufferAligned`
+    // from model-load `alloc_zeros` as 18 % of total GPU time on a cold
+    // 24-tok decode — > 500 ms of wasted fill on a 42 GB model).  Only the
+    // trailing padding tail needs to stay zero — MMQ / MMVQ kernels pad
+    // OOB K-reads into it and rely on d=0 / qs=0 for no contribution.
+    // SAFETY: we fully write `[0, data.len())` via memcpy_htod and
+    // `[data.len(), padded_len)` via the tail memset below before returning.
+    let mut inner = unsafe { device.alloc::<u8>(padded_len)? };
+    device.stream().memcpy_htod(&mut inner, data).w()?;
+    if tail_len > 0 {
+        let tail_ptr = unsafe { (inner.device_ptr() as *mut u8).add(data.len()) };
+        let rc = unsafe {
+            hipdarc::sys::hipMemsetAsync(
+                tail_ptr as *mut std::ffi::c_void,
+                0,
+                tail_len,
+                device.stream().raw(),
+            )
+        };
+        if rc != hipdarc::sys::hipError_t::hipSuccess {
+            crate::bail!("hipMemsetAsync(tail) failed: {rc:?}");
+        }
+    }
     Ok(QStorage::Hip(QHipStorage {
         data: PaddedHipSlice {
             inner,

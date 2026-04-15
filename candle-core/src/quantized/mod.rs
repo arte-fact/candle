@@ -819,6 +819,47 @@ impl QTensor {
         }
     }
 
+    /// MoE matmul that consumes a pre-quantized Q8_1 activation buffer
+    /// (Phase O1).  Skips the per-call `quantize_q8_1` dispatch when the
+    /// same activation feeds multiple matmuls in a MoE layer (router +
+    /// gate + up).  HIP-only.
+    ///
+    /// `x_q8_1` must hold `(batch * input_dim1)` rows of Q8_1 blocks
+    /// (`k_padded / QK8_1` blocks of 36 bytes each), matching the layout
+    /// produced by `hip::quantize_q8_1`.
+    #[cfg(feature = "hip")]
+    pub fn indexed_moe_forward_preq8(
+        &self,
+        x_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        x_shape: &Shape,
+        ids: &crate::Tensor,
+    ) -> Result<crate::Tensor> {
+        match &self.storage {
+            QStorage::Hip(s) => {
+                let ids_storage = ids.storage();
+                let ids_hip = match &*ids_storage {
+                    Storage::Hip(h) => h,
+                    _ => crate::bail!("indexed_moe_forward_preq8: ids must be HIP"),
+                };
+                let ids_view = ids_hip.as_hip_slice::<u32>()?;
+                let (storage, out_shape) = s.indexed_moe_forward_preq8(
+                    self.shape(),
+                    x_q8_1,
+                    x_shape,
+                    &ids_view.slice(0..ids_view.len()),
+                    ids.layout().shape(),
+                )?;
+                Ok(crate::tensor::from_storage(
+                    Storage::Hip(storage),
+                    out_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                ))
+            }
+            _ => crate::bail!("indexed_moe_forward_preq8 is HIP-only"),
+        }
+    }
+
     /// Mat-vec multiply using a pre-quantized Q8_1 activation buffer.
     /// Skips the per-call `quantize_q8_1` dispatch — the caller must have
     /// already quantized the input via `quantize_q8_1` or `rmsnorm_q8_fused`.
@@ -932,10 +973,14 @@ impl QMatMul {
         let dequantize = match qtensor.dtype() {
             // F32/F16/BF16: trivially dequantize.
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => true,
-            // MXFP4: no native HIP/CUDA matmul kernel yet — always dequantize
-            // to F32 at load time and let `Self::Tensor` handle the matmul via
-            // the regular F32 path.
+            // MXFP4: native HIP MMVQ kernel landed in Phase O2
+            // (`mul_mat_vec_mxfp4_q8_1_cuda{1..=8}` + dispatch in
+            // `launch_mul_mat_vec_q8_1_chunk`).  Keep dequantised on CUDA
+            // / Metal until those backends grow their own kernels.
+            #[cfg(not(feature = "hip"))]
             GgmlDType::Mxfp4 => true,
+            #[cfg(feature = "hip")]
+            GgmlDType::Mxfp4 => false,
             // IQ4_XS: no native GPU matmul kernel; dequantize to F32 at load.
             // Used by Unsloth "UD" dynamic quants for ~5 % of tensors — the
             // per-model dequant cost is small (e.g. Devstral: 20/363 tensors).
@@ -983,6 +1028,21 @@ impl QMatMul {
             _ => {
                 panic!("Not implemented!")
             }
+        }
+    }
+
+    /// MoE matmul with pre-quantized Q8_1 input (Phase O1).  HIP-only.
+    /// See `QTensor::indexed_moe_forward_preq8` for the layout contract.
+    #[cfg(feature = "hip")]
+    pub fn indexed_moe_forward_preq8(
+        &self,
+        x_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        x_shape: &Shape,
+        ids: &Tensor,
+    ) -> Result<Tensor> {
+        match self {
+            Self::QTensor(t) => t.indexed_moe_forward_preq8(x_q8_1, x_shape, ids),
+            _ => crate::bail!("indexed_moe_forward_preq8 only supports QTensor"),
         }
     }
 
