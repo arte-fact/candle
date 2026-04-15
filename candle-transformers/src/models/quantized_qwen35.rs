@@ -205,8 +205,26 @@ impl ModelWeights {
         }
         let mut normed_for_attn = self.layers[0].attn_norm.forward(&h)?;
 
+        // T6 layer profiler — `CANDLE_LAYER_PROFILE=1` env-gated.
+        // Tallies per-sublayer wall-time across all layers per forward.
+        #[cfg(feature = "hip")]
+        let layer_profile = std::env::var("CANDLE_LAYER_PROFILE").is_ok();
+        #[cfg(feature = "hip")]
+        let mut t_mask_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_attn_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_norm1_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_ffn_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_norm2_us = 0u128;
+
         for il in 0..layers_len {
             let layer_dev = self.layers[il].device.clone();
+
+            #[cfg(feature = "hip")]
+            let _t_mask_start = std::time::Instant::now();
 
             let mask_for_layer = if l == 1 {
                 None
@@ -218,6 +236,14 @@ impl ModelWeights {
                 }
                 mask_cache.get(&key).cloned()
             };
+
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_dev { let _ = d.stream().synchronize(); }
+                t_mask_us += _t_mask_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_attn_start = std::time::Instant::now();
 
             // Attention. The mutable borrow of `self.layers[il].attn` is
             // scoped to this match so the next field accesses don't
@@ -231,12 +257,36 @@ impl ModelWeights {
                 }
             };
 
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_dev { let _ = d.stream().synchronize(); }
+                t_attn_us += _t_attn_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_norm1_start = std::time::Instant::now();
+
             // Within-layer fusion: post_attn_norm(h + attn_out) + (h + attn_out)
             let (normed_for_ffn, h_after_attn) =
                 self.layers[il].post_attn_norm.forward_residual(&h, &attn_out)?;
             h = h_after_attn;
 
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_dev { let _ = d.stream().synchronize(); }
+                t_norm1_us += _t_norm1_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_ffn_start = std::time::Instant::now();
+
             let ffn_out = self.layers[il].ffn.forward(&normed_for_ffn)?;
+
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_dev { let _ = d.stream().synchronize(); }
+                t_ffn_us += _t_ffn_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_norm2_start = std::time::Instant::now();
 
             // Across-layer fusion: combine the post-FFN residual add with
             // the next layer's attn_norm into one launch when both live on
@@ -263,6 +313,22 @@ impl ModelWeights {
                     normed_for_attn = self.layers[il + 1].attn_norm.forward(&h)?;
                 }
             }
+
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_dev { let _ = d.stream().synchronize(); }
+                t_norm2_us += _t_norm2_start.elapsed().as_micros();
+            }
+        }
+
+        #[cfg(feature = "hip")]
+        if layer_profile {
+            let tot = t_mask_us + t_attn_us + t_norm1_us + t_ffn_us + t_norm2_us;
+            eprintln!(
+                "[layer-profile] mask={} attn={} norm1={} ffn={} norm2={} total={} (µs, summed across {} layers)",
+                t_mask_us, t_attn_us, t_norm1_us, t_ffn_us, t_norm2_us, tot,
+                self.layers.len(),
+            );
         }
 
         let h = self.norm.forward(&h)?;
