@@ -1187,7 +1187,9 @@ fn indexed_moe_forward_turbo_moe(
     weight: &HipView<'_, u8>,
     w_shape: &crate::Shape,     // [n_experts, n, k]
     w_dtype: GgmlDType,
-    input: &HipSlice<f32>,      // raw f32 [tokens, 1, k] contiguous
+    input: &HipSlice<f32>,      // raw f32 contiguous; layout is either
+                                // [tokens, 1, k]    (gate/up, shared across topk)
+                                // [tokens, topk, k] (down, per-slot activations)
     in_shape: &crate::Shape,
     ids: &HipView<'_, u32>,     // [tokens, topk]
     idx_shape: &crate::Shape,
@@ -1222,12 +1224,17 @@ fn indexed_moe_forward_turbo_moe(
     let input_dim1 = in_shape.dims()[1];
     let topk = idx_shape.dims()[1];
 
-    // Shape constraints.  input_dim1==1 because gemma4/qwen reshape to
-    // [tokens,1,k] before this call; the bucket prep expects flat
-    // [tokens, topk] ids.
-    if input_dim1 != 1 || k % 32 != 0 || n_experts > 512 {
+    // Shape constraints.
+    //   input_dim1 == 1     → gate/up pre-expansion (input shared across topk).
+    //   input_dim1 == topk  → down (silu_mul(gate,up) already expanded per-slot).
+    // Other input_dim1 values don't fit the bucket/scatter addressing model.
+    if !(input_dim1 == 1 || input_dim1 == topk)
+        || k % 32 != 0
+        || n_experts > 512
+    {
         return Ok(None);
     }
+
     let total_pos = tokens * topk;
     if total_pos == 0 {
         // Empty — let caller handle.
@@ -1299,7 +1306,7 @@ fn indexed_moe_forward_turbo_moe(
         };
         let mut b = func.builder();
         b.arg(ids);
-        barg!(b, total_pos as i32, topk as i32);
+        barg!(b, total_pos as i32, topk as i32, input_dim1 as i32);
         b.arg(&expert_bounds);
         b.arg(&cursor);
         b.arg(&ids_src1);

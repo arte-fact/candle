@@ -966,12 +966,20 @@ extern "C" __global__ void moe_bucket_prefix(
 // Kernel 3: scatter bucket positions.  `cursor` must be pre-zeroed.
 // For each topk entry (token, slot) assigned to expert e:
 //   bp = expert_bounds[e] + atomicAdd(&cursor[e], 1)
-//   ids_src1[bp] = token
+//   ids_src1[bp] = source row (see below)
 //   ids_dst [bp] = token * topk + slot
+//
+// `input_dim1` selects the source addressing mode:
+//   input_dim1 == 1       : input is [tokens, 1, k] shared across topk
+//                           (gate/up pre-expansion). src_row = token.
+//   input_dim1 == topk    : input is [tokens, topk, k] per-slot
+//                           (down, where silu_mul(gate,up) already expanded).
+//                           src_row = token * topk + slot = tid.
 extern "C" __global__ void moe_bucket_scatter(
     const unsigned int * __restrict__ topk_ids,
     const int total_pos,       // = n_tokens * topk
     const int topk,
+    const int input_dim1,
     const int * __restrict__ expert_bounds,
     int * __restrict__ cursor,
     int * __restrict__ ids_src1,
@@ -982,7 +990,7 @@ extern "C" __global__ void moe_bucket_scatter(
     const int slot  = tid % topk;
     const int e     = (int) topk_ids[tid];
     const int bp    = expert_bounds[e] + atomicAdd(&cursor[e], 1);
-    ids_src1[bp] = token;
+    ids_src1[bp] = (input_dim1 == 1) ? token : (token * input_dim1 + slot);
     ids_dst [bp] = token * topk + slot;
 }
 
