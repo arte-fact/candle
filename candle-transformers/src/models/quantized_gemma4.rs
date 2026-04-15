@@ -1673,6 +1673,11 @@ impl ModelWeights {
                         .arg_sort_last_dim(false)?
                         .narrow(candle::D::Minus1, 0, moe_branch.num_experts_used)?
                         .contiguous()?;
+                    // A3 / EPLB diagnostic — observe routing while ids live
+                    // on CPU.  No-op when CANDLE_EPLB_PRINT / _DUMP unset.
+                    if let Ok(v) = ids.flatten_all()?.to_vec1::<u32>() {
+                        crate::models::quantized_blocks::eplb::observe(&v, il);
+                    }
                     ids.to_device(&device)?
                 };
                 let topk_weights = rw_flat.gather(&topk_ids, candle::D::Minus1)?;

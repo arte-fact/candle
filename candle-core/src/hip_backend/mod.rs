@@ -9,6 +9,7 @@ use hipdarc::driver::{DeviceRepr, HipSlice, LaunchConfig, NullDevicePtr, PushKer
 use hipdarc::rocblas::{GemmDataType, GemmOp, StridedBatchedGemmConfig};
 use half::{bf16, f16};
 
+pub mod attn_backend;
 mod device;
 mod error;
 mod flash_attn;

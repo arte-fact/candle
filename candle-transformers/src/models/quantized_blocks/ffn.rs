@@ -525,12 +525,22 @@ impl MoeExperts {
                 .arg_sort_last_dim(false)?
                 .narrow(D::Minus1, 0, self.num_experts_per_tok)?
                 .contiguous()?;
+            // A3 / EPLB — observe expert routing while the ids live on
+            // CPU (no extra CPU→GPU→CPU roundtrip).  No-op when neither
+            // CANDLE_EPLB_PRINT nor CANDLE_EPLB_DUMP is set.
+            if let Ok(ids_vec) = ids.flatten_all()?.to_vec1::<u32>() {
+                super::eplb::observe(&ids_vec, 0);
+            }
             ids.to_device(&device)?
         } else {
-            routing_weights
+            let ids = routing_weights
                 .arg_sort_last_dim(false)?
                 .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-                .contiguous()?
+                .contiguous()?;
+            if let Ok(ids_vec) = ids.flatten_all()?.to_vec1::<u32>() {
+                super::eplb::observe(&ids_vec, 0);
+            }
+            ids
         };
         let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
 

@@ -28,6 +28,7 @@ pub mod norms;
 pub mod attention;
 pub mod ffn;
 pub mod delta_net;
+pub mod eplb;
 
 pub use gguf_config::*;
 pub use gguf_loader::Gguf;

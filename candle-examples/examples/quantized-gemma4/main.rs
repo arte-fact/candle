@@ -244,5 +244,6 @@ fn main() -> anyhow::Result<()> {
         "{sampled:4} tokens generated: {:.2} t/s",
         sampled as f64 / dt.as_secs_f64(),
     );
+    candle_transformers::models::quantized_blocks::eplb::print_summary();
     Ok(())
 }
