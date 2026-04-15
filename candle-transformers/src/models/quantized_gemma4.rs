@@ -1275,6 +1275,30 @@ impl ModelWeights {
 
         // (SWA mask precompute hoisted up before the G2 fast path)
 
+        // A1 — piecewise capture: start KERNEL recording HERE (after
+        // prelude, after G2 fast-path early-return) so the captured plan
+        // ONLY contains the transformer loop + final norm / LM-head /
+        // softcap. The sampler / argmax that runs between forwards in the
+        // generation loop stays EAGER (its kernel launches are not added
+        // to the plan), exactly like vLLM / Aphrodite's PIECEWISE capture
+        // mode. The decode_alloc table is still active across sampler +
+        // prelude so that anchor addresses (layer_in, inp_per_layer, SWA
+        // masks) stay stable across recordings and replays.
+        //
+        // Before A1, start_recording was called at end-of-forward N so the
+        // recording spanned [end-of-N → end-of-N+1] and included all ops
+        // launched between forwards (sampler, next-token embed).
+        #[cfg(feature = "hip")]
+        if g2_eligible
+            && matches!(
+                self.decode_state,
+                DecodeState::WarmUp | DecodeState::Recorded1 { .. }
+            )
+            && !candle::hip_backend::decode_cache::is_recording()
+        {
+            candle::hip_backend::decode_cache::start_recording();
+        }
+
         // ----- transformer block loop --------------------------------------
         for il in 0..self.layers.len() {
             let (has_kv, kv_source_idx, layer_device, sliding_window_size) = {
@@ -1942,8 +1966,11 @@ impl ModelWeights {
 
                     match std::mem::replace(&mut self.decode_state, DecodeState::Init) {
                         DecodeState::WarmUp => {
+                            // A1 — keep decode_alloc_start_replay here so the
+                            // alloc table stays continuous across sampler +
+                            // prelude. Only start_recording moved to the top
+                            // of the next forward (after the prelude).
                             hdrv::decode_alloc_start_replay();
-                            decode_cache::start_recording();
                             eprintln!(
                                 "[G2-gemma4] token 3 recorded: {} ops, {} alloc entries, ptrs={:x?}",
                                 recording.len(),
@@ -2024,15 +2051,15 @@ impl ModelWeights {
                     }
                 }
             } else {
-                match &self.decode_state {
-                    DecodeState::Init => {
-                        self.decode_state = DecodeState::WarmUp;
-                    }
-                    DecodeState::WarmUp => {
-                        hdrv::decode_alloc_start_record();
-                        decode_cache::start_recording();
-                    }
-                    _ => {}
+                // A1 — kernel recording moves to TOP of next forward (after
+                // prelude).  But `decode_alloc_start_record` fires here
+                // at the Init → WarmUp transition so the FIRST recorded
+                // forward's prelude allocates through the alloc table too,
+                // keeping the anchor tensors (layer_in, inp_per_layer, SWA
+                // masks) at stable pool slots across both recordings.
+                if matches!(&self.decode_state, DecodeState::Init) {
+                    hdrv::decode_alloc_start_record();
+                    self.decode_state = DecodeState::WarmUp;
                 }
             }
         }
