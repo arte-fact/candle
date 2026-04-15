@@ -952,12 +952,18 @@ impl ModelWeights {
         } else {
             1
         };
+        // G2-only SWA mask cache (one per device, padded to nkv_pad).
+        // Keyed by `(device_location, sliding_window_size)`; anchored
+        // into the captured plan so replays read from a stable buffer.
+        // Decode (seq_len = 1) on global-attention layers skips the
+        // mask entirely.
         #[cfg(feature = "hip")]
         let swa_masks: std::collections::HashMap<(String, usize), Tensor> = if g2_eligible {
             use std::collections::HashSet;
-            let mut want: HashSet<(String, usize)> = HashSet::new();
+            let mut want: HashSet<(String, Option<usize>)> = HashSet::new();
             for l in &self.layers {
-                if let Some(sw) = l.sliding_window_size {
+                let sw = l.sliding_window_size;
+                if sw.is_some() {
                     want.insert((format!("{:?}", l.device.location()), sw));
                 }
             }
@@ -968,27 +974,18 @@ impl ModelWeights {
                 let pad_total = if g2_pad_t > 1 {
                     ((current_t + g2_pad_t - 1) / g2_pad_t) * g2_pad_t
                 } else {
-                    current_t
+                    0
                 };
+                let dtype = layer_in.dtype();
                 candle::hip_backend::decode_cache::with_recording_paused(|| -> Result<_> {
                     let mut out = std::collections::HashMap::new();
                     for l in &self.layers {
-                        let sw = match l.sliding_window_size {
-                            Some(s) => s,
-                            None => continue,
-                        };
-                        let key = (format!("{:?}", l.device.location()), sw);
-                        if out.contains_key(&key) {
-                            continue;
-                        }
+                        let sw = l.sliding_window_size;
+                        if sw.is_none() { continue; }
+                        let key = (format!("{:?}", l.device.location()), sw.unwrap_or(0));
+                        if out.contains_key(&key) { continue; }
                         let m = causal_mask_padded(
-                            b_sz,
-                            seq_len,
-                            index_pos,
-                            Some(sw),
-                            layer_in.dtype(),
-                            &l.device,
-                            pad_total,
+                            b_sz, seq_len, index_pos, sw, dtype, &l.device, pad_total,
                         )?;
                         out.insert(key, m);
                     }
@@ -1381,6 +1378,15 @@ impl ModelWeights {
         #[cfg(feature = "hip")]
         let mut t_moe_combine_us = 0u128;
 
+        // Per-device runtime cache for the non-G2 causal-mask path.
+        // Built lazily on first encounter of each (device, sw) pair so
+        // device-setup ordering matches the prior per-layer behaviour
+        // (building all masks up-front before the first layer kernel
+        // broke module loading with hipErrorInvalidImage — see K7).
+        #[cfg(feature = "hip")]
+        let mut mask_runtime_cache: std::collections::HashMap<(String, usize), Tensor> =
+            std::collections::HashMap::new();
+
         // ----- transformer block loop --------------------------------------
         for il in 0..self.layers.len() {
             let (has_kv, kv_source_idx, layer_device, sliding_window_size) = {
@@ -1411,8 +1417,10 @@ impl ModelWeights {
             // than the window — see llama.cpp `gemma4-iswa.cpp` SWA mask path.
             //
             // G2 path: reuse the precomputed mask from `swa_masks` so the
-            // captured kernel reads from a single anchored buffer (instead
-            // of 32 freshly-allocated ones per token).
+            // captured kernel reads from a single anchored buffer.
+            // Non-G2 path: lazily populate & reuse `mask_runtime_cache`
+            // per-device so the same mask isn't rebuilt on every layer
+            // (measured 18 % of prefill on Gemma-4-26B-A4B 4-GPU).
             #[cfg(feature = "hip")]
             let attention_mask = if g2_eligible {
                 if let Some(sw) = sliding_window_size {
@@ -1424,14 +1432,24 @@ impl ModelWeights {
             } else if seq_len == 1 && sliding_window_size.is_none() {
                 None
             } else {
-                Some(causal_mask(
-                    b_sz,
-                    seq_len,
-                    index_pos,
-                    sliding_window_size,
-                    layer_in.dtype(),
-                    &layer_device,
-                )?)
+                let key = (
+                    format!("{:?}", layer_device.location()),
+                    sliding_window_size.unwrap_or(0),
+                );
+                if let Some(m) = mask_runtime_cache.get(&key) {
+                    Some(m.clone())
+                } else {
+                    let m = causal_mask(
+                        b_sz,
+                        seq_len,
+                        index_pos,
+                        sliding_window_size,
+                        layer_in.dtype(),
+                        &layer_device,
+                    )?;
+                    mask_runtime_cache.insert(key, m.clone());
+                    Some(m)
+                }
             };
             #[cfg(not(feature = "hip"))]
             let attention_mask = if seq_len == 1 && sliding_window_size.is_none() {
