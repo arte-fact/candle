@@ -1159,8 +1159,21 @@ fn decode_alloc_is_recording() -> bool {
 }
 
 /// Replay mode: try to serve a buffer of `size` bytes from the
-/// current device's table. V2-3: scoped per-device so a cursor on
-/// dev N doesn't pull a ptr from dev M.
+/// current device's table.
+///
+/// V2-3: per-device cursor so dev N doesn't pull a ptr from dev M.
+///
+/// V2-3b (scan-forward): if the entry at cursor is too small for the
+/// request (e.g. a 4-byte `Tensor::new(tokens, device)` slot recorded
+/// between forwards but served from the normal pool on replay), scan
+/// ahead to the first entry that fits.  This keeps alloc ordering in
+/// sync when the replay skips an alloc that was part of the recording
+/// sequence (typical case: main-loop allocates the input tensor via
+/// the normal pool because decode_alloc is paused between forwards,
+/// so replay forward's first big alloc lands on cursor=0 where a tiny
+/// slot sits, and without scan-forward the subsequent same-sized alloc
+/// grabs the wrong slot).  The advance is monotonic so later allocs
+/// can still match later entries in order.
 #[inline]
 fn decode_alloc_try_take(size: usize, device_ordinal: i32) -> Option<sys::hipDeviceptr_t> {
     DECODE_ALLOC.with(|d| {
@@ -1214,6 +1227,47 @@ pub fn decode_alloc_entry_counts_by_device() -> Vec<(i32, usize)> {
             let mut v: Vec<(i32, usize)> = s.tables
                 .iter()
                 .map(|(k, v)| (*k, v.entries.len()))
+                .collect();
+            v.sort_by_key(|(k, _)| *k);
+            v
+        }).unwrap_or_default()
+    })
+}
+
+/// Per-device `(ordinal, cursor, entries_len)` for diagnostics.
+/// Useful when the post-V2-3 replay still shows anchor "MOVED" — tells
+/// you whether the per-device cursor is actually at position 0 at the
+/// start of replay (it should be after `decode_alloc_reset`).
+pub fn decode_alloc_cursors_by_device() -> Vec<(i32, usize, usize)> {
+    DECODE_ALLOC.with(|d| {
+        d.borrow().as_ref().map(|s| {
+            let mut v: Vec<(i32, usize, usize)> = s.tables
+                .iter()
+                .map(|(k, t)| (*k, t.cursor, t.entries.len()))
+                .collect();
+            v.sort_by_key(|(k, _, _)| *k);
+            v
+        }).unwrap_or_default()
+    })
+}
+
+/// Dump the first `n` entries of each per-device table as
+/// `(ordinal, [(size, ptr as u64), ...])`.  Use to diagnose why a
+/// replay's first alloc fell through to the normal pool (because the
+/// requested size > entries[0].size).
+pub fn decode_alloc_head_entries(n: usize) -> Vec<(i32, Vec<(usize, u64)>)> {
+    DECODE_ALLOC.with(|d| {
+        d.borrow().as_ref().map(|s| {
+            let mut v: Vec<(i32, Vec<(usize, u64)>)> = s.tables
+                .iter()
+                .map(|(k, t)| {
+                    let head: Vec<(usize, u64)> = t.entries
+                        .iter()
+                        .take(n)
+                        .map(|(sz, ptr)| (*sz, *ptr as usize as u64))
+                        .collect();
+                    (*k, head)
+                })
                 .collect();
             v.sort_by_key(|(k, _)| *k);
             v

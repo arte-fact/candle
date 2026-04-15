@@ -695,8 +695,19 @@ impl ModelWeights {
             self.decode_state,
             DecodeState::Replay(_) | DecodeState::Graph { .. }
         );
+        // V2-3b: also resume on Recorded1 — `decode_alloc_start_replay`
+        // is now followed by an immediate pause at the end of the
+        // WarmUp branch, so the second captured forward (the
+        // recording-#2 run) needs to resume the allocator here, before
+        // its own prelude allocs, to consume the cursor positions
+        // that recording #1 populated.
         #[cfg(feature = "hip")]
-        if g2_in_replay {
+        let g2_in_post_warmup = matches!(
+            self.decode_state,
+            DecodeState::Recorded1 { .. }
+        );
+        #[cfg(feature = "hip")]
+        if g2_in_replay || g2_in_post_warmup {
             candle::hip_backend::hipdarc::driver::decode_alloc_resume();
             if std::env::var("CANDLE_G2_ALLOC_TRACE").is_ok() {
                 eprintln!("[G2-alloc] forward start: mode={:?}",
@@ -1137,6 +1148,18 @@ impl ModelWeights {
                         // launch — catches stale ptr / missed input_id
                         // before the kernels crash on garbage addresses.
                         plan.validate_inputs(&fresh_inputs)?;
+                        if std::env::var("CANDLE_G2_ALLOC_CURSOR_TRACE").is_ok() {
+                            let c = candle::hip_backend::hipdarc::driver::decode_alloc_cursors_by_device();
+                            eprintln!("[V2-3] pre-replay cursors-by-dev: {:?}", c);
+                            let h = candle::hip_backend::hipdarc::driver::decode_alloc_head_entries(5);
+                            for (dev, head) in h {
+                                eprintln!(
+                                    "[V2-3] dev {} head entries: {:?}",
+                                    dev,
+                                    head.iter().map(|(s, p)| format!("({}, 0x{:x})", s, p)).collect::<Vec<_>>(),
+                                );
+                            }
+                        }
                         unsafe { plan.replay(&dev_for_replay)?; }
                         // Phase-time: optional sync-here-to-measure-GPU.
                         // CANDLE_G2_SYNC_REPLAY=1 makes the fp timing
@@ -1979,11 +2002,19 @@ impl ModelWeights {
 
                     match std::mem::replace(&mut self.decode_state, DecodeState::Init) {
                         DecodeState::WarmUp => {
-                            // A1 — keep decode_alloc_start_replay here so the
-                            // alloc table stays continuous across sampler +
-                            // prelude. Only start_recording moved to the top
-                            // of the next forward (after the prelude).
+                            // A1 — decode_alloc_start_replay arms the table
+                            // for the next forward's use.  V2-3b: immediately
+                            // PAUSE so that allocations made between now and
+                            // the start of the next forward (main loop
+                            // sampler + `Tensor::new(tokens, device)`) go
+                            // through the normal pool instead of consuming
+                            // recorded slots.  The next forward calls
+                            // `decode_alloc_resume()` at the top to re-enter
+                            // replay mode for its own allocations — keeping
+                            // the cursor aligned between recording #2 and
+                            // all subsequent replays.
                             hdrv::decode_alloc_start_replay();
+                            hdrv::decode_alloc_pause();
                             eprintln!(
                                 "[G2-gemma4] token 3 recorded: {} ops, {} alloc entries, ptrs={:x?}",
                                 recording.len(),
