@@ -1262,12 +1262,19 @@ impl ModelWeights {
             // Fused Q4_0 decode FFN path: uses two fused kernels
             //   gate_up_fused:  gate MMVQ + up MMVQ in one launch (shared x_q8)
             //   down_residual:  down MMVQ + residual add in one launch
-            // Saves 2 kernel launches per layer × 22 layers = 44/token.
-            // Opt-out via CANDLE_FFN_FUSED_OFF=1.
+            // T3 finding (2026-04-15): the Rust-orchestrated fused path
+            // produces NUMERICALLY BROKEN output on TinyLlama Q4_0 at
+            // identical wall-time vs the unfused path (both ~237 t/s,
+            // unfused output is "For experiencing the best of Paris...",
+            // fused output is "colonial , Quint always Sat Rep ...").
+            // Demoted to opt-in (`CANDLE_FFN_FUSED=1`) until the
+            // numerical regression is root-caused; the speed win never
+            // materialised on TinyLlama anyway. Old opt-out
+            // (`CANDLE_FFN_FUSED_OFF=1`) is now a no-op.
             #[cfg(feature = "hip")]
             let ffn_fused: Option<Tensor> = if seq_len == 1
                 && matches!(x.device(), Device::Hip(_))
-                && std::env::var("CANDLE_FFN_FUSED_OFF").is_err()
+                && std::env::var("CANDLE_FFN_FUSED").is_ok()
             {
                 if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
                     if let Some((w_gate, w_up, w_down)) = mlp.as_q4_0_trio() {
@@ -1307,8 +1314,13 @@ impl ModelWeights {
         let result = self.output.forward(&x)?;
 
         // ── G2: Post-forward recording state machine ────────────────────
+        // T3: env-gated to match gemma4's pattern (`CANDLE_G2_REPLAY=1`).
+        // Previously fired unconditionally on every decode forward, which
+        // interacts badly with the Rust-fused FFN path on TinyLlama Q4_0
+        // (replay produces invalid logits → "weight is negative" sample
+        // error after token 3). Opt-in keeps the default path correct.
         #[cfg(feature = "hip")]
-        if is_decode {
+        if is_decode && std::env::var("CANDLE_G2_REPLAY").is_ok() {
             use candle::hip_backend::decode_cache;
             use candle::hip_backend::hipdarc::driver as hdrv;
 
