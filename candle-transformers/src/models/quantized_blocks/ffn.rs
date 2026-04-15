@@ -255,7 +255,26 @@ impl MoeExperts {
     ) -> Result<Self> {
         let num_experts_per_tok = cfg.expert_used_count.unwrap_or(1);
 
-        let router = gg.qmatmul(&format!("{prefix}.ffn_gate_inp.weight"))?;
+        let mut router = gg.qmatmul(&format!("{prefix}.ffn_gate_inp.weight"))?;
+        // Phase O4: requantise the router to Q8_0 when it arrives as F32
+        // (Qwen3-Coder-Next, Mxfp4-quant models) or F16/BF16, so the
+        // decode-path forward goes through MMVQ (~20-40 µs/call) instead
+        // of rocBLAS `Cijk_*_MT128x64x16` (~270 µs/call).  Matches the
+        // gemma4 `inp_gate`/`proj` requantise pattern
+        // (`quantized_gemma4.rs:574-591`).  Opt-out per env var.
+        if !router.is_qtensor()
+            && std::env::var("CANDLE_MOE_ROUTER_NO_REQUANT").is_err()
+        {
+            let dtype = match std::env::var("CANDLE_MOE_ROUTER_REQUANT_DTYPE")
+                .ok().as_deref()
+            {
+                Some("q4_0") => candle::quantized::GgmlDType::Q4_0,
+                Some("q4_1") => candle::quantized::GgmlDType::Q4_1,
+                Some("q5_0") => candle::quantized::GgmlDType::Q5_0,
+                _ => candle::quantized::GgmlDType::Q8_0,
+            };
+            let _ = router.requantize_to(dtype);
+        }
         let down_exps = Arc::new(gg.tensor(&format!("{prefix}.ffn_down_exps.weight"))?);
 
         // Detect separate vs fused gate+up
@@ -330,7 +349,164 @@ impl MoeExperts {
         })
     }
 
+    /// Phase O1 fast path: pre-quantise x to Q8_1 once and feed BOTH the
+    /// router AND the gate/up MoE matmuls from the same buffer.  Cuts the
+    /// `quantize_q8_1` count from 4 (sep gate/up) or 3 (fused gate_up) to
+    /// 2 per layer per token (one shared input quant + one for the
+    /// activated `silu_mul` going into down).
+    ///
+    /// Restricted to:
+    ///   - HIP backend
+    ///   - decode-shaped batch (`b * m ≤ 8`)
+    ///   - all involved weights are real QTensors (not dequantised)
+    ///   - input is contiguous F32 (the Q8_1 quantiser's contract)
+    ///
+    /// Returns Ok(None) when any precondition fails — caller falls through.
+    #[cfg(feature = "hip")]
+    fn forward_shared_q8_decode(&self, x: &Tensor) -> Result<Option<Tensor>> {
+        use candle::quantized::hip::{pad, quantize_q8_1, MATRIX_ROW_PADDING};
+        use candle::quantized::GgmlDType;
+        use candle::D;
+
+        let (b_sz, seq_len, hidden) = x.dims3()?;
+        let b_size = b_sz * seq_len;
+
+        // Note: we do NOT require the router to be a QTensor.  When the
+        // router weight has been dequantised (e.g. Mxfp4 → F32 fallback),
+        // it goes through its own `forward` path; the savings then come
+        // purely from sharing Q8_1 between the gate/up MoE matmuls.
+        if b_size > 8
+            || !matches!(x.device(), candle::Device::Hip(_))
+            || x.dtype() != candle::DType::F32
+            || !x.is_contiguous()
+        {
+            return Ok(None);
+        }
+
+        // Reuse the existing routing logic (softmax → topk on CPU) — same
+        // as the slow path, but with the matmul replaced by `forward_preq8`.
+        let dev = match x.device() {
+            candle::Device::Hip(d) => d.clone(),
+            _ => return Ok(None),
+        };
+
+        let x_flat = x.reshape((b_size, hidden))?;
+        let (x_st, x_l) = x_flat.storage_and_layout();
+        let x_hip = match &*x_st {
+            candle::Storage::Hip(s) => s,
+            _ => return Ok(None),
+        };
+        let x_slice = x_hip.as_hip_slice::<f32>()?;
+        let x_view = match x_l.contiguous_offsets() {
+            Some((lo, hi)) => x_slice.slice(lo..hi),
+            None => return Ok(None),
+        };
+
+        let ncols_padded = pad(hidden, MATRIX_ROW_PADDING);
+        let q8_bytes = b_size * ncols_padded * GgmlDType::Q8_1.type_size()
+            / GgmlDType::Q8_1.block_size();
+        let mut y_q8_1 = unsafe { dev.alloc::<u8>(q8_bytes)? };
+        quantize_q8_1(&x_view, &mut y_q8_1, hidden, b_size, &dev)?;
+        let q8_view = y_q8_1.slice(0..y_q8_1.len());
+
+        let rhs_shape = x_flat.dims().to_vec();
+        drop(x_st);
+
+        // Router: use shared Q8_1 if it's a QTensor; otherwise fall through
+        // to its standard (likely dequantised) forward — no quantize savings
+        // there, but gate/up still benefit from the shared buffer below.
+        let router_logits = if self.router.is_qtensor() {
+            self.router.forward_preq8(&q8_view, b_size, &rhs_shape)?
+        } else {
+            self.router.forward(&x_flat)?
+        };
+        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+
+        // TopK on CPU (matches the existing path; HIP arg_sort is not wired).
+        let cpu = candle::Device::Cpu;
+        let rw_cpu = routing_weights.to_device(&cpu)?;
+        let topk_ids_cpu = rw_cpu
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+            .contiguous()?;
+        let hip_dev = candle::Device::Hip(dev.clone());
+        let topk_ids = topk_ids_cpu.to_device(&hip_dev)?;
+
+        let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
+        let topk_weights = (&topk_weights
+            / topk_weights.sum_keepdim(D::Minus1)?.broadcast_as(topk_weights.shape())?)?;
+
+        // The MoE preq8 kernel expects `[batch, topk_or_1, k]` `in_shape`
+        // for its block-grid sizing.  `topk_or_1 == 1` here because the
+        // input is shared across all top-k experts.
+        let in_shape = candle::Shape::from((b_size, 1usize, hidden));
+
+        let moe_out = if let Some(ref gate_exps) = self.gate_exps {
+            let up_exps = self.up_exps.as_ref().unwrap();
+            let gate_out =
+                gate_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
+            let up_out =
+                up_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
+            let activated = candle_nn::ops::silu_mul(&gate_out, &up_out)?;
+            self.down_exps
+                .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?
+        } else if let Some(ref gate_up_exps) = self.gate_up_exps {
+            let gate_up =
+                gate_up_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
+            let gate = gate_up
+                .narrow(D::Minus1, 0, self.intermediate_size)?
+                .contiguous()?;
+            let up = gate_up
+                .narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?
+                .contiguous()?;
+            let activated = candle_nn::ops::silu_mul(&gate, &up)?;
+            self.down_exps
+                .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?
+        } else {
+            candle::bail!("MoE has no expert weights");
+        };
+
+        let topk_weights = topk_weights.unsqueeze(D::Minus1)?;
+        let weighted = moe_out.broadcast_mul(&topk_weights)?;
+        let mut result = weighted.sum(1)?;
+
+        if let Some(ref shared_mlp) = self.shared {
+            let shared_out = shared_mlp.forward(&x_flat)?;
+            let shared_out = if let Some(ref sg_weight) = self.shared_gate_weight {
+                let sg = if device_eq(sg_weight.device(), x_flat.device()) {
+                    sg_weight.clone()
+                } else {
+                    sg_weight.to_device(x_flat.device())?
+                };
+                let gate_logits = x_flat.broadcast_mul(&sg)?.sum_keepdim(D::Minus1)?;
+                let gate = candle_nn::ops::sigmoid(&gate_logits)?;
+                shared_out.broadcast_mul(&gate)?
+            } else {
+                shared_out
+            };
+            result = (result + shared_out)?;
+        }
+
+        Ok(Some(result.reshape((b_sz, seq_len, hidden))?))
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Phase O1 — decode-path fast path.  Pre-quantises x once into
+        // Q8_1 and reuses it for the router AND the gate/up MoE matmuls.
+        // (Down still has its own quantise since its input is
+        // `silu_mul(gate, up)`.)  Returns None when the conditions aren't
+        // met (b*m > 8, non-HIP, dequantised weights, MXFP4 router…) and
+        // we fall through to the existing path.
+        #[cfg(feature = "hip")]
+        {
+            if let Some(out) = self.forward_shared_q8_decode(x)? {
+                return Ok(out);
+            }
+        }
+        self.forward_inner(x)
+    }
+
+    fn forward_inner(&self, x: &Tensor) -> Result<Tensor> {
         let (b_sz, seq_len, hidden) = x.dims3()?;
         let x_flat = x.reshape((b_sz * seq_len, hidden))?;
 
