@@ -10,6 +10,43 @@ use candle::quantized::QTensor;
 use candle::{Device, Module, Result, Tensor, D};
 use std::sync::Arc;
 
+/// T1.2: try the fused softmax+topk+normalise GPU kernel.
+/// Returns `(topk_weights, topk_ids)` both shape `(rows, n_used)` on
+/// HIP, or `None` if pre-conditions don't hold (non-HIP, non-f32, non-
+/// contiguous input, n_experts not in {64, 128, 512}, or env-disabled).
+///
+/// `routing_logits` is `(rows, n_experts)`. EPLB observation is skipped
+/// on the fast path (would defeat the purpose); EPLB users should set
+/// `CANDLE_GEMMA4_TOPK_FUSED_OFF=1` to fall back to the legacy CPU
+/// arg_sort chain that observes ids while they're on CPU.
+#[cfg(feature = "hip")]
+fn try_topk_fused(
+    routing_logits: &Tensor,
+    n_experts_used: usize,
+) -> Option<(Tensor, Tensor)> {
+    if std::env::var("CANDLE_GEMMA4_TOPK_FUSED_OFF").is_ok() {
+        return None;
+    }
+    if !matches!(routing_logits.device(), candle::Device::Hip(_))
+        || routing_logits.dtype() != candle::DType::F32
+        || !routing_logits.is_contiguous()
+    {
+        return None;
+    }
+    let n_experts_dim = routing_logits.dim(D::Minus1).ok()?;
+    // Only 64 / 128 / 512 are compiled; reject other counts.
+    if !matches!(n_experts_dim, 64 | 128 | 512) {
+        return None;
+    }
+    let flat = routing_logits.reshape(((), n_experts_dim)).ok()?;
+    candle::hip_backend::topk_moe_norm_fused(&flat, n_experts_used).ok()
+}
+
+#[cfg(not(feature = "hip"))]
+fn try_topk_fused(_: &Tensor, _: usize) -> Option<(Tensor, Tensor)> {
+    None
+}
+
 /// Compare two devices for equality without allocating.
 fn device_eq(a: &Device, b: &Device) -> bool {
     format!("{:?}", a.location()) == format!("{:?}", b.location())
@@ -420,21 +457,27 @@ impl MoeExperts {
         } else {
             self.router.forward(&x_flat)?
         };
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
-
-        // TopK on CPU (matches the existing path; HIP arg_sort is not wired).
-        let cpu = candle::Device::Cpu;
-        let rw_cpu = routing_weights.to_device(&cpu)?;
-        let topk_ids_cpu = rw_cpu
-            .arg_sort_last_dim(false)?
-            .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-            .contiguous()?;
-        let hip_dev = candle::Device::Hip(dev.clone());
-        let topk_ids = topk_ids_cpu.to_device(&hip_dev)?;
-
-        let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
-        let topk_weights = (&topk_weights
-            / topk_weights.sum_keepdim(D::Minus1)?.broadcast_as(topk_weights.shape())?)?;
+        // T1.2 fast path: fused softmax+topk+norm on GPU.  Falls back
+        // to the legacy CPU arg_sort chain when not applicable.
+        let (topk_weights, topk_ids) = if let Some((w, ids)) =
+            try_topk_fused(&router_logits, self.num_experts_per_tok)
+        {
+            (w, ids)
+        } else {
+            let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+            let cpu = candle::Device::Cpu;
+            let rw_cpu = routing_weights.to_device(&cpu)?;
+            let topk_ids_cpu = rw_cpu
+                .arg_sort_last_dim(false)?
+                .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+                .contiguous()?;
+            let hip_dev = candle::Device::Hip(dev.clone());
+            let topk_ids = topk_ids_cpu.to_device(&hip_dev)?;
+            let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
+            let topk_weights = (&topk_weights
+                / topk_weights.sum_keepdim(D::Minus1)?.broadcast_as(topk_weights.shape())?)?;
+            (topk_weights, topk_ids)
+        };
 
         // The MoE preq8 kernel expects `[batch, topk_or_1, k]` `in_shape`
         // for its block-grid sizing.  `topk_or_1 == 1` here because the
@@ -512,41 +555,46 @@ impl MoeExperts {
 
         // Route: softmax → topk
         let router_logits = self.router.forward(&x_flat)?;
-        let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
 
-        // TopK selection.
-        // candle's HIP backend has no argsort yet, so route this small op
-        // through CPU. routing_weights shape is (tokens, n_experts) — tiny.
-        let device = routing_weights.device().clone();
-        let topk_ids = if matches!(device, candle::Device::Hip(_)) {
-            let cpu = candle::Device::Cpu;
-            let rw_cpu = routing_weights.to_device(&cpu)?;
-            let ids = rw_cpu
-                .arg_sort_last_dim(false)?
-                .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-                .contiguous()?;
-            // A3 / EPLB — observe expert routing while the ids live on
-            // CPU (no extra CPU→GPU→CPU roundtrip).  No-op when neither
-            // CANDLE_EPLB_PRINT nor CANDLE_EPLB_DUMP is set.
-            if let Ok(ids_vec) = ids.flatten_all()?.to_vec1::<u32>() {
-                super::eplb::observe(&ids_vec, 0);
-            }
-            ids.to_device(&device)?
+        // T1.2 fast path: fused softmax+topk+norm on GPU.  Falls back
+        // to the legacy softmax + CPU arg_sort + gather + norm chain
+        // when not applicable (non-HIP, n_experts not in {64,128,512},
+        // env-disabled).  EPLB observation is only available on the
+        // legacy path; users wanting EPLB stats must set
+        // `CANDLE_GEMMA4_TOPK_FUSED_OFF=1`.
+        let device = router_logits.device().clone();
+        let (topk_weights, topk_ids) = if let Some((w, ids)) =
+            try_topk_fused(&router_logits, self.num_experts_per_tok)
+        {
+            (w, ids)
         } else {
-            let ids = routing_weights
-                .arg_sort_last_dim(false)?
-                .narrow(D::Minus1, 0, self.num_experts_per_tok)?
-                .contiguous()?;
-            if let Ok(ids_vec) = ids.flatten_all()?.to_vec1::<u32>() {
-                super::eplb::observe(&ids_vec, 0);
-            }
-            ids
+            let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+            let topk_ids = if matches!(device, candle::Device::Hip(_)) {
+                let cpu = candle::Device::Cpu;
+                let rw_cpu = routing_weights.to_device(&cpu)?;
+                let ids = rw_cpu
+                    .arg_sort_last_dim(false)?
+                    .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+                    .contiguous()?;
+                if let Ok(ids_vec) = ids.flatten_all()?.to_vec1::<u32>() {
+                    super::eplb::observe(&ids_vec, 0);
+                }
+                ids.to_device(&device)?
+            } else {
+                let ids = routing_weights
+                    .arg_sort_last_dim(false)?
+                    .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+                    .contiguous()?;
+                if let Ok(ids_vec) = ids.flatten_all()?.to_vec1::<u32>() {
+                    super::eplb::observe(&ids_vec, 0);
+                }
+                ids
+            };
+            let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
+            let topk_weights = (&topk_weights
+                / topk_weights.sum_keepdim(D::Minus1)?.broadcast_as(topk_weights.shape())?)?;
+            (topk_weights, topk_ids)
         };
-        let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
-
-        // Normalize topk weights
-        let topk_weights = (&topk_weights
-            / topk_weights.sum_keepdim(D::Minus1)?.broadcast_as(topk_weights.shape())?)?;
 
         // indexed_moe_forward expects 3D input `[batch, topk_or_1, k]` and 2D
         // ids `[batch, topk]`. For the gate/up step we want each token to be
