@@ -48,6 +48,29 @@ pub struct RecordedOp {
     pub device_ordinal: i32,
 }
 
+/// Sentinel kernel name for a recorded HIP→HIP memcpy.
+///
+/// MI50 has no P2P, so `Tensor::to_device` on HIP→HIP goes through a CPU
+/// staging buffer (see `tensor.rs` HIP→HIP arm).  These bounces are
+/// REQUIRED for pipeline-parallel model correctness but are invisible to
+/// the launch recorder (only kernel launches hit `maybe_record`).  The
+/// V1b fix: when recording is active, `tensor.rs` calls `record_memcpy`
+/// after the bounce completes, pushing a sentinel op into the captured
+/// plan.  On replay, `DecodePlan::replay` detects the sentinel via
+/// `RecordedOp::is_memcpy()` and re-executes the bounce via
+/// `hipMemcpy(DtoH)` + `hipMemcpy(HtoD)` through a fresh host Vec.
+pub const MEMCPY_H2H_NAME: &str = "__memcpy_h2h__";
+
+impl RecordedOp {
+    /// True when this op is a sentinel for a HIP→HIP memcpy rather than
+    /// a kernel launch.  Memcpy ops have `func == null` and carry
+    /// `[src_ptr, dst_ptr, bytes]` in `arg_values`, with
+    /// `device_ordinal == src_dev` and `grid.0 == dst_dev as u32`.
+    pub fn is_memcpy(&self) -> bool {
+        self.func.is_null()
+    }
+}
+
 // Thread-local recording state.
 thread_local! {
     static RECORDING: RefCell<Option<Vec<RecordedOp>>> = RefCell::new(None);
@@ -190,6 +213,36 @@ pub fn maybe_record(
             false
         }
     })
+}
+
+/// Record a HIP→HIP memcpy as a sentinel op in the current recording.
+/// Callers pass the src/dst device ordinals and raw device pointers.
+/// No-op when recording is inactive.  Bytes must match what
+/// `tensor.rs`'s HIP→HIP arm transferred through the CPU staging
+/// buffer.
+pub fn record_memcpy(
+    src_dev: i32,
+    src_ptr: usize,
+    dst_dev: i32,
+    dst_ptr: usize,
+    bytes: usize,
+) {
+    RECORDING.with(|r| {
+        let mut rec = r.borrow_mut();
+        if let Some(ref mut ops) = *rec {
+            ops.push(RecordedOp {
+                func: std::ptr::null_mut(),
+                name: MEMCPY_H2H_NAME.to_string(),
+                grid: (dst_dev as u32, 0, 0),
+                block: (0, 0, 0),
+                shared_mem: 0,
+                stream: std::ptr::null_mut(),
+                arg_values: vec![src_ptr as u64, dst_ptr as u64, bytes as u64],
+                arg_sizes: vec![8, 8, 8],
+                device_ordinal: src_dev,
+            });
+        }
+    });
 }
 
 // ============================================================================
@@ -378,6 +431,13 @@ impl DecodePlan {
         for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
             if a.func != b.func || a.arg_values.len() != b.arg_values.len() {
                 return None;
+            }
+
+            // V1b: memcpy sentinel ops skip dynamic-arg analysis.
+            if a.is_memcpy() {
+                dynamic_args.push(Vec::new());
+                dynamic_kinds.push(Vec::new());
+                continue;
             }
 
             let mut dyn_indices = Vec::new();
@@ -576,6 +636,13 @@ impl DecodePlan {
         for (i, (a, b)) in first.iter().zip(second.iter()).enumerate() {
             if a.func != b.func || a.arg_values.len() != b.arg_values.len() {
                 return None;
+            }
+
+            // V1b: memcpy sentinel ops — fixed src/dst, no classify.
+            if a.is_memcpy() {
+                dynamic_args.push(Vec::new());
+                dynamic_kinds.push(Vec::new());
+                continue;
             }
 
             let mut dyn_indices = Vec::new();
@@ -861,9 +928,10 @@ impl DecodePlan {
         let debug = std::env::var("CANDLE_G2_DEBUG").is_ok();
         let trace_replay = std::env::var("CANDLE_G2_V1_TRACE").is_ok();
         if trace_replay {
+            let n_memcpy = self.ops.iter().filter(|o| o.is_memcpy()).count();
             eprintln!(
-                "[V1-trace] replay #{} ENTRY ({} ops, first={}@dev{}, last={}@dev{})",
-                self.replay_count, self.ops.len(),
+                "[V1-trace] replay #{} ENTRY ({} ops, {} memcpys, first={}@dev{}, last={}@dev{})",
+                self.replay_count, self.ops.len(), n_memcpy,
                 self.ops.first().map(|o| o.name.as_str()).unwrap_or(""),
                 self.ops.first().map(|o| o.device_ordinal).unwrap_or(-1),
                 self.ops.last().map(|o| o.name.as_str()).unwrap_or(""),
@@ -932,6 +1000,70 @@ impl DecodePlan {
                     );
                 }
                 current_dev = op.device_ordinal;
+            }
+
+            // V1b: sentinel HIP→HIP memcpy.  Re-execute the CPU-staged
+            // bounce that `tensor.rs:to_device` ran at recording time.
+            // MI50 has no P2P, so this is DtoH on src_dev + HtoD on
+            // dst_dev through a fresh host Vec (allocated + freed per
+            // replay — cheap compared to the transfer itself at ~660 MB/s
+            // PCIe Gen3 x16 half-duplex).  Both memcpys are synchronous
+            // (hipMemcpy, not Async), matching the original code path.
+            if op.is_memcpy() {
+                let src_ptr = op.arg_values[0] as usize as *const c_void;
+                let dst_ptr = op.arg_values[1] as usize as *mut c_void;
+                let bytes = op.arg_values[2] as usize;
+                let src_dev = op.device_ordinal;
+                let dst_dev = op.grid.0 as i32;
+                if trace_replay {
+                    eprintln!(
+                        "[V1-trace] replay[{:>4}/{}] MEMCPY src_dev={} dst_dev={} bytes={}",
+                        idx, self.ops.len(), src_dev, dst_dev, bytes
+                    );
+                }
+                let mut staging: Vec<u8> = vec![0; bytes];
+                // D2H from src device.
+                let rc = hipdarc::sys::hipSetDevice(src_dev);
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    crate::bail!(
+                        "decode_cache replay: memcpy op[{}] hipSetDevice(src={}) failed with {:?}",
+                        idx, src_dev, rc
+                    );
+                }
+                let rc = hipdarc::sys::hipMemcpy(
+                    staging.as_mut_ptr() as *mut c_void,
+                    src_ptr,
+                    bytes,
+                    hipdarc::sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+                );
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    crate::bail!(
+                        "decode_cache replay: memcpy op[{}] DtoH failed with {:?} ({} bytes, src={})",
+                        idx, rc, bytes, src_dev
+                    );
+                }
+                // H2D to dst device.
+                let rc = hipdarc::sys::hipSetDevice(dst_dev);
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    crate::bail!(
+                        "decode_cache replay: memcpy op[{}] hipSetDevice(dst={}) failed with {:?}",
+                        idx, dst_dev, rc
+                    );
+                }
+                let rc = hipdarc::sys::hipMemcpy(
+                    dst_ptr,
+                    staging.as_ptr() as *const c_void,
+                    bytes,
+                    hipdarc::sys::hipMemcpyKind::hipMemcpyHostToDevice,
+                );
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    crate::bail!(
+                        "decode_cache replay: memcpy op[{}] HtoD failed with {:?} ({} bytes, dst={})",
+                        idx, rc, bytes, dst_dev
+                    );
+                }
+                current_dev = dst_dev;
+                continue;
             }
 
             // Reuse `arg_ptrs` instead of collecting a fresh Vec per op.

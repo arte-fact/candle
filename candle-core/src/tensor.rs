@@ -2394,7 +2394,33 @@ impl Tensor {
                 (Storage::Hip(storage), Device::Hip(hip)) => {
                     // Hip-to-Hip transfer via CPU (no P2P on MI50 PCIe)
                     let cpu = storage.to_cpu_storage()?;
-                    Storage::Hip(hip.storage_from_cpu_storage(&cpu)?)
+                    let dst = hip.storage_from_cpu_storage(&cpu)?;
+                    // V1b: when G2 recording is active, capture this
+                    // cross-device bounce as a sentinel memcpy op in the
+                    // plan.  MI50 has no P2P, so pipeline-parallel
+                    // models hit this path at every device boundary; if
+                    // the recorder misses them, `DecodePlan::replay`
+                    // skips the data transfer and the downstream
+                    // device's kernels read stale buffers (V1b-d
+                    // diagnosis).  Bytes is `elem_count * dtype_size`
+                    // matching what `to_cpu_storage`/`storage_from_cpu_storage`
+                    // just transferred.
+                    #[cfg(feature = "hip")]
+                    {
+                        use crate::hip_backend::decode_cache;
+                        if decode_cache::is_recording() {
+                            let src_ptr = storage.slice.device_ptr() as usize;
+                            let dst_ptr = dst.slice.device_ptr() as usize;
+                            let src_dev = storage.device.ordinal() as i32;
+                            let dst_dev = hip.ordinal() as i32;
+                            let bytes = self.layout.shape().elem_count()
+                                * self.dtype.size_in_bytes();
+                            decode_cache::record_memcpy(
+                                src_dev, src_ptr, dst_dev, dst_ptr, bytes,
+                            );
+                        }
+                    }
+                    Storage::Hip(dst)
                 }
                 (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
                 _ => {
