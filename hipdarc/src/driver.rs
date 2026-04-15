@@ -173,8 +173,10 @@ impl HipStream {
         }
         let size = len * std::mem::size_of::<T>();
 
-        // Decode-alloc replay: serve from pre-recorded (padded) table.
-        if let Some(ptr) = decode_alloc_try_take(size) {
+        // Decode-alloc replay: serve from per-device pre-recorded
+        // (padded) table. V2-3: each device has its own ordered
+        // cursor so pipeline-parallel allocs don't cross-contaminate.
+        if let Some(ptr) = decode_alloc_try_take(size, ordinal as i32) {
             return Ok(HipSlice {
                 ptr,
                 len,
@@ -192,7 +194,7 @@ impl HipStream {
         // Pool fast path.
         if let Some(ptr) = pool_try_take(ordinal, alloc_size) {
             if recording {
-                decode_alloc_record(alloc_size, ptr);
+                decode_alloc_record(alloc_size, ptr, ordinal as i32);
                 return Ok(HipSlice {
                     ptr,
                     len,
@@ -220,7 +222,7 @@ impl HipStream {
             }
         };
         if recording {
-            decode_alloc_record(alloc_size, ptr);
+            decode_alloc_record(alloc_size, ptr, ordinal as i32);
             return Ok(HipSlice {
                 ptr,
                 len,
@@ -256,8 +258,8 @@ impl HipStream {
         }
         let size = len * std::mem::size_of::<T>();
 
-        // Decode-alloc replay: serve from padded table, zero for correctness.
-        if let Some(ptr) = decode_alloc_try_take(size) {
+        // Decode-alloc replay: serve from per-device padded table.
+        if let Some(ptr) = decode_alloc_try_take(size, ordinal as i32) {
             unsafe { check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?; }
             return Ok(HipSlice {
                 ptr,
@@ -276,7 +278,7 @@ impl HipStream {
                 check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?;
             }
             if recording {
-                decode_alloc_record(alloc_size, ptr);
+                decode_alloc_record(alloc_size, ptr, ordinal as i32);
                 return Ok(HipSlice {
                     ptr,
                     len,
@@ -305,7 +307,7 @@ impl HipStream {
             check_hip(sys::hipMemsetAsync(ptr, 0, size, self.raw))?;
         }
         if recording {
-            decode_alloc_record(alloc_size, ptr);
+            decode_alloc_record(alloc_size, ptr, ordinal as i32);
             return Ok(HipSlice {
                 ptr,
                 len,
@@ -1032,15 +1034,27 @@ pub enum DecodeAllocMode {
     Paused,
 }
 
-/// Decode allocator state: records or replays a fixed sequence of
-/// `(byte_size, device_ptr)` allocations.
-struct DecodeAllocState {
-    /// Ordered list of (padded_byte_size, device_ptr) captured during recording.
-    /// Sizes are padded via `pad_decode_size` to absorb kv_len growth.
+/// Per-device alloc table: ordered list of `(size, ptr)` captured during
+/// recording, with its own read cursor.  V2-3 refactor: moved from a
+/// single global Vec+cursor to one per device_ordinal so pipeline-
+/// parallel models don't interleave allocs from different devices into
+/// a shared list (which desynced the cursor when replay-mode served the
+/// wrong device's pointer back to the caller — the multi-device G2
+/// op-0 crash root cause, see V2-1 diagnostic finding).
+#[derive(Default)]
+struct PerDeviceAllocTable {
     entries: Vec<(usize, sys::hipDeviceptr_t)>,
-    /// Read cursor — advances on each `try_take`, reset between forwards.
     cursor: usize,
-    /// Current mode.
+}
+
+/// Decode allocator state: per-device `(byte_size, device_ptr)` tables
+/// keyed by device ordinal, with a single global mode that applies to
+/// all devices (start_record / start_replay / pause / resume are
+/// lifecycle transitions that should happen across the whole model).
+struct DecodeAllocState {
+    /// One ordered alloc table per device ordinal.
+    tables: std::collections::HashMap<i32, PerDeviceAllocTable>,
+    /// Current mode (shared across all per-device tables).
     mode: DecodeAllocMode,
 }
 
@@ -1049,33 +1063,39 @@ thread_local! {
 }
 
 /// Start recording decode allocations. Every `alloc()`/`alloc_zeros()`
-/// that happens while recording is active is appended to the table.
-/// The returned `HipSlice` is sentinel-marked so its `Drop` is a no-op.
+/// that happens while recording is active is appended to the
+/// per-device table for the device the allocation was made on. The
+/// returned `HipSlice` is sentinel-marked so its `Drop` is a no-op.
 pub fn decode_alloc_start_record() {
     DECODE_ALLOC.with(|d| {
         *d.borrow_mut() = Some(DecodeAllocState {
-            entries: Vec::with_capacity(512),
-            cursor: 0,
+            tables: std::collections::HashMap::new(),
             mode: DecodeAllocMode::Recording,
         });
     });
 }
 
-/// Switch to replay mode, keeping recorded entries. Resets cursor.
+/// Switch to replay mode, keeping recorded entries. Resets every
+/// per-device cursor to 0.
 pub fn decode_alloc_start_replay() {
     DECODE_ALLOC.with(|d| {
         if let Some(ref mut state) = *d.borrow_mut() {
             state.mode = DecodeAllocMode::Replaying;
-            state.cursor = 0;
+            for t in state.tables.values_mut() {
+                t.cursor = 0;
+            }
         }
     });
 }
 
-/// Reset cursor for the next forward pass (call before each replay).
+/// Reset every per-device cursor for the next forward pass (call
+/// before each replay).
 pub fn decode_alloc_reset() {
     DECODE_ALLOC.with(|d| {
         if let Some(ref mut state) = *d.borrow_mut() {
-            state.cursor = 0;
+            for t in state.tables.values_mut() {
+                t.cursor = 0;
+            }
         }
     });
 }
@@ -1138,19 +1158,22 @@ fn decode_alloc_is_recording() -> bool {
     })
 }
 
-/// Replay mode: try to serve a buffer of `size` bytes from the table.
+/// Replay mode: try to serve a buffer of `size` bytes from the
+/// current device's table. V2-3: scoped per-device so a cursor on
+/// dev N doesn't pull a ptr from dev M.
 #[inline]
-fn decode_alloc_try_take(size: usize) -> Option<sys::hipDeviceptr_t> {
+fn decode_alloc_try_take(size: usize, device_ordinal: i32) -> Option<sys::hipDeviceptr_t> {
     DECODE_ALLOC.with(|d| {
         let mut guard = d.borrow_mut();
         let state = guard.as_mut()?;
         if state.mode != DecodeAllocMode::Replaying {
             return None;
         }
-        if state.cursor < state.entries.len() {
-            let (entry_size, ptr) = state.entries[state.cursor];
+        let tbl = state.tables.get_mut(&device_ordinal)?;
+        if tbl.cursor < tbl.entries.len() {
+            let (entry_size, ptr) = tbl.entries[tbl.cursor];
             if entry_size >= size {
-                state.cursor += 1;
+                tbl.cursor += 1;
                 return Some(ptr);
             }
         }
@@ -1158,22 +1181,43 @@ fn decode_alloc_try_take(size: usize) -> Option<sys::hipDeviceptr_t> {
     })
 }
 
-/// Record mode: append `(size, ptr)` to the table.
+/// Record mode: append `(size, ptr)` to the current device's table.
 #[inline]
-fn decode_alloc_record(size: usize, ptr: sys::hipDeviceptr_t) {
+fn decode_alloc_record(size: usize, ptr: sys::hipDeviceptr_t, device_ordinal: i32) {
     DECODE_ALLOC.with(|d| {
         if let Some(ref mut state) = *d.borrow_mut() {
             if state.mode == DecodeAllocMode::Recording {
-                state.entries.push((size, ptr));
+                state.tables
+                    .entry(device_ordinal)
+                    .or_insert_with(PerDeviceAllocTable::default)
+                    .entries
+                    .push((size, ptr));
             }
         }
     });
 }
 
-/// Number of entries recorded.
+/// Total number of entries recorded across all per-device tables.
 pub fn decode_alloc_entry_count() -> usize {
     DECODE_ALLOC.with(|d| {
-        d.borrow().as_ref().map_or(0, |s| s.entries.len())
+        d.borrow().as_ref().map_or(0, |s| {
+            s.tables.values().map(|t| t.entries.len()).sum()
+        })
+    })
+}
+
+/// Per-device entry counts for diagnostics: returns
+/// `[(ordinal, count), ...]` sorted by ordinal.
+pub fn decode_alloc_entry_counts_by_device() -> Vec<(i32, usize)> {
+    DECODE_ALLOC.with(|d| {
+        d.borrow().as_ref().map(|s| {
+            let mut v: Vec<(i32, usize)> = s.tables
+                .iter()
+                .map(|(k, v)| (*k, v.entries.len()))
+                .collect();
+            v.sort_by_key(|(k, _)| *k);
+            v
+        }).unwrap_or_default()
     })
 }
 
