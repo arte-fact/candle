@@ -695,22 +695,43 @@ impl ModelWeights {
             self.decode_state,
             DecodeState::Replay(_) | DecodeState::Graph { .. }
         );
-        // V2-3b: also resume on Recorded1 — `decode_alloc_start_replay`
-        // is now followed by an immediate pause at the end of the
-        // WarmUp branch, so the second captured forward (the
-        // recording-#2 run) needs to resume the allocator here, before
-        // its own prelude allocs, to consume the cursor positions
+        // V2-3b: also resume on Recorded1 — second captured forward
+        // (recording-#2 run) needs to consume the cursor positions
         // that recording #1 populated.
+        // V2-5a: also resume on WarmUp because
+        // `decode_alloc_start_record` was followed by an immediate
+        // pause in the post-forward state-machine branch, so the
+        // FIRST recorded forward needs to resume (in Recording mode)
+        // before its prelude allocs.  Between-forward main-loop
+        // allocs stay in the normal pool (decode_alloc Paused
+        // outside the forward).
         #[cfg(feature = "hip")]
         let g2_in_post_warmup = matches!(
             self.decode_state,
             DecodeState::Recorded1 { .. }
         );
         #[cfg(feature = "hip")]
+        let g2_in_warmup = matches!(
+            self.decode_state,
+            DecodeState::WarmUp
+        );
+        #[cfg(feature = "hip")]
         if g2_in_replay || g2_in_post_warmup {
+            // Recorded1 → replay existing recorded entries,
+            // Replay/Graph → same.
             candle::hip_backend::hipdarc::driver::decode_alloc_resume();
             if std::env::var("CANDLE_G2_ALLOC_TRACE").is_ok() {
-                eprintln!("[G2-alloc] forward start: mode={:?}",
+                eprintln!("[G2-alloc] forward start (resume replaying): mode={:?}",
+                    candle::hip_backend::hipdarc::driver::decode_alloc_get_mode());
+            }
+        } else if g2_in_warmup {
+            // WarmUp (rec #1) → enter Recording mode for this forward
+            // so in-forward allocs append to the per-device tables.
+            candle::hip_backend::hipdarc::driver::decode_alloc_set_mode(
+                candle::hip_backend::hipdarc::driver::DecodeAllocMode::Recording
+            );
+            if std::env::var("CANDLE_G2_ALLOC_TRACE").is_ok() {
+                eprintln!("[G2-alloc] forward start (resume recording): mode={:?}",
                     candle::hip_backend::hipdarc::driver::decode_alloc_get_mode());
             }
         }
@@ -2101,8 +2122,21 @@ impl ModelWeights {
                 // forward's prelude allocates through the alloc table too,
                 // keeping the anchor tensors (layer_in, inp_per_layer, SWA
                 // masks) at stable pool slots across both recordings.
+                //
+                // V2-5a: immediately pause after start_record so the
+                // main-loop allocations that fire BETWEEN this forward
+                // and the next (e.g. `Tensor::new(tokens, device)` in
+                // main.rs before the next forward call) do NOT land in
+                // the decode_alloc table.  Without this, the between-
+                // forwards 4-byte input becomes entries[0] on dev 0
+                // and desyncs rec #2's cursor on the first 11264-byte
+                // layer_in alloc.  The next forward calls
+                // decode_alloc_resume() at its top (Recorded1 or Replay
+                // state handling at the top of forward), so in-forward
+                // allocs still hit the table in their correct order.
                 if matches!(&self.decode_state, DecodeState::Init) {
                     hdrv::decode_alloc_start_record();
+                    hdrv::decode_alloc_pause();
                     self.decode_state = DecodeState::WarmUp;
                 }
             }
