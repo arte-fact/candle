@@ -72,6 +72,50 @@ impl HipDevice {
         &self,
         len: usize,
     ) -> Result<hipdarc::driver::HipSlice<T>> {
+        // O3 diagnostic: when CANDLE_TRACE_ZEROS=1, dump a stack trace and
+        // element count so we can localise which call site emits the
+        // `__amd_rocclr_fillBufferAligned` dispatches that the rocprofv3
+        // trace shows as 18-35 % of decode GPU time.  Only enable for
+        // short runs — the backtrace capture is very expensive.
+        if std::env::var_os("CANDLE_TRACE_ZEROS").is_some() {
+            static COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Skip the initial setup allocs (KV cache init). Two possible
+            // filters: `CANDLE_TRACE_ZEROS_START=N` sets an offset, and
+            // `CANDLE_TRACE_ZEROS_MAXB=N` caps by byte size.  Defaults keep
+            // only small allocs after the first 200 calls.
+            let start = std::env::var("CANDLE_TRACE_ZEROS_START")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(200u64);
+            let maxb = std::env::var("CANDLE_TRACE_ZEROS_MAXB")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000usize);
+            if n >= start && len * std::mem::size_of::<T>() <= maxb {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let bt_str = format!("{bt}");
+                // Keep the first 8 frames that mention candle_transformers
+                // or candle_core model code.
+                let mut frames = Vec::<String>::new();
+                for line in bt_str.lines() {
+                    if frames.len() >= 8 { break; }
+                    let l = line.trim();
+                    if l.contains("candle_transformers::")
+                        || l.contains("candle_core::kv_cache")
+                        || l.contains("candle_nn::kv_cache")
+                        || l.contains("quantized_blocks")
+                        || l.contains("quantized_gemma4")
+                        || l.contains("quantized_qwen")
+                        || (l.starts_with("at ") && (l.contains(".rs:") || l.contains("/candle-")))
+                    {
+                        frames.push(l.to_string());
+                    }
+                }
+                eprintln!(
+                    "[alloc_zeros #{n}] bytes={}\n  {}",
+                    len * std::mem::size_of::<T>(),
+                    frames.join("\n  ")
+                );
+            }
+        }
         self.stream.alloc_zeros::<T>(len).w()
     }
 

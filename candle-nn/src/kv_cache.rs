@@ -57,19 +57,30 @@ impl Cache {
 
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
-        // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
-        // self.all_data.get_or_insert_with.
+        // Phase O3: the initial cache is only READ via `narrow(dim, 0,
+        // current_seq_len)` — unread slots never leak into attention.  So
+        // `Tensor::zeros` was paying ~30 % of gemma4-26B decode GPU time
+        // in `fillBufferAligned` for bytes that are never read.  Use
+        // `Tensor::empty` (uninit) instead.  The new-cache slot at
+        // `[0, seq_len)` is fully written by `slice_set` below; later slots
+        // stay uninit until a future `append` writes them.
+        //
+        // SAFETY: reads never go past `current_seq_len` (callers use
+        // `.narrow(self.dim, 0, self.current_seq_len)` via `Cache::current_data`
+        // / `Cache::{k,v}`).
         if self.all_data.is_none() {
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.max_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            let ad = unsafe { Tensor::empty(shape, src.dtype(), src.device())? };
             self.all_data = Some(ad)
         };
         let ad = self.all_data.as_mut().unwrap();
         while self.current_seq_len + seq_len > self.max_seq_len {
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.grow_by;
-            let next_ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            // Same rationale: the extension cols past `current_seq_len + seq_len`
+            // are uninit and never read before a subsequent `slice_set`.
+            let next_ad = unsafe { Tensor::empty(shape, src.dtype(), src.device())? };
             *ad = Tensor::cat(&[&*ad, &next_ad], self.dim)?;
             self.max_seq_len += self.grow_by;
         }
@@ -307,12 +318,15 @@ impl RotatingCache {
 
     pub fn append(&mut self, src: &Tensor) -> Result<Tensor> {
         let seq_len = src.dim(self.dim)?;
-        // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
-        // self.all_data.get_or_insert_with.
+        // Phase O3: same rationale as `Cache::append` — unread cache slots
+        // never leak into attention, so uninit alloc is safe.
         if self.all_data.is_none() {
             let mut shape = src.dims().to_vec();
             shape[self.dim] = self.max_seq_len;
-            let ad = Tensor::zeros(shape, src.dtype(), src.device())?;
+            // SAFETY: callers read via `narrow(dim, offset, current_seq_len)`
+            // so bytes past `current_seq_len` are never observed before
+            // being written by a later `slice_set` / wrap-copy below.
+            let ad = unsafe { Tensor::empty(shape, src.dtype(), src.device())? };
             self.all_data = Some(ad)
         };
         let ad = self.all_data.as_mut().unwrap();
