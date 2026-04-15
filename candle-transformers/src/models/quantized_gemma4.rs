@@ -1351,6 +1351,36 @@ impl ModelWeights {
             candle::hip_backend::decode_cache::start_recording();
         }
 
+        // T1 profiling: per-sublayer wall-time when CANDLE_LAYER_PROFILE=1.
+        // Tallies (attention, ffn, tail) across all layers per forward.
+        #[cfg(feature = "hip")]
+        let layer_profile = std::env::var("CANDLE_LAYER_PROFILE").is_ok();
+        #[cfg(feature = "hip")]
+        let mut t_xdev_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_mask_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_attn_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_ffn_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_tail_us = 0u128;
+        // MoE sub-phase tallies.
+        #[cfg(feature = "hip")]
+        let mut t_moe_dense_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_moe_router_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_moe_topk_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_moe_gate_up_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_moe_activated_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_moe_down_us = 0u128;
+        #[cfg(feature = "hip")]
+        let mut t_moe_combine_us = 0u128;
+
         // ----- transformer block loop --------------------------------------
         for il in 0..self.layers.len() {
             let (has_kv, kv_source_idx, layer_device, sliding_window_size) = {
@@ -1358,10 +1388,19 @@ impl ModelWeights {
                 (l.has_kv, l.kv_source_idx, l.device.clone(), l.sliding_window_size)
             };
 
+            #[cfg(feature = "hip")]
+            let _t_xdev_start = std::time::Instant::now();
             // Pipeline-parallel: move residual stream to this layer's device.
             if !device_eq(layer_in.device(), &layer_device) {
                 layer_in = layer_in.to_device(&layer_device)?;
             }
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                t_xdev_us += _t_xdev_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_mask_start = std::time::Instant::now();
 
             // Build the per-device causal mask (sliding-aware).
             //
@@ -1407,6 +1446,14 @@ impl ModelWeights {
                     &layer_device,
                 )?)
             };
+
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                t_mask_us += _t_mask_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_attn_start = std::time::Instant::now();
 
             // -------- attention block --------
             let residual = layer_in.clone();
@@ -1683,6 +1730,14 @@ impl ModelWeights {
                 .post_attention_norm
                 .forward_post_residual(&attn, &residual)?;
 
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                t_attn_us += _t_attn_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_ffn_start = std::time::Instant::now();
+
             // -------- FFN block --------
             let skip_moe = std::env::var("CANDLE_GEMMA4_SKIP_MOE").is_ok();
             let mut x = if !skip_moe && self.layers[il].moe.is_some() {
@@ -1691,10 +1746,21 @@ impl ModelWeights {
                 // attention residual output, a.k.a. attn_out in turbo).
                 let attn_out = x;
 
+                #[cfg(feature = "hip")]
+                let _t_dense_start = std::time::Instant::now();
+
                 // Branch 1: Dense MLP
                 let dense_in = self.layers[il].ffn_norm.forward(&attn_out)?;
                 let dense_out = self.layers[il].mlp.forward(&dense_in)?;
                 let dense_normed = moe_branch.dense_post_norm.forward(&dense_out)?;
+
+                #[cfg(feature = "hip")]
+                if layer_profile {
+                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                    t_moe_dense_us += _t_dense_start.elapsed().as_micros();
+                }
+                #[cfg(feature = "hip")]
+                let _t_router_start = std::time::Instant::now();
 
                 // Branch 2: MoE experts
                 let moe_in = moe_branch.pre_norm.forward(&attn_out)?;
@@ -1712,6 +1778,14 @@ impl ModelWeights {
                 };
                 let router_logits = moe_branch.gate_inp.forward(&router_input)?;
                 let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+
+                #[cfg(feature = "hip")]
+                if layer_profile {
+                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                    t_moe_router_us += _t_router_start.elapsed().as_micros();
+                }
+                #[cfg(feature = "hip")]
+                let _t_topk_start = std::time::Instant::now();
 
                 // TopK selection (route through CPU for argsort).
                 let device = routing_weights.device().clone();
@@ -1737,6 +1811,14 @@ impl ModelWeights {
                     / topk_weights
                         .sum_keepdim(candle::D::Minus1)?
                         .broadcast_as(topk_weights.shape())?)?;
+
+                #[cfg(feature = "hip")]
+                if layer_profile {
+                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                    t_moe_topk_us += _t_topk_start.elapsed().as_micros();
+                }
+                #[cfg(feature = "hip")]
+                let _t_gate_up_start = std::time::Instant::now();
 
                 // Expert computation via fused gate_up_exps
                 let hidden = moe_in.dim(candle::D::Minus1)?;
@@ -1773,6 +1855,14 @@ impl ModelWeights {
                     let input_vals: Vec<f32> = x_3d.narrow(0, 0, 1)?.to_device(&candle::Device::Cpu)?.flatten_all()?.to_vec1()?;
                     eprintln!("[L0 MoE] input[0,:5] = {:.6?}", &input_vals[..5.min(input_vals.len())]);
                 }
+                #[cfg(feature = "hip")]
+                if layer_profile {
+                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                    t_moe_gate_up_us += _t_gate_up_start.elapsed().as_micros();
+                }
+                #[cfg(feature = "hip")]
+                let _t_activated_start = std::time::Instant::now();
+
                 let gate = gate_up
                     .narrow(candle::D::Minus1, 0, moe_branch.expert_intermediate)?
                     .contiguous()?;
@@ -1784,6 +1874,15 @@ impl ModelWeights {
                     )?
                     .contiguous()?;
                 let activated = gate.gelu()?.broadcast_mul(&up)?;
+
+                #[cfg(feature = "hip")]
+                if layer_profile {
+                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                    t_moe_activated_us += _t_activated_start.elapsed().as_micros();
+                }
+                #[cfg(feature = "hip")]
+                let _t_down_start = std::time::Instant::now();
+
                 let mut moe_out = moe_branch
                     .down_exps
                     .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?;
@@ -1800,6 +1899,14 @@ impl ModelWeights {
                     let expert_scales = expert_scales.unsqueeze(candle::D::Minus1)?;
                     moe_out = moe_out.broadcast_mul(&expert_scales)?;
                 }
+
+                #[cfg(feature = "hip")]
+                if layer_profile {
+                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                    t_moe_down_us += _t_down_start.elapsed().as_micros();
+                }
+                #[cfg(feature = "hip")]
+                let _t_combine_start = std::time::Instant::now();
 
                 // Weight + sum across topk
                 let topk_weights = topk_weights.unsqueeze(candle::D::Minus1)?;
@@ -1835,9 +1942,16 @@ impl ModelWeights {
                 // override it — we loaded `_1` into MoeBranch.dense_post_norm
                 // separately.
                 let combined = (&dense_normed + &moe_normed)?;
-                self.layers[il]
+                let result = self.layers[il]
                     .post_ffn_norm
-                    .forward_post_residual(&combined, &attn_out)?
+                    .forward_post_residual(&combined, &attn_out)?;
+
+                #[cfg(feature = "hip")]
+                if layer_profile {
+                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                    t_moe_combine_us += _t_combine_start.elapsed().as_micros();
+                }
+                result
             } else {
                 // Dense-only path (E4B and similar).
                 let residual = x.clone();
@@ -1895,6 +2009,14 @@ impl ModelWeights {
                     .forward_post_residual(&ffn_out, &residual)?
             };
 
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                t_ffn_us += _t_ffn_start.elapsed().as_micros();
+            }
+            #[cfg(feature = "hip")]
+            let _t_tail_start = std::time::Instant::now();
+
             // -------- per-layer embedding injection (E4B) --------
             // Diagnostic switch: CANDLE_GEMMA4_NO_PE_INJECT=1 skips the
             // per-layer embed injection entirely. Used to localize where
@@ -1940,7 +2062,32 @@ impl ModelWeights {
                 eprintln!("[LAYER idx={} L{}] head={:?}", index_pos, il, head);
             }
 
+            #[cfg(feature = "hip")]
+            if layer_profile {
+                if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
+                t_tail_us += _t_tail_start.elapsed().as_micros();
+            }
+
             layer_in = x;
+        }
+
+        #[cfg(feature = "hip")]
+        if layer_profile {
+            let tot = t_xdev_us + t_mask_us + t_attn_us + t_ffn_us + t_tail_us;
+            eprintln!(
+                "[layer-profile] xdev={} mask={} attn={} ffn={} tail={} total={} (µs, summed across {} layers)",
+                t_xdev_us, t_mask_us, t_attn_us, t_ffn_us, t_tail_us, tot,
+                self.layers.len(),
+            );
+            let moe_tot = t_moe_dense_us + t_moe_router_us + t_moe_topk_us
+                + t_moe_gate_up_us + t_moe_activated_us + t_moe_down_us + t_moe_combine_us;
+            if moe_tot > 0 {
+                eprintln!(
+                    "[moe-profile]   dense={} router={} topk={} gate_up={} activated={} down={} combine={} sum={} (µs)",
+                    t_moe_dense_us, t_moe_router_us, t_moe_topk_us,
+                    t_moe_gate_up_us, t_moe_activated_us, t_moe_down_us, t_moe_combine_us, moe_tot,
+                );
+            }
         }
 
         // ----- final norm + lm_head + softcap ------------------------------
