@@ -1182,13 +1182,32 @@ fn decode_alloc_try_take(size: usize, device_ordinal: i32) -> Option<sys::hipDev
         if state.mode != DecodeAllocMode::Replaying {
             return None;
         }
+        let trace = std::env::var("CANDLE_G2_TRY_TAKE_TRACE").is_ok();
         let tbl = state.tables.get_mut(&device_ordinal)?;
         if tbl.cursor < tbl.entries.len() {
             let (entry_size, ptr) = tbl.entries[tbl.cursor];
             if entry_size >= size {
+                if trace {
+                    eprintln!(
+                        "[try_take] dev={} c={}/{} req={} served sz={} ptr=0x{:x}",
+                        device_ordinal, tbl.cursor, tbl.entries.len(),
+                        size, entry_size, ptr as usize
+                    );
+                }
                 tbl.cursor += 1;
                 return Some(ptr);
+            } else if trace {
+                eprintln!(
+                    "[try_take] dev={} c={}/{} req={} FAIL too-small sz={}",
+                    device_ordinal, tbl.cursor, tbl.entries.len(),
+                    size, entry_size
+                );
             }
+        } else if trace {
+            eprintln!(
+                "[try_take] dev={} c={}/{} req={} FAIL end",
+                device_ordinal, tbl.cursor, tbl.entries.len(), size
+            );
         }
         None
     })
