@@ -495,7 +495,28 @@ impl ModelWeights {
 
                 // Detect MoE layer: present if ffn_gate_inp.weight exists.
                 let moe = if lgg.has_tensor(&format!("{block_prefix}.ffn_gate_inp.weight")) {
-                    let gate_inp = lgg.qmatmul(&format!("{block_prefix}.ffn_gate_inp.weight"))?;
+                    let mut gate_inp = lgg.qmatmul(&format!("{block_prefix}.ffn_gate_inp.weight"))?;
+                    // Gemma-4 ships `ffn_gate_inp.weight` as F32 in all Q*_0 /
+                    // Q*_1 GGUFs.  F32 matmul lowers to rocBLAS gemv, which the
+                    // steady-state profiler shows at ~25 % of total decode on
+                    // 4-GPU 26B-A4B (7.3 ms / 29 ms summed across 30 layers).
+                    // Requantising to Q8_0 forces the router onto the MMVQ
+                    // kernel chain (same fix as O4 for Qwen3-Coder-Next,
+                    // memory `project_phase_o2_o4_qwen3next.md`).  The router
+                    // head is tiny ([hidden, 128]) so Q8_0 is essentially
+                    // lossless.  Opt-out: `CANDLE_GEMMA4_ROUTER_NO_REQUANT=1`,
+                    // override dtype: `CANDLE_GEMMA4_ROUTER_REQUANT_DTYPE=q4_0|q4_1|q5_0|q8_0`.
+                    if std::env::var("CANDLE_GEMMA4_ROUTER_NO_REQUANT").is_err() {
+                        let dtype = match std::env::var("CANDLE_GEMMA4_ROUTER_REQUANT_DTYPE")
+                            .ok().as_deref()
+                        {
+                            Some("q4_0") => candle::quantized::GgmlDType::Q4_0,
+                            Some("q4_1") => candle::quantized::GgmlDType::Q4_1,
+                            Some("q5_0") => candle::quantized::GgmlDType::Q5_0,
+                            _ => candle::quantized::GgmlDType::Q8_0,
+                        };
+                        let _ = gate_inp.requantize_to(dtype);
+                    }
                     let gate_inp_s = lgg
                         .try_dequantize(&format!("{block_prefix}.ffn_gate_inp.scale"))
                         .ok_or_else(|| {
