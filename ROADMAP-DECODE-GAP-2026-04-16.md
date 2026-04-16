@@ -103,10 +103,26 @@ vs turbo's warp-coop path at ~50 µs/call: candle's is 44 % slower per call, but
 - Thread-local CPU-ids cache (`w3_cached_ids_*`). No longer on the hot path but retained — may be useful for future MoE paths that need CPU ids.
 - `launch_mul_mat_vec_q8_1_chunk_raw` — kept, useful for targeted MoE variants on other dtypes.
 
-**Not yet covered** (future W3c):
-- Q4_0 / Q4_1 MoE decode (Qwen3-Coder-30B). Same technique applies; needs Q4_0/Q4_1 MoE kernel variants.
-- K-quant MoE (Q4_K / Q5_K / Q6_K). Lower priority; few active models use K-quant MoE.
-- Prefill MoE gather-by-expert (b_size > 1). Orthogonal to W3-rev2; needs variable-M per-expert MMQ.
+**W3c attempt (2026-04-16) — per-call <50 µs NOT achieved via kernel micro-tweaks.** Tried 4 experiments:
+
+| experiment | change | per-call µs | verdict |
+|---|---|---:|---|
+| Exp1 | int4 → 8× scalar int loads (turbo pattern) | 71 (noise) | no-op |
+| Exp3 | `__launch_bounds__(64, 8)` | 70 (noise) | no-op |
+| Exp4 | 2-way unroll (stride=64) | 74.6 | regression (+2 VGPR → occupancy loss) |
+| — | back to baseline | 72 | confirmed floor |
+
+ASM-level inspection of the compiled kernel (`/opt/rocm/llvm/bin/llvm-objdump`) shows the inner loop is already well-pipelined: 4 global loads issued before `s_waitcnt vmcnt(2)`, then 3 dp4a overlapping the last 2 in-flight loads. 21 VGPR, 0 scratch, theoretical 12 waves/SIMD. Memory-latency is the dominant cost at 70 µs/call; no room to shrink without reducing memory traffic or dispatch count.
+
+**The real gap vs turbo is dispatch count, not per-call µs.** Turbo fires ~30 MoE MMVQ calls per decode forward (as measured in the 2026-04-16 profile: 3,872 `gfx906_mul_mat_vec_q8_0_warp_coop` calls / 129 forwards). Candle fires 60 (our 7,680 / 128). Turbo likely bundles gate_up and down projections into a single `mul_mat_id` launch via its `mm_ids_helper`-compacted index arrays — it's a dispatch-layer optimisation, not a kernel-body one.
+
+**W3c retro conclusion:** micro-tweaks hit the ~70 µs floor on this gfx906 warp-coop config. To get below 50 µs per-call on our shape would require either (a) a meaningfully lower-latency memory path (not available — we're already at 4–5 blocks/CU with plenty of waves-in-flight), or (b) a different grid that does more output rows per launch. Option (b) is a **W3d follow-up** worth a separate planning pass.
+
+**Not yet covered (future follow-ups):**
+- **W3d**: dispatch-level batching — combine `gate_up_exps` and `down_exps` projections into one `indexed_moe_forward` call (or write a new kernel that processes both weights in one launch). Expected: halves MoE MMVQ call count from 60 → 30 per forward, saving ~2 ms aggregate per forward = ~2–3 pp tg128. Requires: new kernel signature or Rust-side orchestration rewrite. Estimated effort: 2–3 days.
+- **W3e**: Q4_0 / Q4_1 MoE decode (Qwen3-Coder-30B). Same W3-rev2 technique, different block types; 0.5 day.
+- **W3f**: K-quant MoE (Q4_K / Q5_K / Q6_K). Lower priority; few active models.
+- **W3b**: Prefill MoE gather-by-expert (b_size > 1). Orthogonal axis; needs variable-M per-expert MMQ.
 
 **Remaining levers for the 1.05× turbo goal:** W1 (alloc pool), W5 (ucopy), W2 (peer copies), W6 (elementwise), W4 (memset), W7 (G2/G3). W3 contributed +3.5 pp; the cumulative projection now shows W1-W6 landing ≈ 0.96× turbo with W7 delivering the over-turbo push.
 
