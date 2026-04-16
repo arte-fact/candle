@@ -184,6 +184,12 @@ pub struct ModelWeights {
     /// G2/G3 decode replay state (opt-in via `CANDLE_G2_REPLAY=1`).
     #[cfg(feature = "hip")]
     decode_state: candle::hip_backend::decode_cache::DecodeState,
+    /// Number of distinct HIP devices spanned by this model. Used to
+    /// auto-select the decomposed attention path on single-GPU
+    /// (+1.9 % tg on E4B 1-GPU; -1 % on 4-GPU MoE per Task #10
+    /// validation). Computed once at load.
+    #[cfg(feature = "hip")]
+    n_devices: usize,
 }
 
 impl ModelWeights {
@@ -674,6 +680,8 @@ impl ModelWeights {
         let kv_caches: Vec<Option<candle_nn::kv_cache::KvCache>> =
             (0..block_count).map(|_| None).collect();
 
+        #[cfg(feature = "hip")]
+        let n_devices = devices.len();
         Ok(Self {
             tok_embeddings: Embedding::new_unused(),
             embedding_length,
@@ -685,6 +693,8 @@ impl ModelWeights {
             kv_caches,
             #[cfg(feature = "hip")]
             decode_state: candle::hip_backend::decode_cache::DecodeState::Init,
+            #[cfg(feature = "hip")]
+            n_devices,
         }
         .with_tok_embeddings(tok_embeddings))
     }
@@ -1357,13 +1367,17 @@ impl ModelWeights {
                         let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
                         let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
                         let l_k_iter = pad_info.map(|(t_cur, _)| t_cur).unwrap_or(k_c.dim(2)?);
-                        // Task #2: opt-in decomposed attention (gemv_qk → softmax → gemv_v).
-                        // Per-op micro-bench shows parity-to-slight-win vs the fused
-                        // gqa_decode_mv_fast (41 vs 43 µs). Gate behind
-                        // CANDLE_ATTN_DECOMPOSED=1 until validated across full decode.
-                        let use_decomposed = std::env::var("CANDLE_ATTN_DECOMPOSED")
-                            .map(|v| v != "0" && v != "false")
-                            .unwrap_or(false);
+                        // Task #2 + #10: decomposed attention (gemv_qk → softmax → gemv_v).
+                        // Validated +1.9 % on E4B 1-GPU, -1 % on 4-GPU MoE (the extra
+                        // kernel launches cross device boundaries, adding sync cost).
+                        // Default heuristic: enable on single-GPU, disable on multi-GPU.
+                        // CANDLE_ATTN_DECOMPOSED={0,1} overrides the heuristic.
+                        let env_override = std::env::var("CANDLE_ATTN_DECOMPOSED").ok();
+                        let use_decomposed = match env_override.as_deref() {
+                            Some("0") | Some("false") => false,
+                            Some(_) => true,
+                            None => self.n_devices == 1,
+                        };
                         if use_decomposed {
                             candle::hip_backend::gqa_attention_decode_mv_decomposed(
                                 q_precomputed, &k_c, &v_c,
