@@ -938,6 +938,107 @@ fn pool_enabled() -> bool {
     *POOL_ENABLED.get_or_init(|| std::env::var("HIPDARC_DISABLE_POOL").is_err())
 }
 
+/// Pool-hit/miss counters for diagnosis. Enabled via `HIPDARC_POOL_STATS=1`.
+/// Prints a size-bucketed histogram at process exit (or when dumped via
+/// `pool_stats_dump()`).
+static POOL_STATS_ENABLED: OnceLock<bool> = OnceLock::new();
+/// Histogram bins: count (hits, misses, skips) per log2(size) bin.
+/// Bin 0 = [1, 2), bin 1 = [2, 4), ..., bin 30 = [1 GiB, 2 GiB).
+/// Lock-per-bin would be cleaner but this whole path is cold when
+/// `HIPDARC_POOL_STATS` is off (one atomic load per call).
+struct PoolStatsBin {
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+    skips: std::sync::atomic::AtomicU64,
+}
+impl PoolStatsBin {
+    const fn new() -> Self {
+        Self {
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            skips: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+const POOL_STATS_BINS: usize = 31;
+static POOL_STATS: [PoolStatsBin; POOL_STATS_BINS] = {
+    // Array of 31 zero-init bins.
+    const Z: PoolStatsBin = PoolStatsBin::new();
+    [Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z, Z]
+};
+
+#[inline]
+fn pool_stats_enabled() -> bool {
+    *POOL_STATS_ENABLED.get_or_init(|| std::env::var("HIPDARC_POOL_STATS").is_ok())
+}
+
+#[inline]
+fn pool_stats_bin(size: usize) -> usize {
+    // log2 floor — for size=0 return 0.
+    if size <= 1 {
+        0
+    } else {
+        let lz = (size as u64).leading_zeros() as usize;
+        let bin = 63 - lz;
+        if bin >= POOL_STATS_BINS { POOL_STATS_BINS - 1 } else { bin }
+    }
+}
+
+#[inline]
+fn pool_stats_record_hit(size: usize) {
+    if !pool_stats_enabled() { return; }
+    POOL_STATS[pool_stats_bin(size)]
+        .hits
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pool_stats_record_miss(size: usize) {
+    if !pool_stats_enabled() { return; }
+    POOL_STATS[pool_stats_bin(size)]
+        .misses
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn pool_stats_record_skip(size: usize) {
+    if !pool_stats_enabled() { return; }
+    POOL_STATS[pool_stats_bin(size)]
+        .skips
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Dump the pool hit/miss histogram to stderr. Called automatically at
+/// process exit when `HIPDARC_POOL_STATS=1`; can also be called on
+/// demand.
+pub fn pool_stats_dump() {
+    use std::sync::atomic::Ordering;
+    if !pool_stats_enabled() { return; }
+    eprintln!("hipdarc pool stats (size bucket: log2):");
+    eprintln!("{:>6}  {:>12}  {:>12}  {:>12}  {:>6}", "bin", "hits", "misses", "skip>1MB", "hit%");
+    let mut total_h = 0u64;
+    let mut total_m = 0u64;
+    let mut total_s = 0u64;
+    for (i, bin) in POOL_STATS.iter().enumerate() {
+        let h = bin.hits.load(Ordering::Relaxed);
+        let m = bin.misses.load(Ordering::Relaxed);
+        let s = bin.skips.load(Ordering::Relaxed);
+        if h + m + s == 0 { continue; }
+        let hit_pct = if h + m > 0 { 100.0 * (h as f64) / ((h + m) as f64) } else { 0.0 };
+        let lo = 1usize << i;
+        let hi = 1usize << (i + 1);
+        eprintln!("{:>6}  {:>12}  {:>12}  {:>12}  {:>5.1}%   [{} .. {})", i, h, m, s, hit_pct, lo, hi);
+        total_h += h; total_m += m; total_s += s;
+    }
+    let hit_pct = if total_h + total_m > 0 {
+        100.0 * (total_h as f64) / ((total_h + total_m) as f64)
+    } else { 0.0 };
+    eprintln!(
+        "total: {} hits, {} misses, {} skips (>1 MiB); pool hit rate {:.1}%",
+        total_h, total_m, total_s, hit_pct
+    );
+}
+
 fn pool_max_bytes() -> usize {
     *POOL_MAX_BYTES.get_or_init(|| {
         std::env::var("HIPDARC_POOL_MAX_BYTES")
@@ -955,15 +1056,18 @@ fn pool_max_bytes() -> usize {
 /// Maximum size of an individual buffer eligible for the pool.
 /// Buffers larger than this skip the pool on both alloc and free.
 ///
-/// Why this matters: candle's `ConcatKvCache` grows the KV cache by
-/// one row per decode step via `Tensor::cat`, which produces a buffer
-/// of a *new* size every step (1, 2, 3, ... rows). Each unique size
-/// lives in its own bucket, hits *exactly once*, and never gets
-/// reused — so pooling them just hoards VRAM. The per-token
-/// activation buffers that *do* benefit from pooling (the wq/wk/wv
-/// projections, ffn intermediate, layer norms) are all under ~256 KB
-/// at typical hidden sizes. The default threshold filters the cache
-/// growth out and keeps the activations.
+/// History: was 1 MiB — designed to keep candle's legacy
+/// `ConcatKvCache` one-row-per-step growth out of the pool (each
+/// new kv_len size allocated once, hit once, wasted bytes). Phase O3
+/// (2026-04-15) pre-allocates KV cache to `max_seq_len` so the
+/// concat growth pattern is gone. Remaining >1 MiB decode-path
+/// allocations (flash-attn intermediate, MoE per-expert outputs for
+/// large shapes, prefill activation tensors at pp>=256) were
+/// bypassing the pool and firing 600+ `hipMallocAsync` per tg128
+/// decode run on Gemma-4-26B-A4B (W1 profile 2026-04-16). Raising
+/// the default to 64 MiB lets these allocations hit the pool
+/// without risking runaway bloat — the per-device `pool_max_bytes`
+/// cap (1 GiB default) is the upper bound.
 ///
 /// Override with `HIPDARC_POOL_MAX_BUFFER_BYTES`.
 fn pool_max_buffer_bytes() -> usize {
@@ -971,10 +1075,13 @@ fn pool_max_buffer_bytes() -> usize {
         std::env::var("HIPDARC_POOL_MAX_BUFFER_BYTES")
             .ok()
             .and_then(|s| s.parse().ok())
-            // 1 MiB: covers all per-token activation buffers for
-            // hidden_size up to ~32K with f32 dtype, while excluding
-            // even modest KV-cache cat results.
-            .unwrap_or(1024 * 1024)
+            // 64 MiB: covers all per-token activation buffers
+            // (hidden_size up to ~32K f32), prefill activations for
+            // pp up to ~2048, flash-attn split-Lk combine outputs,
+            // and the 4-8 MiB MoE expert gather staging. Excludes
+            // only truly outlier buffers (>64 MiB = KV cache slabs,
+            // full-sequence logits, etc.) that don't repeat per step.
+            .unwrap_or(64 * 1024 * 1024)
     })
 }
 
@@ -994,11 +1101,18 @@ fn pool_for(ordinal: i32) -> Arc<Mutex<DevicePool>> {
 #[inline]
 fn pool_try_take(ordinal: i32, size: usize) -> Option<sys::hipDeviceptr_t> {
     if !pool_enabled() || size > pool_max_buffer_bytes() {
+        pool_stats_record_skip(size);
         return None;
     }
     let pool = pool_for(ordinal);
     let mut guard = pool.lock().ok()?;
-    guard.try_take(size)
+    let result = guard.try_take(size);
+    if result.is_some() {
+        pool_stats_record_hit(size);
+    } else {
+        pool_stats_record_miss(size);
+    }
+    result
 }
 
 /// Return a buffer to the device pool. If pooling is disabled or the

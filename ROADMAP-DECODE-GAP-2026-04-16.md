@@ -170,7 +170,30 @@ W8 gate passed: aggregate GPU −6.3 % (10,042 → 9,412 ms); `activation` −42
 
 ---
 
-### W1 — Decode-path allocation pool **[biggest CPU-side win]**
+### W1 — Pool threshold raised to 64 MiB **[LANDED 2026-04-16 — PARTIAL]**
+
+**Diagnosis first (not assumed).** Added `HIPDARC_POOL_STATS=1` instrumentation to `hipdarc::driver`: a 31-bin log2(size) histogram of pool hits / misses / skips (>threshold). Ran pp512+tg128 and found the existing pool is *already highly effective* — **96.4 % hit rate on decode-hot sizes**. The "13,181 hipMallocAsync" baseline figure was split between:
+- ~1,100 pool-misses at small sizes (unavoidable warmup churn + shape irregularities)
+- ~600–700 **pool-skips** because allocations exceed the 1 MiB per-buffer cap — almost all in the 4 MiB – 64 MiB range (flash-attn split-L_k combine, MoE gather staging, prefill activation).
+
+Root cause: the 1 MiB `HIPDARC_POOL_MAX_BUFFER_BYTES` default was chosen pre-O3 to filter out `Tensor::cat`-driven KV cache growth (unique size per step). Phase O3 (2026-04-15) pre-allocates KV cache to `max_seq_len` so the concat pattern is gone; the 1 MiB threshold was just excluding legitimate pool-eligible buffers.
+
+**Fix landed:** default raised `1 MiB → 64 MiB` in `hipdarc/src/driver.rs::pool_max_buffer_bytes`. Still overridable via `HIPDARC_POOL_MAX_BUFFER_BYTES=<n>`. Per-device `pool_max_bytes` (1 GiB total) still caps runaway growth.
+
+**Measured (4 GPUs, pp512+tg128, best-of-3):**
+| | W3d baseline | **W1 (64 MiB pool)** | Δ |
+|---|---:|---:|---:|
+| **pp512** | 654 t/s | **676 t/s** | **+3.4 %** |
+| tg128 | 47.45 | 47.65 | +0.4 % |
+| vs turbo tg | 0.711× | **0.714×** | — |
+
+**W8 gate:** no PRESERVE family regressed > 10 %; aggregate GPU +1.4 % (noise; first run showed +7.6 % with a rocBLAS variance spike that cleared on re-run). New baseline snapshotted.
+
+**Why decode gain is small (+0.4 % not the projected +8-12 pp):** the decode path's pool hit rate was *already* 96 % before W1. The big skip-bypass bucket was prefill-dominated, which is why pp saw +3.4 % and tg only +0.4 %. **The original "13,181 hipMallocAsync / decode run" figure that projected W1 at +8-12 pp was misread — most of that count was prefill allocations.**
+
+**W1b — further tuning (not yet landed):** 96 → 100 % pool hit rate still leaves ~1,100 decode-path mallocs. Investigation deferred to W1b (needs callsite-attribution trace for the remaining misses — likely specific Rust-side `alloc_uninit` patterns with shape-dependent sizing that doesn't repeat exactly).
+
+### W1 (original plan — superseded by above; kept for historical reference)
 
 **Target:** Eliminate all `hipMallocAsync` inside the forward pass. Per-device pool, size-bucketed, returned via `Drop` rather than `hipFree`.
 
@@ -374,8 +397,9 @@ Projections per phase (non-additive: dependencies and diminishing-returns noted)
 | today | 43.84 | 0.66× | 282 s | 13,181 |
 | + W3a (fused moe-combine — **landed**) | 44.81 | 0.67× | 282 s | 13,181 |
 | + W3-rev2 (MoE warp-coop Q8_0 — **landed**) | 46.37 | 0.695× | 282 s | 13,181 |
-| + W3d (gelu_mul_quantize fused — **landed**) | **47.45** | **0.711×** | 282 s | 13,181 |
-| + W1 (alloc pool) | ~55 | 0.82× | ~50 s | 0 |
+| + W3d (gelu_mul_quantize fused — **landed**) | 47.45 | 0.711× | 282 s | 13,181 |
+| + W1 (pool threshold 1 MiB → 64 MiB — **landed**) | **47.65** | **0.714×** | 282 s | ~1,100 |
+| + W1b (pool diagnostics / further tuning) | ~49 | 0.73× | ~50 s | 0 |
 | + W5 (ucopy clean) | ~56 | 0.84× | ~45 s | 0 |
 | + W2 (peer-to-peer) | ~59 | 0.88× | ~40 s | 0 |
 | + W6 (param bin_bcast) | ~62 | 0.93× | ~35 s | 0 |

@@ -245,5 +245,7 @@ fn main() -> anyhow::Result<()> {
         sampled as f64 / dt.as_secs_f64(),
     );
     candle_transformers::models::quantized_blocks::eplb::print_summary();
+    #[cfg(feature = "hip")]
+    candle::hip_backend::hipdarc::driver::pool_stats_dump();
     Ok(())
 }

@@ -1,30 +1,30 @@
 # Kernel-family baseline — gemma-4-26B-A4B-it-Q8_0.gguf (candle)
 
-- captured_at: 2026-04-16T12:53:18+00:00
+- captured_at: 2026-04-16T13:30:12+00:00
 - gpus: 0,1,2,3
 - prompt_tokens: 663, gen_tokens: 127
-- throughput (no rocprof): {'pp_t_s': 653.66, 'tg_t_s': 47.45}
-- cpu_seconds: {'real': 68.203, 'user': 116.828, 'sys': 457.622}
+- throughput (no rocprof): {'pp_t_s': 675.96, 'tg_t_s': 47.65}
+- cpu_seconds: {'real': 71.164, 'user': 126.717, 'sys': 476.279}
 
 ```
 family                  calls     total_ms     avg_us     pct  role
 --------------------------------------------------------------------------
-moe_fused                 120      5564.39   46369.90  59.12%  DEGRADE-TARGET
-mmvq_q8                 34050      1498.36      44.00  15.92%  PRESERVE
-bookkeeping             48041       684.64      14.25   7.27%  DEGRADE-TARGET
-mmq_q8_prefill            410       449.86    1097.22   4.78%  PRESERVE
-rmsnorm                 35230       238.22       6.76   2.53%  PRESERVE
-elementwise             39190       216.50       5.52   2.30%  DEGRADE-TARGET
-router_topk             11700       210.45      17.99   2.24%  DEGRADE-TARGET
-flash_decode             7680       198.93      25.90   2.11%  PRESERVE
-quant_q8_1              21140       120.19       5.69   1.28%  PRESERVE
-rocblas_fallback          120        55.03     458.57   0.58%  
-rope                     7800        36.31       4.66   0.39%  PRESERVE
-softmax_attn             3960        35.55       8.98   0.38%  PRESERVE
-sampler_gpu               778        34.35      44.15   0.36%  
-activation               3960        25.12       6.34   0.27%  PRESERVE
-moe_combine              3900        24.12       6.19   0.26%  DEGRADE-TARGET
-moe_gelu_quant           3840        19.72       5.14   0.21%  DEGRADE-TARGET
+moe_fused                 120      5571.11   46425.88  58.36%  DEGRADE-TARGET
+mmvq_q8                 34050      1463.97      42.99  15.33%  PRESERVE
+bookkeeping             48041       679.78      14.15   7.12%  DEGRADE-TARGET
+mmq_q8_prefill            410       448.94    1094.98   4.70%  PRESERVE
+rocblas_fallback          120       241.22    2010.17   2.53%  
+rmsnorm                 35230       236.36       6.71   2.48%  PRESERVE
+elementwise             39190       210.07       5.36   2.20%  DEGRADE-TARGET
+router_topk             11700       207.23      17.71   2.17%  DEGRADE-TARGET
+flash_decode             7680       195.69      25.48   2.05%  PRESERVE
+quant_q8_1              21140       118.89       5.62   1.25%  PRESERVE
+rope                     7800        36.12       4.63   0.38%  PRESERVE
+sampler_gpu               778        35.16      45.19   0.37%  
+softmax_attn             3960        34.66       8.75   0.36%  PRESERVE
+activation               3960        24.63       6.22   0.26%  PRESERVE
+moe_combine              3900        23.71       6.08   0.25%  DEGRADE-TARGET
+moe_gelu_quant           3840        19.08       4.97   0.20%  DEGRADE-TARGET
 --------------------------------------------------------------------------
-TOTAL                              9411.73
+TOTAL                              9546.61
 ```
