@@ -402,6 +402,51 @@ extern "C" __global__ void FN_NAME(                                            \
 L2_NORM_OP(float, l2_norm_f32, sqrtf)
 
 // ---------------------------------------------------------------------------
+// Fused V normalisation along the last dimension (parameter-free RMS-norm):
+//     out[row, i] = x[row, i] / sqrt(mean(x[row, :]²) + eps)
+//                 = x[row, i] / sqrt(Σ x² / N + eps)
+// ---------------------------------------------------------------------------
+//
+// Same shape as L2_NORM_OP but divides the sum by row_len before adding
+// eps and taking sqrt. Used by Gemma-family `v_norm` on per-layer V
+// projections (see `candle-transformers/src/models/quantized_blocks/norms.rs::v_norm`).
+// Replaces the 5-op tensor chain (sqr + mean_keepdim + add_eps + sqrt +
+// broadcast_div) with a single fused kernel launch.
+
+#define V_NORM_OP(TYPENAME, FN_NAME, SQRT_FN)                                  \
+extern "C" __global__ void FN_NAME(                                            \
+    const size_t row_len,                                                      \
+    const TYPENAME eps,                                                        \
+    const TYPENAME *__restrict__ in,                                           \
+    TYPENAME *__restrict__ out                                                 \
+) {                                                                            \
+    const int row = blockIdx.x;                                                \
+    const int lane = threadIdx.x;                                              \
+    const TYPENAME *row_in  = in  + (size_t)row * row_len;                     \
+    TYPENAME       *row_out = out + (size_t)row * row_len;                     \
+                                                                               \
+    /* Pass 1: compute Σ x² across the row. */                                 \
+    TYPENAME partial = (TYPENAME)0;                                            \
+    for (size_t i = lane; i < row_len; i += blockDim.x) {                      \
+        const TYPENAME v = row_in[i];                                          \
+        partial += v * v;                                                      \
+    }                                                                          \
+    _Pragma("unroll")                                                          \
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {                     \
+        partial += __shfl_xor(partial, mask);                                  \
+    }                                                                          \
+    /* inv_norm = 1 / sqrt(mean(x²) + eps) = 1 / sqrt(sum/N + eps) */          \
+    const TYPENAME mean_sq = partial / (TYPENAME)row_len;                      \
+    const TYPENAME inv_norm = (TYPENAME)1 / SQRT_FN(mean_sq + eps);            \
+                                                                               \
+    for (size_t i = lane; i < row_len; i += blockDim.x) {                      \
+        row_out[i] = row_in[i] * inv_norm;                                     \
+    }                                                                          \
+}
+
+V_NORM_OP(float, v_norm_f32, sqrtf)
+
+// ---------------------------------------------------------------------------
 // Fused MoE router pre-amble (Phase T1.1):
 //     out[r,i] = x[r,i] / sqrt(mean(x[r,:]^2) + eps) * inv_sqrt_n * gate_s[i]
 //

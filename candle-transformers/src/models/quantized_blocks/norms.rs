@@ -115,7 +115,22 @@ pub fn causal_mask_padded(
 
 /// Parameter-free RMS normalization on a tensor.
 /// Used for V-norm in Gemma4 (`ggml_rms_norm` without learned weights).
+///
+/// On HIP with contiguous f32 inputs, lowers to a single fused kernel
+/// launch via `candle::hip_backend::v_norm_fused`. Otherwise falls back
+/// to the 5-op tensor chain (sqr + mean_keepdim + add_eps + sqrt +
+/// broadcast_div). Both paths are mathematically identical.
 pub fn v_norm(x: &Tensor, eps: f64) -> Result<Tensor> {
+    #[cfg(feature = "hip")]
+    {
+        if matches!(x.device(), candle::Device::Hip(_))
+            && x.dtype() == DType::F32
+            && x.is_contiguous()
+            && x.rank() >= 1
+        {
+            return candle::hip_backend::v_norm_fused(x, eps);
+        }
+    }
     let x_sq = x.sqr()?;
     let mean_sq = x_sq.mean_keepdim(D::Minus1)?;
     let norm = (mean_sq + eps)?.sqrt()?;

@@ -602,6 +602,84 @@ pub fn l2_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
     ))
 }
 
+/// Fused parameter-free RMS-norm (Gemma-style `v_norm`):
+///     out[row, i] = x[row, i] / sqrt(mean(x[row, :]²) + eps)
+///
+/// Same shape as [`l2_norm_fused`] but divides the row sum by `row_len`
+/// before sqrt, matching the math of `ggml_rms_norm` without a learned
+/// weight. Replaces the 5-op Rust chain in
+/// `quantized_blocks::norms::v_norm` (sqr + mean_keepdim + add_eps +
+/// sqrt + broadcast_div). Used by Gemma-family V projections and any
+/// other parameter-free RMSNorm site.
+///
+/// # Requirements
+/// - `x` must be on a HIP device, contiguous, and f32.
+/// - `x.rank() >= 1`.
+pub fn v_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let dev = match x.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("v_norm_fused: input must be on a HIP device"),
+    };
+    if x.dtype() != DType::F32 {
+        crate::bail!(
+            "v_norm_fused: input must be f32, got {:?}",
+            x.dtype()
+        );
+    }
+    if !x.is_contiguous() {
+        crate::bail!("v_norm_fused: input must be contiguous");
+    }
+    if x.rank() < 1 {
+        crate::bail!("v_norm_fused: input must have rank >= 1");
+    }
+
+    let row_len = *x.dims().last().unwrap();
+    let n_rows = x.elem_count() / row_len;
+    if row_len == 0 || n_rows == 0 {
+        return x.clone().contiguous();
+    }
+
+    let (x_st, x_l) = x.storage_and_layout();
+    let x_hip = match &*x_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("v_norm_fused: storage is not HIP"),
+    };
+    let x_slice = x_hip.as_hip_slice::<f32>()?;
+    let x_view = match x_l.contiguous_offsets() {
+        Some((lo, hi)) => x_slice.slice(lo..hi),
+        None => crate::bail!("v_norm_fused: non-contiguous storage"),
+    };
+
+    let out = unsafe { dev.alloc::<f32>(x.elem_count())? };
+
+    let func = dev.get_or_load_func("v_norm_f32", &kernels::UNARY)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (WARP_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    let row_len_arg = row_len;
+    let eps_f32 = eps as f32;
+    builder.arg(&row_len_arg);
+    builder.arg(&eps_f32);
+    builder.arg(&x_view);
+    builder.arg(&out);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(x_st);
+
+    let out_storage = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        <Shape as From<Vec<usize>>>::from(x.dims().to_vec()),
+        BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
 /// Phase T1.2 — fused MoE topk: softmax + top-k argmax + normalise in
 /// a single kernel.
 ///
