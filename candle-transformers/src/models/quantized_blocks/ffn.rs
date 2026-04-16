@@ -159,14 +159,23 @@ impl DenseMlp {
     ) -> Result<Tensor> {
         let gate_up = self.gate_up.forward_preq8(x_q8_view, b_size, rhs_shape)?;
 
-        // Gate+up split → activation. For SiLU the fused kernel reads
-        // `gate_up` directly. For GELU there's no fused variant yet, so
-        // we materialize gate/up separately.
-        let activated = if matches!(self.activation, MlpActivation::Silu)
-            && gate_up.is_contiguous()
+        // Gate+up split → activation. Both SiLU and GELU have fused
+        // kernels that read `gate_up` directly (W5 wired the GELU
+        // variant for Gemma-family). This eliminates two
+        // `.narrow().contiguous()` (ucopy_f32) launches plus the
+        // activation and the bmul — one fused kernel replaces four.
+        // Saves ~3 launches per FFN per layer per token.
+        let activated = if gate_up.is_contiguous()
             && gate_up.dtype() == candle::DType::F32
         {
-            candle::hip_backend::silu_mul_split_last_fused(&gate_up)?
+            match self.activation {
+                MlpActivation::Silu => {
+                    candle::hip_backend::silu_mul_split_last_fused(&gate_up)?
+                }
+                MlpActivation::Gelu => {
+                    candle::hip_backend::gelu_mul_split_last_fused(&gate_up)?
+                }
+            }
         } else {
             let gate = gate_up
                 .narrow(D::Minus1, 0, self.intermediate_size)?
