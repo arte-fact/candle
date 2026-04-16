@@ -680,6 +680,179 @@ pub fn v_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
     ))
 }
 
+/// Fused rmsnorm + RoPE for decode (seq_len == 1).
+///
+/// Input `x`: shape `(B, H, 1, D)` contiguous f32, with full-dim RoPE
+/// (`rope_dim == D`). Computes:
+///     normed[i] = x[i] * weight[i] / sqrt(mean(x²) + eps)
+///     out[i1]   = normed[i1] * cos - normed[i2] * sin
+///     out[i2]   = normed[i1] * sin + normed[i2] * cos
+/// where pairs are `(i, i + D/2)` and `cos`/`sin` are read from
+/// `cos_base + offset_bytes`, `sin_base + offset_bytes`.
+///
+/// `offset_bytes` is updated once via the per-device
+/// `g3_counters::CounterSlot::RopeOffsetBytes` slot (same counter-slot
+/// convention as `rope_f32_ctr`), so under G3 the kernel's cos/sin args
+/// stay constant across replays — only the slot value changes.
+///
+/// Replaces `rmsnorm_f32 + rope_f32_ctr` (2 launches) with a single
+/// launch. Used on Gemma-family Q/K decode paths (per-head Q-norm /
+/// K-norm followed by RoPE).
+///
+/// # Requirements
+/// - `x`, `weight`, `cos`, `sin` must all be on the same HIP device,
+///   f32, and contiguous.
+/// - `x.rank() == 4` with `x.dim(2) == 1` (decode).
+/// - `weight.dim(0) == D` (last dim of x).
+/// - `cos.dim(1) == sin.dim(1) == D / 2`.
+/// - `D` even.
+///
+/// Returns a fresh `(B, H, 1, D)` f32 tensor.
+pub fn rmsnorm_rope_decode_fused(
+    x: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+    offset: usize,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<Tensor> {
+    use super::g3_counters::{set, slot_ptr, CounterSlot};
+    use super::HipDevice;
+
+    let dev: HipDevice = match x.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("rmsnorm_rope_decode_fused: x must be on HIP"),
+    };
+    if x.dtype() != DType::F32
+        || weight.dtype() != DType::F32
+        || cos.dtype() != DType::F32
+        || sin.dtype() != DType::F32
+    {
+        crate::bail!("rmsnorm_rope_decode_fused: all inputs must be f32");
+    }
+    if !x.is_contiguous() || !weight.is_contiguous() || !cos.is_contiguous() || !sin.is_contiguous()
+    {
+        crate::bail!("rmsnorm_rope_decode_fused: inputs must be contiguous");
+    }
+    if x.rank() != 4 {
+        crate::bail!(
+            "rmsnorm_rope_decode_fused: expected x.rank()==4 (B,H,1,D), got {:?}",
+            x.shape()
+        );
+    }
+    let (b, h, seq, d) = x.dims4()?;
+    if seq != 1 {
+        crate::bail!(
+            "rmsnorm_rope_decode_fused: seq_len must be 1 (decode), got {}",
+            seq
+        );
+    }
+    if d % 2 != 0 {
+        crate::bail!("rmsnorm_rope_decode_fused: D must be even, got {}", d);
+    }
+    if weight.dim(0)? != d {
+        crate::bail!(
+            "rmsnorm_rope_decode_fused: weight length {} != D {}",
+            weight.dim(0)?,
+            d
+        );
+    }
+    let half_d = d / 2;
+    if cos.rank() < 2 || sin.rank() < 2 {
+        crate::bail!("rmsnorm_rope_decode_fused: cos/sin must have rank>=2");
+    }
+    if cos.dim(cos.rank() - 1)? != half_d || sin.dim(sin.rank() - 1)? != half_d {
+        crate::bail!(
+            "rmsnorm_rope_decode_fused: cos/sin last dim must equal D/2 ({})",
+            half_d
+        );
+    }
+
+    let n_rows = b * h;
+    if n_rows == 0 {
+        return x.clone().contiguous();
+    }
+
+    // Push the offset into the device-resident counter slot (same pattern
+    // as rope_f32_ctr). This is a ~64-byte hipMemcpyAsync; G3 reuses the
+    // stable slot pointer and only needs the value update per replay.
+    let off_bytes = (offset * half_d * std::mem::size_of::<f32>()) as u32;
+    set(&dev, CounterSlot::RopeOffsetBytes, off_bytes)?;
+    let off_ptr: usize = slot_ptr(&dev, CounterSlot::RopeOffsetBytes) as usize;
+
+    let (x_st, x_l) = x.storage_and_layout();
+    let x_hip = match &*x_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("rmsnorm_rope_decode_fused: x storage not HIP"),
+    };
+    let x_slice = x_hip.as_hip_slice::<f32>()?;
+    let x_view = match x_l.contiguous_offsets() {
+        Some((lo, hi)) => x_slice.slice(lo..hi),
+        None => crate::bail!("rmsnorm_rope_decode_fused: non-contiguous x"),
+    };
+
+    let (w_st, _w_l) = weight.storage_and_layout();
+    let w_hip = match &*w_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("rmsnorm_rope_decode_fused: weight storage not HIP"),
+    };
+    let w_slice = w_hip.as_hip_slice::<f32>()?.slice(0..w_hip.as_hip_slice::<f32>()?.len());
+
+    let (cs_st, _cs_l) = cos.storage_and_layout();
+    let cs_hip = match &*cs_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("rmsnorm_rope_decode_fused: cos storage not HIP"),
+    };
+    let cos_full = cs_hip.as_hip_slice::<f32>()?.slice(0..cs_hip.as_hip_slice::<f32>()?.len());
+
+    let (sn_st, _sn_l) = sin.storage_and_layout();
+    let sn_hip = match &*sn_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("rmsnorm_rope_decode_fused: sin storage not HIP"),
+    };
+    let sin_full = sn_hip.as_hip_slice::<f32>()?.slice(0..sn_hip.as_hip_slice::<f32>()?.len());
+
+    let out = unsafe { dev.alloc::<f32>(x.elem_count())? };
+    let func = dev.get_or_load_func("rmsnorm_rope_decode_f32", &kernels::REDUCE)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (WARP_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let bh_u32 = n_rows as u32;
+    let d_u32 = d as u32;
+    let eps_f32 = eps as f32;
+    let stride_b: u32 = 0;
+
+    let mut builder = func.builder();
+    builder.arg(&x_view);
+    builder.arg(&w_slice);
+    builder.arg(&cos_full);
+    builder.arg(&sin_full);
+    builder.arg(&out);
+    builder.arg(&bh_u32);
+    builder.arg(&d_u32);
+    builder.arg(&eps_f32);
+    builder.arg(&stride_b);
+    builder.arg(&off_ptr);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(x_st);
+    drop(w_st);
+    drop(cs_st);
+    drop(sn_st);
+
+    let out_storage = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        <Shape as From<Vec<usize>>>::from(x.dims().to_vec()),
+        BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
 /// Phase T1.2 — fused MoE topk: softmax + top-k argmax + normalise in
 /// a single kernel.
 ///

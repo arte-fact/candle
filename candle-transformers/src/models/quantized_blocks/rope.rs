@@ -115,6 +115,17 @@ impl RotaryEmbedding {
         Ok(Self { sin, cos, dim })
     }
 
+    /// Access the cos table `(max_seq_len, dim/2)`. Used by fused-kernel
+    /// callers that consume the full cache by base pointer + byte offset.
+    pub fn cos(&self) -> &Tensor {
+        &self.cos
+    }
+
+    /// Access the sin table `(max_seq_len, dim/2)`.
+    pub fn sin(&self) -> &Tensor {
+        &self.sin
+    }
+
     /// Apply RoPE to a single tensor (Q or K).
     ///
     /// Expected shape: `(batch, n_heads, seq_len, head_dim)`.

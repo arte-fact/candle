@@ -127,6 +127,11 @@ impl RmsNorm {
         self.eps as f32
     }
 
+    /// Numerical-stability epsilon as `f64`.
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
+
     /// Fused: compute `(rms_norm(h + delta, weight), h + delta)` in one
     /// HIP launch. The first return value is the input to the next op
     /// (post-norm); the second is the residual stream that the next add

@@ -9,7 +9,7 @@ use super::norms::GemmaRmsNorm;
 use super::rope::RotaryEmbedding;
 use super::super::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
-use candle::{Module, Result, Tensor, D};
+use candle::{DType, Module, Result, Tensor, D};
 use candle_nn::kv_cache::{ConcatKvCache, KvCache};
 use std::sync::Arc;
 
@@ -35,6 +35,52 @@ thread_local! {
 }
 pub(crate) fn set_flash_l_k_iter_override(v: Option<usize>) {
     FLASH_L_K_ITER_OVERRIDE.with(|c| c.set(v));
+}
+
+/// Try the fused `rmsnorm + RoPE` decode kernel for a Q or K tensor.
+/// Falls back to the unfused `norm.forward + rotary.apply_one` chain on
+/// any precondition miss (partial RoPE, prefill, non-HIP, no norm, etc.).
+///
+/// Input `q_or_k`: shape `(B, H, seq_len, head_dim)`, usually the output
+/// of a QKV matmul + reshape + transpose + contiguous.
+fn try_fused_norm_rope_decode(
+    q_or_k: &Tensor,
+    norm: Option<&AttnNorm>,
+    rotary: &super::rope::RotaryEmbedding,
+    offset: usize,
+    seq_len: usize,
+) -> Result<Tensor> {
+    #[cfg(feature = "hip")]
+    {
+        let head_dim = q_or_k.dim(D::Minus1)?;
+        let fusable = seq_len == 1
+            && norm.is_some()
+            && rotary.dim == head_dim
+            && matches!(q_or_k.device(), candle::Device::Hip(_))
+            && q_or_k.dtype() == DType::F32
+            && q_or_k.is_contiguous()
+            && rotary.cos().dtype() == DType::F32
+            && rotary.sin().dtype() == DType::F32;
+        if fusable {
+            let n = norm.unwrap();
+            if let Ok(out) = candle::hip_backend::rmsnorm_rope_decode_fused(
+                q_or_k,
+                n.weight(),
+                n.eps(),
+                offset,
+                rotary.cos(),
+                rotary.sin(),
+            ) {
+                return Ok(out);
+            }
+        }
+    }
+    // Fallback: plain chain.
+    let x = match norm {
+        Some(n) => n.forward(q_or_k)?,
+        None => q_or_k.clone(),
+    };
+    rotary.apply_one(&x, offset)
 }
 
 /// Run scaled-dot-product attention with GQA sharing done via zero-copy
@@ -511,6 +557,24 @@ impl AttnNorm {
             AttnNorm::Gemma(n) => n.forward(x),
         }
     }
+
+    /// Effective rmsnorm weight for fused-kernel consumers. Gemma's
+    /// weight already has the `+1` offset baked in via the GGUF
+    /// converter, so downstream code can treat both cases uniformly.
+    pub fn weight(&self) -> &Tensor {
+        match self {
+            AttnNorm::Standard(n) => n.weight(),
+            AttnNorm::Gemma(n) => n.weight(),
+        }
+    }
+
+    /// Epsilon for rmsnorm stability.
+    pub fn eps(&self) -> f64 {
+        match self {
+            AttnNorm::Standard(n) => n.eps(),
+            AttnNorm::Gemma(n) => n.eps(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -785,12 +849,22 @@ impl StandardAttention {
 
         // Q
         let q_raw = self.wq.forward_preq8(&q8_view, b_size, rhs_shape)?;
-        let mut q = q_raw
+        let q_proj = q_raw
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        if let Some(ref qn) = self.q_norm { q = qn.forward(&q)?; }
-        let q = self.rotary.apply_one(&q, offset)?;
+        // Fused q_norm + RoPE (decode-only, full-dim RoPE, HIP+f32).
+        // Collapses two launches (rmsnorm_f32 + rope_f32_ctr) into one
+        // `rmsnorm_rope_decode_f32` launch. Falls back to the unfused
+        // sequence when any precondition isn't met (partial RoPE,
+        // prefill seq_len > 1, no q_norm, non-HIP, etc).
+        let q = try_fused_norm_rope_decode(
+            &q_proj,
+            self.q_norm.as_ref(),
+            &self.rotary,
+            offset,
+            seq_len,
+        )?;
 
         // K
         let k_raw = wk.forward_preq8(&q8_view, b_size, rhs_shape)?;
@@ -806,11 +880,18 @@ impl StandardAttention {
             .transpose(1, 2)?
             .contiguous()?;
 
-        let k = if let Some(ref kn) = self.k_norm { kn.forward(&k_3d)? } else { k_3d };
+        // Fused k_norm + RoPE (same conditions as Q above). When k_norm
+        // is absent, falls back to a bare rotary.apply_one on k_3d.
+        let k = try_fused_norm_rope_decode(
+            &k_3d,
+            self.k_norm.as_ref(),
+            &self.rotary,
+            offset,
+            seq_len,
+        )?;
         let v = if let Some(eps) = self.v_norm_eps {
             super::norms::v_norm(&v_pre, eps)?
         } else { v_pre };
-        let k = self.rotary.apply_one(&k, offset)?;
 
         Ok(Some((q, k, v, x_norm)))
     }

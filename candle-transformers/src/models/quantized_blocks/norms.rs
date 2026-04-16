@@ -41,6 +41,18 @@ impl GemmaRmsNorm {
             None
         }
     }
+
+    /// Access the dequantised weight tensor (with the `+1` offset already
+    /// baked in by the GGUF converter). Used by fused-kernel callers that
+    /// need to feed it directly into an `rms_norm`-style kernel.
+    pub fn weight(&self) -> &Tensor {
+        &self.weight_plus_one
+    }
+
+    /// Access the epsilon used for stability.
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
 }
 
 impl Module for GemmaRmsNorm {

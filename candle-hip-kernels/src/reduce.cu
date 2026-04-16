@@ -1121,6 +1121,91 @@ extern "C" __global__ void rope_f32_ctr(
   rope<float>(src, cos, sin, dst, bh, td, d, stride_b);
 }
 
+// ---------------------------------------------------------------------------
+// Fused rmsnorm + RoPE for decode (L=1) — replaces 2 kernel launches with 1.
+// ---------------------------------------------------------------------------
+//
+// Input x: (B, H, 1, D) contiguous f32, row-major.
+// Output: (B, H, 1, D) with
+//     normed[i]   = x[i] * weight[i] * rsqrt(mean(x²) + eps)
+//     dst[i1]     = normed[i1] * cos - normed[i2] * sin
+//     dst[i2]     = normed[i1] * sin + normed[i2] * cos
+// where the pairs are (i1 = i, i2 = i + D/2).
+//
+// Gemma-family Q/K decode path hits this sequence (compute_qkv_norm_q8_fused
+// at quantized_blocks/attention.rs) once per layer per forward for both Q
+// and K. Collapsing rmsnorm + RoPE to a single launch saves 1 launch/tensor/
+// layer × 2 tensors × N layers on decode.
+//
+// Block: one Wave64 (WARP_SIZE=64 threads).
+// Grid: `bh` blocks = B*H rows.
+// Two passes: (1) sum(x²) warp-reduced → inv_norm; (2) per-pair normalise +
+// rotate. cos/sin are indexed by (i_d) alone since L=1 — the offset into the
+// full cos/sin cache is supplied by `cos_offset_bytes_ptr` (same counter-slot
+// convention as `rope_f32_ctr` → graph-capture friendly).
+//
+// Caller contract:
+//   - D must be even (pair layout).
+//   - `cos_base` / `sin_base` point to the FULL cache; the effective cos/sin
+//     row for the current decode position is at
+//     `(const char *)cos_base + *cos_offset_bytes_ptr`.
+//   - `stride_b > 0` enables per-batch cos/sin stride (rare; usually 0).
+extern "C" __global__ void rmsnorm_rope_decode_f32(
+    const float *__restrict__ src,
+    const float *__restrict__ weight,
+    const float *__restrict__ cos_base,
+    const float *__restrict__ sin_base,
+    float *__restrict__ dst,
+    const uint32_t bh,
+    const uint32_t d,
+    const float eps,
+    const uint32_t stride_b,
+    const uint32_t *__restrict__ cos_offset_bytes_ptr
+) {
+    const int row = blockIdx.x;
+    if ((uint32_t)row >= bh) return;
+    const int lane = threadIdx.x;
+
+    const float *row_in  = src + (size_t)row * d;
+    float       *row_out = dst + (size_t)row * d;
+
+    // Pass 1: reduce sum(x²) across the row.
+    float partial = 0.0f;
+    for (int i = lane; (uint32_t)i < d; i += blockDim.x) {
+        const float v = row_in[i];
+        partial += v * v;
+    }
+    _Pragma("unroll")
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        partial += __shfl_xor(partial, mask);
+    }
+    const float mean_sq = partial / (float)d;
+    const float scale   = rsqrtf(mean_sq + eps);
+
+    // Pass 2: per-pair normalise + rotate.
+    const uint32_t off = *cos_offset_bytes_ptr;
+    const float *cos = (const float *)((const char *)cos_base + off);
+    const float *sin = (const float *)((const char *)sin_base + off);
+    if (stride_b > 0) {
+        // Per-batch stride offset in elements. Rare path; kept for parity
+        // with rope_f32_ctr. `stride_b` is the batch stride in elements of
+        // the src tensor, so `b_idx` = row / (stride_b / d). For the common
+        // decode case (B=1) this branch isn't taken.
+        const uint32_t b_idx = (uint32_t)row / (stride_b / d);
+        cos += b_idx * (d / 2);
+        sin += b_idx * (d / 2);
+    }
+    const uint32_t half_d = d / 2;
+    for (int p = lane; (uint32_t)p < half_d; p += blockDim.x) {
+        const float x1 = row_in[p]          * weight[p]          * scale;
+        const float x2 = row_in[p + half_d] * weight[p + half_d] * scale;
+        const float c = cos[p];
+        const float s = sin[p];
+        row_out[p]          = x1 * c - x2 * s;
+        row_out[p + half_d] = x1 * s + x2 * c;
+    }
+}
+
 FAST_OP(float, fast_min_f32, fast_max_f32, fast_argmin_f32, fast_argmax_f32, fast_sum_f32)
 FAST_OP(double, fast_min_f64, fast_max_f64, fast_argmin_f64, fast_argmax_f64, fast_sum_f64)
 FAST_OP(uint32_t, fast_min_u32, fast_max_u32, fast_argmin_u32, fast_argmax_u32, fast_sum_u32)
