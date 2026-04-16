@@ -708,6 +708,150 @@ pub fn topk_moe_norm_fused(
     Ok((weights, ids))
 }
 
+/// W3a: Fused MoE-combine weighted sum over the top-k axis.
+///
+/// Replaces the two-kernel Rust chain in
+/// `quantized_gemma4.rs:2021-2023`:
+/// ```ignore
+/// let topk_weights = topk_weights.unsqueeze(D::Minus1)?;  // shape -> [T, K, 1]
+/// let weighted = moe_out.broadcast_mul(&topk_weights)?;   // bmul_f32 kernel
+/// let moe_summed = weighted.sum(1)?;                      // fast_sum_f32 kernel
+/// ```
+/// with a single HIP kernel launch per MoE layer.
+///
+/// # Perf evidence
+/// From the 2026-04-16 rocprofv3 baseline
+/// (`bench/results/kfr_gemma4-26B-A4B-Q8_0.json`), `fast_sum_f32` is
+/// called 7,800× at 46 µs/call = **358 ms aggregate GPU time**.
+/// The kernel is launch-overhead bound because `fast_sum` launches one
+/// block per output element with a 1024-wide default block — totally
+/// over-provisioned for K=8 reductions. Plus the preceding
+/// `broadcast_mul` adds bmul_f32 time and allocates a [T, K, H]
+/// intermediate tensor every layer. This fused replacement reads
+/// `moe_out` once, broadcasts the weights via LDS, and writes
+/// `combined` — no intermediate tensor, one kernel launch.
+///
+/// # Shape contract
+/// - `moe_out`: `[T, K, H]` f32 contiguous on HIP.
+/// - `topk_weights`: `[T, K]` f32 contiguous on the same HIP device.
+/// - returns: `[T, H]` f32.
+///
+/// `T` (tokens, prompt+decode), `K` (top-k experts used, ≤ 32 today),
+/// `H` (hidden dim) are recovered from the tensor shapes.
+pub fn moe_combine_weighted_sum_fused(
+    moe_out: &Tensor,
+    topk_weights: &Tensor,
+) -> Result<Tensor> {
+    let dev = match moe_out.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("moe_combine_weighted_sum_fused: moe_out must be HIP"),
+    };
+    if !matches!(topk_weights.device(), Device::Hip(d) if d.same_device(&dev)) {
+        crate::bail!(
+            "moe_combine_weighted_sum_fused: moe_out and topk_weights must be on the same HIP device"
+        );
+    }
+    if moe_out.dtype() != DType::F32 || topk_weights.dtype() != DType::F32 {
+        crate::bail!(
+            "moe_combine_weighted_sum_fused: both inputs must be f32 (got moe_out={:?}, weights={:?})",
+            moe_out.dtype(), topk_weights.dtype()
+        );
+    }
+    if !moe_out.is_contiguous() {
+        crate::bail!("moe_combine_weighted_sum_fused: moe_out must be contiguous");
+    }
+    if !topk_weights.is_contiguous() {
+        crate::bail!("moe_combine_weighted_sum_fused: topk_weights must be contiguous");
+    }
+    if moe_out.rank() != 3 {
+        crate::bail!(
+            "moe_combine_weighted_sum_fused: moe_out must have rank 3 [T, K, H], got {:?}",
+            moe_out.shape()
+        );
+    }
+    if topk_weights.rank() != 2 {
+        crate::bail!(
+            "moe_combine_weighted_sum_fused: topk_weights must have rank 2 [T, K], got {:?}",
+            topk_weights.shape()
+        );
+    }
+    let (t_out, k_out, h_out) = moe_out.dims3()?;
+    let (t_w, k_w) = topk_weights.dims2()?;
+    if t_out != t_w || k_out != k_w {
+        crate::bail!(
+            "moe_combine_weighted_sum_fused: shape mismatch — moe_out [{},{},{}] vs weights [{},{}]",
+            t_out, k_out, h_out, t_w, k_w
+        );
+    }
+    // Kernel's compile-time MOE_COMBINE_K_MAX is 32.
+    if k_out > 32 {
+        crate::bail!(
+            "moe_combine_weighted_sum_fused: K={} exceeds compiled MOE_COMBINE_K_MAX=32",
+            k_out
+        );
+    }
+
+    let (out_st, out_l) = moe_out.storage_and_layout();
+    let out_hip = match &*out_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("moe_combine_weighted_sum_fused: moe_out storage not HIP"),
+    };
+    let out_view = match out_l.contiguous_offsets() {
+        Some((lo, hi)) => out_hip.as_hip_slice::<f32>()?.slice(lo..hi),
+        None => crate::bail!("moe_combine_weighted_sum_fused: non-contiguous moe_out"),
+    };
+
+    let (w_st, w_l) = topk_weights.storage_and_layout();
+    let w_hip = match &*w_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("moe_combine_weighted_sum_fused: topk_weights storage not HIP"),
+    };
+    let w_view = match w_l.contiguous_offsets() {
+        Some((lo, hi)) => w_hip.as_hip_slice::<f32>()?.slice(lo..hi),
+        None => crate::bail!("moe_combine_weighted_sum_fused: non-contiguous topk_weights"),
+    };
+
+    // SAFETY: kernel writes every (t, h).
+    let combined_out = unsafe { dev.alloc::<f32>(t_out * h_out)? };
+
+    let func = dev.get_or_load_func(
+        "moe_combine_weighted_sum_f32",
+        &kernels::TOPK_MOE,
+    )?;
+
+    // Must match MOE_COMBINE_BH in topk_moe.cu.
+    const BH: u32 = 128;
+    let cfg = LaunchConfig {
+        grid_dim: (((h_out as u32) + BH - 1) / BH, t_out as u32, 1),
+        block_dim: (BH, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let t_arg = t_out as i32;
+    let k_arg = k_out as i32;
+    let h_arg = h_out as i32;
+    let mut builder = func.builder();
+    builder.arg(&out_view);
+    builder.arg(&w_view);
+    builder.arg(&combined_out);
+    builder.arg(&t_arg);
+    builder.arg(&k_arg);
+    builder.arg(&h_arg);
+    // SAFETY: ffi — shapes/dtype validated above.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(out_st);
+    drop(w_st);
+
+    let out_shape: Shape = vec![t_out, h_out].into();
+    let storage = HipStorage::wrap_hip_slice(combined_out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(storage),
+        out_shape,
+        BackpropOp::none(),
+        false,
+    ))
+}
+
 /// Fused MoE router pre-amble: `out = v_norm(x, eps) * (1/sqrt(n_embd)) * gate_s`.
 ///
 /// Phase T1.1 — replaces 5 separate launches in

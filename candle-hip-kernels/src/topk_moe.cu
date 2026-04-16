@@ -193,3 +193,74 @@ extern "C" __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_norm_f32
 ) {
     topk_moe_norm_f32_n<512>(logits, weights_out, ids_out, n_rows, n_expert_used);
 }
+
+// ---------------------------------------------------------------------------
+// W3a: fused MoE combine (weighted sum across topk).
+//
+// Replaces a two-kernel Rust chain at `quantized_gemma4.rs:2021-2023`:
+//   let weighted = moe_out.broadcast_mul(&topk_weights)?;   // bmul_f32
+//   let moe_summed = weighted.sum(1)?;                       // fast_sum_f32
+// with a single kernel launch per MoE layer.
+//
+// Before W3a: fast_sum_f32 burns 358 ms / 7800 calls / 46 µs each because
+// candle's generic `fast_sum` kernel uses one block per output element
+// and is launch-overhead-bound for K=8-sized reductions. bmul_f32 adds
+// another ~50 ms for the broadcast_mul that produces the intermediate.
+// Both kernels together also allocate a full [T, K, H] intermediate
+// tensor on every MoE layer, adding to W1's allocation pressure.
+//
+// After W3a: a single pass reads moe_out and weights, writes combined.
+// No intermediate tensor.
+//
+// Inputs (all device f32, row-major contiguous):
+//   moe_out    : [T, K, H]   per-expert outputs already indexed by topk
+//   weights    : [T, K]      routing weights (post-normalise)
+// Output:
+//   combined   : [T, H]      sum_k(moe_out[t,k,h] * weights[t,k])
+//
+// Grid: (ceil(H / BH), T)     where BH = threads per block (128)
+// Block: (BH, 1, 1)
+//
+// Each thread owns one (t, h) element of the output. It loops over K
+// (compile-time bounded at 32 to keep per-thread register pressure in
+// check; the runtime `k_used` arg terminates early when K < 32).
+//
+// Shared memory: weights[t, 0..K] loaded once per block (K floats, tiny).
+
+#ifndef MOE_COMBINE_BH
+#define MOE_COMBINE_BH 128
+#endif
+#ifndef MOE_COMBINE_K_MAX
+#define MOE_COMBINE_K_MAX 32
+#endif
+
+extern "C" __launch_bounds__(MOE_COMBINE_BH, 2) __global__ void
+moe_combine_weighted_sum_f32(
+    const float * __restrict__ moe_out,   // [T, K, H]
+    const float * __restrict__ weights,   // [T, K]
+    float       * __restrict__ combined,  // [T, H]
+    const int T,
+    const int K,          // runtime; must be <= MOE_COMBINE_K_MAX
+    const int H
+) {
+    const int h = blockIdx.x * MOE_COMBINE_BH + threadIdx.x;
+    const int t = blockIdx.y;
+    if (t >= T) return;
+
+    // Broadcast the K routing weights for this row into LDS.
+    __shared__ float w_smem[MOE_COMBINE_K_MAX];
+    if (threadIdx.x < K && threadIdx.x < MOE_COMBINE_K_MAX) {
+        w_smem[threadIdx.x] = weights[(size_t)t * K + threadIdx.x];
+    }
+    __syncthreads();
+
+    if (h >= H) return;
+
+    const float * row = moe_out + ((size_t)t * K) * H + h;
+    float acc = 0.0f;
+    #pragma unroll 8
+    for (int k = 0; k < K; k++) {
+        acc += row[(size_t)k * H] * w_smem[k];
+    }
+    combined[(size_t)t * H + h] = acc;
+}

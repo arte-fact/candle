@@ -2017,10 +2017,44 @@ impl ModelWeights {
                 #[cfg(feature = "hip")]
                 let _t_combine_start = std::time::Instant::now();
 
-                // Weight + sum across topk
-                let topk_weights = topk_weights.unsqueeze(candle::D::Minus1)?;
-                let weighted = moe_out.broadcast_mul(&topk_weights)?;
-                let moe_summed = weighted.sum(1)?; // sum across topk dim
+                // Weight + sum across topk.
+                //
+                // W3a: prefer the fused `moe_combine_weighted_sum_fused`
+                // kernel when inputs are HIP/f32/contiguous — it replaces
+                // `broadcast_mul + sum(1)` (one bmul_f32 + one fast_sum_f32
+                // per layer, = 358+ ms aggregate in the 2026-04-16 profile)
+                // with a single launch and no [T, K, H] intermediate.
+                // Env kill-switch: CANDLE_W3A_COMBINE=0 restores the old
+                // unfused path for debugging / regression isolation.
+                let moe_summed = {
+                    #[cfg(feature = "hip")]
+                    let try_fused =
+                        matches!(moe_out.device(), candle::Device::Hip(_))
+                        && moe_out.dtype() == candle::DType::F32
+                        && topk_weights.dtype() == candle::DType::F32
+                        && moe_out.rank() == 3
+                        && topk_weights.rank() == 2
+                        && std::env::var("CANDLE_W3A_COMBINE").as_deref() != Ok("0");
+                    #[cfg(not(feature = "hip"))]
+                    let try_fused = false;
+                    let moe_out_c = moe_out.contiguous()?;
+                    let topk_w_c = topk_weights.contiguous()?;
+                    if try_fused {
+                        #[cfg(feature = "hip")]
+                        {
+                            candle::hip_backend::moe_combine_weighted_sum_fused(
+                                &moe_out_c,
+                                &topk_w_c,
+                            )?
+                        }
+                        #[cfg(not(feature = "hip"))]
+                        unreachable!()
+                    } else {
+                        let topk_w_u = topk_w_c.unsqueeze(candle::D::Minus1)?;
+                        let weighted = moe_out_c.broadcast_mul(&topk_w_u)?;
+                        weighted.sum(1)?
+                    }
+                };
                 let moe_summed = moe_summed.reshape((b_sz_ff, seq_len_ff, hidden))?;
                 let moe_normed = moe_branch.post_norm.forward(&moe_summed)?;
 

@@ -1,0 +1,199 @@
+{
+  "tool": "kernel_family",
+  "version": 1,
+  "captured_at": "2026-04-16T08:28:34+00:00",
+  "model": "gemma-4-26B-A4B-it-Q8_0.gguf",
+  "backend": "candle",
+  "config": {
+    "gpus": "0,1,2,3",
+    "bin": "quantized-gemma4",
+    "prompt_tokens": 663,
+    "gen_tokens": 127
+  },
+  "throughput_unrocprof": {
+    "pp_t_s": 566.11,
+    "tg_t_s": 43.84
+  },
+  "throughput_rocprof": {
+    "pp_t_s": 198.45,
+    "tg_t_s": 26.13
+  },
+  "cpu_seconds": {
+    "real": 67.531,
+    "user": 122.596,
+    "sys": 282.418
+  },
+  "notes": [
+    "Baseline captured before any W-phase work.",
+    "rocprof adds ~38% instrumentation tax uniformly.",
+    "Real prompt (~500 tokens) via /tmp/prompt_gemma4_512.txt"
+  ],
+  "aggregate_gpu_usec": 9970782.106,
+  "families": {
+    "moe_fused": {
+      "calls": 7800,
+      "total_usec": 6126951.413,
+      "avg_usec": 785.507,
+      "pct_of_gpu": 61.449,
+      "kernels": [
+        "indexed_moe_forward_q8_0_q8_1"
+      ]
+    },
+    "mmvq_q8": {
+      "calls": 26370,
+      "total_usec": 916905.043,
+      "avg_usec": 34.771,
+      "pct_of_gpu": 9.196,
+      "kernels": [
+        "mul_mat_vec_q8_0_q8_1_cuda1"
+      ]
+    },
+    "bookkeeping": {
+      "calls": 71201,
+      "total_usec": 799437.93,
+      "avg_usec": 11.228,
+      "pct_of_gpu": 8.018,
+      "kernels": [
+        "ucopy_f32",
+        "__amd_rocclr_copyBuffer",
+        "__amd_rocclr_fillBufferAligned",
+        "copy2d_f32"
+      ]
+    },
+    "mmq_q8_prefill": {
+      "calls": 410,
+      "total_usec": 532648.539,
+      "avg_usec": 1299.143,
+      "pct_of_gpu": 5.342,
+      "kernels": [
+        "mul_mat_q8_0_gfx906_v2f_tile32"
+      ]
+    },
+    "router_topk": {
+      "calls": 15600,
+      "total_usec": 541755.449,
+      "avg_usec": 34.728,
+      "pct_of_gpu": 5.433,
+      "kernels": [
+        "fast_sum_f32",
+        "gemma4_router_prep_f32",
+        "topk_moe_norm_f32_n128"
+      ]
+    },
+    "rmsnorm": {
+      "calls": 35230,
+      "total_usec": 244089.486,
+      "avg_usec": 6.928,
+      "pct_of_gpu": 2.448,
+      "kernels": [
+        "rmsnorm_f32",
+        "rmsnorm_post_residual_f32",
+        "rmsnorm_q8_fused_f32"
+      ]
+    },
+    "elementwise": {
+      "calls": 46930,
+      "total_usec": 273701.968,
+      "avg_usec": 5.832,
+      "pct_of_gpu": 2.745,
+      "kernels": [
+        "bmul_f32",
+        "bdiv_f32",
+        "affine_f32",
+        "is_u32_f32",
+        "usqr_f32",
+        "badd_f32",
+        "usqrt_f32"
+      ]
+    },
+    "quant_q8_1": {
+      "calls": 24980,
+      "total_usec": 135244.331,
+      "avg_usec": 5.414,
+      "pct_of_gpu": 1.356,
+      "kernels": [
+        "quantize_q8_1"
+      ]
+    },
+    "flash_decode": {
+      "calls": 7680,
+      "total_usec": 197549.523,
+      "avg_usec": 25.723,
+      "pct_of_gpu": 1.981,
+      "kernels": [
+        "gqa_decode_split_chunk_d256_f32",
+        "gqa_decode_split_combine_d256_f32",
+        "gqa_decode_split_chunk_d512_f32",
+        "gqa_decode_split_combine_d512_f32"
+      ]
+    },
+    "activation": {
+      "calls": 7800,
+      "total_usec": 42571.178,
+      "avg_usec": 5.458,
+      "pct_of_gpu": 0.427,
+      "kernels": [
+        "ugelu_f32"
+      ]
+    },
+    "rope": {
+      "calls": 7800,
+      "total_usec": 35946.333,
+      "avg_usec": 4.609,
+      "pct_of_gpu": 0.361,
+      "kernels": [
+        "rope_f32"
+      ]
+    },
+    "rocblas_fallback": {
+      "calls": 120,
+      "total_usec": 54680.554,
+      "avg_usec": 455.671,
+      "pct_of_gpu": 0.548,
+      "kernels": [
+        "Cijk_Ailk_Bljk_SB_MT64x64x16_SN_APM1_AF0EM1_AF1EM1_AMAS3_ASAE01_ASCE01_ASEM1_BL1_BS1_DTLA0_DTLB0_EPS1_FL0_GLVWA4_GLVWB4_GRVW4_GSU1_GSUASB_ISA906_IU1_K1_KLA_LPA0_LPB0_LDL1_LRVW4_MDA2_MMFGLC_NLCA1_NLCB1_ONLL1_PK0_PGR1_PLR1_SIA1_SU32_SUM0_SUS256_SVW4_SNLL0_TT4_4_USFGRO0_VAW1_VS1_VW4_VWB4_WG16_16_1_WGM8",
+        "Cijk_Ailk_Bljk_SB_MT64x96x8_SE_APM1_AF0EM1_AF1EM1_AMAS3_ASAE01_ASCE01_ASEM1_BL1_BS1_DTLA0_DTLB0_EPS1_FL1_GLVWA2_GLVWB4_GRVW4_GSU1_GSUASB_ISA906_IU1_K1_KLA_LPA0_LPB0_LDL1_LRVW2_MDA2_MMFGLC_NLCA1_NLCB1_ONLL1_PK0_PGR1_PLR1_SIA1_SU32_SUM0_SUS256_SVW4_SNLL0_TT4_6_USFGRO0_VAW1_VS1_VW2_VWB2_WG16_16_1_WGM1",
+        "Cijk_Ailk_Bljk_SB_MT64x64x32_SN_APM1_AF0EM1_AF1EM1_AMAS3_ASAE01_ASCE01_ASEM1_BL1_BS1_DTLA0_DTLB0_EPS0_FL0_GLVWA4_GLVWB4_GRVW4_GSU1_GSUASB_ISA906_IU1_K1_KLA_LPA0_LPB0_LDL1_LRVW4_MDA2_MMFGLC_NLCA1_NLCB1_ONLL1_PK0_PGR0_PLR1_SIA1_SU32_SUM0_SUS256_SVW4_SNLL0_TT4_4_USFGRO0_VAW1_VS1_VW4_VWB4_WG16_16_1_WGM1"
+      ]
+    },
+    "sampler_gpu": {
+      "calls": 778,
+      "total_usec": 33490.656,
+      "avg_usec": 43.047,
+      "pct_of_gpu": 0.336,
+      "kernels": [
+        "fast_argmax_f32",
+        "cast_f32_f64",
+        "utanh_f64",
+        "affine_f64",
+        "cast_f64_f32"
+      ]
+    },
+    "softmax_attn": {
+      "calls": 3960,
+      "total_usec": 35809.703,
+      "avg_usec": 9.043,
+      "pct_of_gpu": 0.359,
+      "kernels": [
+        "masked_softmax_scale_f32",
+        "softmax_f32"
+      ]
+    }
+  },
+  "preserve_set": [
+    "activation",
+    "flash_decode",
+    "mmq_q8_prefill",
+    "mmvq_q8",
+    "quant_q8_1",
+    "rmsnorm",
+    "rope",
+    "softmax_attn"
+  ],
+  "degrade_target_set": [
+    "bookkeeping",
+    "elementwise",
+    "moe_fused",
+    "router_topk"
+  ]
+}

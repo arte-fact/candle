@@ -56,5 +56,9 @@ vega-shader-instruction-set-architecture.pdf
 # Vega ISA PDFs — extracted text lives in docs/
 docs/vega-isa-*.txt
 
-# prefill_3way.py run outputs (mirrored under /tmp too; keep repo clean)
-bench/results/
+# prefill_3way.py run outputs (mirrored under /tmp too; keep repo clean).
+# Ignore contents individually (directory-level ignore blocks negation).
+bench/results/*
+# …except the kernel-family regression baselines (W8 gate).
+!bench/results/kfr_*.json
+!bench/results/kfr_*.md
