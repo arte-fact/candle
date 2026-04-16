@@ -514,6 +514,28 @@ impl LayerWeights {
                 }
             };
             let scale = 1.0 / (self.head_dim as f64).sqrt();
+
+            // G2 dynamic-L_k: when the KV cache is padded beyond the real
+            // context length for replay stability, set the per-call
+            // thread-local override so the attention dispatcher routes to
+            // the `_dyn` kernel variant that iterates [0..t_cur) instead
+            // of [0..l_k_padded). Under G2 capture the kernel's `l_k_iter`
+            // arg diffs by +1 between recordings → classified as
+            // Counter(+1) and patched in-place per replay. Keeps strides
+            // stable while the real attention work stays O(t_cur).
+            //
+            // No-gain on gfx906 (see memory `project_g2g3_no_gain_gfx906`)
+            // but benefits MI200+/NVIDIA where graph amortisation pays off.
+            let dyn_lk_guard = if seq_len == 1 && l_k_padded > t_cur
+                && std::env::var("CANDLE_G2_DYN_LK").ok().as_deref() != Some("0")
+            {
+                crate::models::quantized_blocks::attention::set_flash_l_k_iter_override(
+                    Some(t_cur),
+                );
+                true
+            } else {
+                false
+            };
             let out = crate::models::quantized_blocks::attention::gqa_attention_k_transposed(
                 &q,
                 &k_t,
@@ -521,6 +543,9 @@ impl LayerWeights {
                 mask_additive.as_ref(),
                 scale,
             )?;
+            if dyn_lk_guard {
+                crate::models::quantized_blocks::attention::set_flash_l_k_iter_override(None);
+            }
             Some(out)
         } else {
             None
