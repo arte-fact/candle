@@ -118,8 +118,19 @@ ASM-level inspection of the compiled kernel (`/opt/rocm/llvm/bin/llvm-objdump`) 
 
 **W3c retro conclusion:** micro-tweaks hit the ~70 µs floor on this gfx906 warp-coop config. To get below 50 µs per-call on our shape would require either (a) a meaningfully lower-latency memory path (not available — we're already at 4–5 blocks/CU with plenty of waves-in-flight), or (b) a different grid that does more output rows per launch. Option (b) is a **W3d follow-up** worth a separate planning pass.
 
-**Not yet covered (future follow-ups):**
-- **W3d**: dispatch-level batching — combine `gate_up_exps` and `down_exps` projections into one `indexed_moe_forward` call (or write a new kernel that processes both weights in one launch). Expected: halves MoE MMVQ call count from 60 → 30 per forward, saving ~2 ms aggregate per forward = ~2–3 pp tg128. Requires: new kernel signature or Rust-side orchestration rewrite. Estimated effort: 2–3 days.
+**W3d LANDED 2026-04-16 (partial — activation-side fusion).** The original dispatch-bundling idea (1 kernel per MoE layer instead of 2) proved intractable without a larger graph-fusion pass. Instead landed a **targeted activation-side fusion**: single kernel `gelu_mul_quantize_q8_1_f32` in `candle-hip-kernels/src/quantized.cu` that replaces the 5-step `narrow → gelu → broadcast_mul → contiguous → quantize_q8_1` chain between `gate_up_exps` MMVQ and `down_exps` MMVQ. 10 VGPR, 0 scratch. Wired in `quantized_gemma4.rs` behind `CANDLE_W3D=1` (default on) with a `batch ≤ 8` gate (prefill uses unfused pipeline because the fused kernel's block-count balloons at large batch).
+
+Measured (uninstrumented, 4 GPUs, pp512+tg128, best-of-3):
+
+| | W3-rev2 baseline | **W3d** | Δ |
+|---|---:|---:|---:|
+| pp512 | 655 t/s | 654 t/s | 0 (prefill excluded by design) |
+| **tg128** | 46.37 | **47.45** | **+2.3 %** |
+| vs turbo | 0.695× | **0.711×** | — |
+
+W8 gate passed: aggregate GPU −6.3 % (10,042 → 9,412 ms); `activation` −42.6 %, `bookkeeping` −9.1 %, `moe_fused` −8.5 % (secondary effect), `mmvq_q8` only +1.4 %. New kernel `gelu_mul_quantize_q8_1_f32` categorised as `moe_gelu_quant` DEGRADE-TARGET (20 ms total = 3,840 × 5.1 µs/call, one per MoE layer per decode forward).
+
+**Still not covered:**
 - **W3e**: Q4_0 / Q4_1 MoE decode (Qwen3-Coder-30B). Same W3-rev2 technique, different block types; 0.5 day.
 - **W3f**: K-quant MoE (Q4_K / Q5_K / Q6_K). Lower priority; few active models.
 - **W3b**: Prefill MoE gather-by-expert (b_size > 1). Orthogonal axis; needs variable-M per-expert MMQ.
@@ -362,8 +373,9 @@ Projections per phase (non-additive: dependencies and diminishing-returns noted)
 |---|---:|---:|---:|---:|
 | today | 43.84 | 0.66× | 282 s | 13,181 |
 | + W3a (fused moe-combine — **landed**) | 44.81 | 0.67× | 282 s | 13,181 |
-| + W3-rev2 (MoE warp-coop Q8_0 — **landed**) | **46.37** | **0.695×** | 282 s | 13,181 |
-| + W1 (alloc pool) | ~54 | 0.81× | ~50 s | 0 |
+| + W3-rev2 (MoE warp-coop Q8_0 — **landed**) | 46.37 | 0.695× | 282 s | 13,181 |
+| + W3d (gelu_mul_quantize fused — **landed**) | **47.45** | **0.711×** | 282 s | 13,181 |
+| + W1 (alloc pool) | ~55 | 0.82× | ~50 s | 0 |
 | + W5 (ucopy clean) | ~56 | 0.84× | ~45 s | 0 |
 | + W2 (peer-to-peer) | ~59 | 0.88× | ~40 s | 0 |
 | + W6 (param bin_bcast) | ~62 | 0.93× | ~35 s | 0 |

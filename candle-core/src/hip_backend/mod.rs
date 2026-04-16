@@ -22,8 +22,8 @@ pub use device::{HipDevice, DeviceId};
 pub use error::{HipError, WrapErr};
 pub use flash_attn::{flash_attn_decode_strided, flash_attn_decode_strided_split_k, flash_attn_fused, flash_attn_v2_fused, flash_attn_v2_kt_fused, flash_attn_v2_kt_strided_v, flash_attn_v2_kt_strided_v_dyn, gqa_attention_decode_gemv, gqa_attention_decode_mv};
 pub use fused_pointwise::{
-    fused_ffn_decode_q4_0, gemma4_router_prep_fused, l2_norm_fused,
-    masked_softmax_scale_fused, moe_combine_weighted_sum_fused,
+    fused_ffn_decode_q4_0, gelu_mul_quantize_q8_1_fused, gemma4_router_prep_fused,
+    l2_norm_fused, masked_softmax_scale_fused, moe_combine_weighted_sum_fused,
     rms_norm_post_residual_fused, rmsnorm_q8_fused, silu_mul_split_last_fused,
     softplus_fused, topk_moe_norm_fused,
 };

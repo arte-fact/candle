@@ -1999,29 +1999,81 @@ impl ModelWeights {
                 #[cfg(feature = "hip")]
                 let _t_activated_start = std::time::Instant::now();
 
-                let gate = gate_up
-                    .narrow(candle::D::Minus1, 0, moe_branch.expert_intermediate)?
-                    .contiguous()?;
-                let up = gate_up
-                    .narrow(
-                        candle::D::Minus1,
-                        moe_branch.expert_intermediate,
-                        moe_branch.expert_intermediate,
-                    )?
-                    .contiguous()?;
-                let activated = gate.gelu()?.broadcast_mul(&up)?;
-
+                // W3d: fused `gelu(gate) * up → quantize_q8_1 → down`
+                // replaces the 5-step narrow/gelu/bmul/contiguous/quant
+                // chain with one HIP kernel launch + a preq8 down
+                // MMVQ. Eliminates 4-5 small kernel launches per MoE
+                // layer on decode. Opt out with CANDLE_W3D=0.
+                // W3d eligibility: limit to decode-shape batch (≤ 8).
+                // The fused kernel launches `batch * topk * inter_padded/32`
+                // blocks per call; at prefill batch=512 this balloons to
+                // 327k blocks and dominates the unfused Rust pipeline.
+                // The unfused path scales better at large batch because
+                // bulk ops like gelu / bmul / contiguous amortise launch
+                // overhead over millions of elements per kernel.
                 #[cfg(feature = "hip")]
-                if layer_profile {
-                    if let candle::Device::Hip(d) = &layer_device { let _ = d.stream().synchronize(); }
-                    t_moe_activated_us += _t_activated_start.elapsed().as_micros();
-                }
+                let w3d_on = matches!(gate_up.device(), candle::Device::Hip(_))
+                    && gate_up.dtype() == candle::DType::F32
+                    && gate_up.is_contiguous()
+                    && moe_branch.expert_intermediate % 32 == 0
+                    && gate_up.dim(0).unwrap_or(usize::MAX) <= 8
+                    && std::env::var("CANDLE_W3D").as_deref() != Ok("0");
+                #[cfg(not(feature = "hip"))]
+                let w3d_on = false;
+
+                let mut moe_out = if w3d_on {
+                    #[cfg(feature = "hip")]
+                    {
+                        let (q8_buf, activated_shape) =
+                            candle::hip_backend::gelu_mul_quantize_q8_1_fused(
+                                &gate_up,
+                                moe_branch.expert_intermediate,
+                            )?;
+                        if layer_profile {
+                            if let candle::Device::Hip(d) = &layer_device {
+                                let _ = d.stream().synchronize();
+                            }
+                            t_moe_activated_us +=
+                                _t_activated_start.elapsed().as_micros();
+                        }
+                        let q8_view = q8_buf.slice(0..q8_buf.len());
+                        let out = moe_branch.down_exps.indexed_moe_forward_preq8(
+                            &q8_view,
+                            &activated_shape,
+                            &topk_ids,
+                        )?;
+                        drop(q8_buf);
+                        out
+                    }
+                    #[cfg(not(feature = "hip"))]
+                    unreachable!()
+                } else {
+                    let gate = gate_up
+                        .narrow(candle::D::Minus1, 0, moe_branch.expert_intermediate)?
+                        .contiguous()?;
+                    let up = gate_up
+                        .narrow(
+                            candle::D::Minus1,
+                            moe_branch.expert_intermediate,
+                            moe_branch.expert_intermediate,
+                        )?
+                        .contiguous()?;
+                    let activated = gate.gelu()?.broadcast_mul(&up)?;
+
+                    #[cfg(feature = "hip")]
+                    if layer_profile {
+                        if let candle::Device::Hip(d) = &layer_device {
+                            let _ = d.stream().synchronize();
+                        }
+                        t_moe_activated_us += _t_activated_start.elapsed().as_micros();
+                    }
+
+                    moe_branch
+                        .down_exps
+                        .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?
+                };
                 #[cfg(feature = "hip")]
                 let _t_down_start = std::time::Instant::now();
-
-                let mut moe_out = moe_branch
-                    .down_exps
-                    .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?;
                 // Apply per-expert down scale if present (ffn_down_exps.scale).
                 // Shape: [n_experts]; gather the scales for the selected
                 // topk experts and broadcast over the hidden dim.

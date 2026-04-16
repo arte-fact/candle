@@ -4377,6 +4377,97 @@ extern "C" __global__ void quantize_q8_1(const float * __restrict__ x, void * __
     reinterpret_cast<half&>(y[ib].ds.y) = sum;
 }
 
+// ============================================================================
+// W3d: fused GELU × broadcast_mul × quantize_q8_1 for MoE gate_up → down path
+// ============================================================================
+//
+// Replaces the 5-kernel chain in `quantized_gemma4.rs:2008-2014`:
+//   let gate = gate_up.narrow(D::Minus1, 0, inter)?.contiguous()?;
+//   let up   = gate_up.narrow(D::Minus1, inter, inter)?.contiguous()?;
+//   let activated = gate.gelu()?.broadcast_mul(&up)?;
+//   // down.indexed_moe_forward internally calls quantize_q8_1(activated)
+// with a single kernel that takes the raw gate_up f32 tensor, computes
+// gelu(gate) * up per element, and writes the Q8_1 block directly for
+// consumption by `indexed_moe_forward_preq8`.
+//
+// Eliminates (per MoE layer on decode):
+//   - 2× `contiguous` (may be ucopy_f32 kernels if strides force a copy)
+//   - 1× `ugelu_f32` kernel
+//   - 1× `bmul_f32` kernel
+//   - 1× `quantize_q8_1` kernel
+//
+// Grid: (inter / QK8_1, topk, batch) — one block per Q8_1 output block.
+// Block: (32, 1, 1) — half-warp cooperates on one block's amax/sum.
+//
+// Input layout: `gate_up` is row-major f32 with shape
+//   [batch, topk, 2 * inter]
+// Column [:, :, 0..inter)  = gate values
+// Column [:, :, inter..2*inter) = up values
+//
+// Output layout: `y_q8_1` is `block_q8_1[batch][topk][inter / QK8_1]`
+// row-major. Each block has per-32-element scale (`ds.x = d`) and the
+// unscaled-float sum (`ds.y`, used in Q8_1×Q8_0 dot correction).
+//
+// GELU: tanh-approximation matching `ugelu_f32` in unary.cu:37.
+
+static __device__ __forceinline__ float gelu_fwd_f32(float x) {
+    const float a = x + 0.044715f * x * x * x;
+    const float k = 0.7978845608028654f;   // sqrt(2/pi)
+    return 0.5f * x * (1.0f + tanhf(k * a));
+}
+
+extern "C" __global__ void __launch_bounds__(32, 1)
+gelu_mul_quantize_q8_1_f32(
+    const float * __restrict__ gate_up,
+    void * __restrict__ vy_q8_1,
+    const int inter,              // half of the gate_up last-dim
+    const int inter_padded,       // padded up to MATRIX_ROW_PADDING (last-dim
+                                  // used by downstream MMVQ for Q8_1 stride)
+    const int topk,               // unused by kernel, for shape context
+    const int batch               // unused by kernel, for shape context
+) {
+    (void) topk; (void) batch;
+    const int j_in_block = threadIdx.x;              // 0..31
+    const int block_x = blockIdx.x;                  // which Q8_1 block
+    const int topk_slot = blockIdx.y;
+    const int batch_idx = blockIdx.z;
+
+    const int col = block_x * QK8_1 + j_in_block;    // 0..inter_padded-1
+    const int row = batch_idx * gridDim.y + topk_slot;
+
+    const size_t gate_stride_elem = 2 * (size_t) inter;
+
+    // Grid covers `inter_padded / QK8_1` blocks — the real range
+    // [0..inter) plus padding blocks [inter..inter_padded) required
+    // by the downstream MMVQ's `k_padded / QK8_1` stride.
+    // Padding blocks write zeros (val = 0 → q = 0, d = 0, sum = 0).
+    float val = 0.0f;
+    if (col < inter) {
+        const float g = gate_up[row * gate_stride_elem + col];
+        const float u = gate_up[row * gate_stride_elem + (size_t) inter + col];
+        val = gelu_fwd_f32(g) * u;
+    }
+
+    // Per-block Q8_1 quantization — same math as `quantize_q8_1` above.
+    float amax = fabsf(val);
+    float sum = val;
+    amax = gfx906_half_warp_reduce_max_dpp(amax);
+    sum = gfx906_half_warp_reduce_sum_dpp(sum);
+
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? (int8_t) 0 : (int8_t) roundf(val / d);
+
+    const int blocks_per_row = inter_padded / QK8_1;
+    block_q8_1 * y = (block_q8_1 *) vy_q8_1;
+    const size_t out_block = (size_t) row * blocks_per_row + block_x;
+
+    y[out_block].qs[j_in_block] = q;
+    if (j_in_block == 0) {
+        reinterpret_cast<half&>(y[out_block].ds.x) = d;
+        reinterpret_cast<half&>(y[out_block].ds.y) = sum;
+    }
+}
+
 // Kernels from https://github.com/ggerganov/llama.cpp/blob/master/ggml-cuda/mmq.cu
 
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q5_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {

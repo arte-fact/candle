@@ -24,6 +24,7 @@ from typing import Iterable
 FAMILY_RULES: list[tuple[str, re.Pattern]] = [
     ("moe_fused",        re.compile(r"indexed_moe_forward_q8_0_q8_1")),
     ("moe_combine",      re.compile(r"moe_combine_weighted_sum_f32")),
+    ("moe_gelu_quant",   re.compile(r"gelu_mul_quantize_q8_1_f32")),
     ("flash_decode",     re.compile(r"gqa_decode_split_(chunk|combine)_d\d+_f32")),
     ("router_topk",      re.compile(
         r"gemma4_router_prep_f32|topk_moe_norm_f32|fast_sum_f32|topk_moe_cuda|mm_ids_helper")),
@@ -67,6 +68,7 @@ PRESERVE: set[str] = {
 DEGRADE_TARGET: set[str] = {
     "moe_fused",
     "moe_combine",
+    "moe_gelu_quant",
     "bookkeeping",
     "elementwise",
     "router_topk",

@@ -961,6 +961,131 @@ pub fn gemma4_router_prep_fused(x: &Tensor, gate_s: &Tensor, eps: f64) -> Result
     ))
 }
 
+/// W3d: Fused `gelu(gate) * up → quantize_q8_1` for MoE gate_up → down.
+///
+/// Replaces the 5-step chain in `quantized_gemma4.rs:2005-2014`:
+/// ```ignore
+/// let gate = gate_up.narrow(D::Minus1, 0, inter)?.contiguous()?;
+/// let up   = gate_up.narrow(D::Minus1, inter, inter)?.contiguous()?;
+/// let activated = gate.gelu()?.broadcast_mul(&up)?;
+/// // down.indexed_moe_forward internally quantizes activated to Q8_1
+/// ```
+/// with a single HIP kernel (`gelu_mul_quantize_q8_1_f32` in
+/// `candle-hip-kernels/src/quantized.cu`) producing a Q8_1 buffer
+/// suitable for direct consumption by
+/// `QHipStorage::indexed_moe_forward_preq8`. Eliminates 4-5 small
+/// kernel launches per MoE layer on decode (narrow × 2, contiguous ×
+/// 2, gelu, bmul, quantize) at ~5 µs each = ~25 µs CPU per layer =
+/// ~750 µs per decode forward.
+///
+/// # Inputs
+/// - `gate_up`: HIP f32 tensor of shape `[batch, topk, 2 * inter]`,
+///   row-major contiguous (exactly the output of
+///   `gate_up_exps.indexed_moe_forward` with a fused gate_up weight).
+/// - `inter`: half the last-dim of `gate_up` (= `expert_intermediate`).
+///
+/// # Output
+/// An owned `HipSlice<u8>` holding `batch * topk * inter / QK8_1`
+/// `block_q8_1` entries (36 bytes each). The caller is responsible for
+/// keeping it alive for the duration of the subsequent
+/// `indexed_moe_forward_preq8` call and passes it as a `HipView<u8>`.
+///
+/// The output layout matches what candle's existing `quantize_q8_1`
+/// kernel writes — per-32-element blocks with `ds.x = delta` and
+/// `ds.y = sum(raw_floats)` — so the downstream MMVQ kernel reads
+/// without any extra stride acrobatics.
+pub fn gelu_mul_quantize_q8_1_fused(
+    gate_up: &Tensor,
+    inter: usize,
+) -> Result<(hipdarc::driver::HipSlice<u8>, crate::Shape)> {
+    use crate::hip_backend::HipDevice;
+    let dev: HipDevice = match gate_up.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("gelu_mul_quantize_q8_1_fused: gate_up must be on HIP"),
+    };
+    if gate_up.dtype() != DType::F32 {
+        crate::bail!(
+            "gelu_mul_quantize_q8_1_fused: gate_up must be f32, got {:?}",
+            gate_up.dtype()
+        );
+    }
+    if !gate_up.is_contiguous() {
+        crate::bail!("gelu_mul_quantize_q8_1_fused: gate_up must be contiguous");
+    }
+    if gate_up.rank() != 3 {
+        crate::bail!(
+            "gelu_mul_quantize_q8_1_fused: expected rank 3 [batch, topk, 2*inter], got shape {:?}",
+            gate_up.shape()
+        );
+    }
+    let (batch, topk, last) = gate_up.dims3()?;
+    if last != 2 * inter {
+        crate::bail!(
+            "gelu_mul_quantize_q8_1_fused: last dim {} != 2*inter {}",
+            last, 2 * inter
+        );
+    }
+    if inter % 32 != 0 {
+        crate::bail!(
+            "gelu_mul_quantize_q8_1_fused: inter={} must be a multiple of QK8_1=32",
+            inter
+        );
+    }
+
+    let (st, l) = gate_up.storage_and_layout();
+    let hip = match &*st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gelu_mul_quantize_q8_1_fused: storage not HIP"),
+    };
+    let slice = hip.as_hip_slice::<f32>()?;
+    let gate_up_view = match l.contiguous_offsets() {
+        Some((lo, hi)) => slice.slice(lo..hi),
+        None => crate::bail!("gelu_mul_quantize_q8_1_fused: non-contiguous gate_up"),
+    };
+
+    // Pad `inter` up to MATRIX_ROW_PADDING so the downstream MMVQ's
+    // `k_padded / QK8_1` block stride reads initialised data (zero
+    // blocks in the padding range).
+    let inter_padded = crate::quantized::hip::pad(inter, crate::quantized::hip::MATRIX_ROW_PADDING);
+
+    // Output buffer: batch * topk * (inter_padded / 32) Q8_1 blocks.
+    const Q8_1_BLOCK_BYTES: usize = 36;
+    let n_blocks = batch * topk * (inter_padded / 32);
+    let q8_bytes = n_blocks * Q8_1_BLOCK_BYTES;
+    // SAFETY: kernel writes every block's qs[0..32] + ds (padded blocks
+    // get zero val → q=0, d=0, sum=0).
+    let out = unsafe { dev.alloc::<u8>(q8_bytes)? };
+
+    let func = dev.get_or_load_func(
+        "gelu_mul_quantize_q8_1_f32",
+        &kernels::QUANTIZED,
+    )?;
+    // Grid: (inter_padded / QK8_1, topk, batch). Block: (32, 1, 1).
+    let cfg = LaunchConfig {
+        grid_dim: ((inter_padded / 32) as u32, topk as u32, batch as u32),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let inter_arg = inter as i32;
+    let inter_padded_arg = inter_padded as i32;
+    let topk_arg = topk as i32;
+    let batch_arg = batch as i32;
+    let mut builder = func.builder();
+    builder.arg(&gate_up_view);
+    builder.arg(&out);
+    builder.arg(&inter_arg);
+    builder.arg(&inter_padded_arg);
+    builder.arg(&topk_arg);
+    builder.arg(&batch_arg);
+    // SAFETY: shape validated; all kernel args match kernel signature.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(st);
+
+    let out_shape: crate::Shape = vec![batch, topk, inter].into();
+    Ok((out, out_shape))
+}
+
 /// Fused RMSNorm + Scale + Q8_1 quantize.
 ///
 /// Combines three operations into a single kernel launch:
