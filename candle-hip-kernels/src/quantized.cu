@@ -2825,6 +2825,78 @@ extern "C" __global__ void mul_mat_vec_mxfp4_q8_1_cuda8(
     mul_mat_vec_mxfp4_q8_1_body<8>(vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
+// 128-thread variant — one output row per block, 2 warps cooperating.
+// Mirrors llama.cpp's `mul_mat_vec_q<GGML_TYPE_Q4_0, 1, false, false>`
+// dispatch on gfx906 (GCN table_id picks nwarps=2). Empirically wins
+// at ~15 µs/call vs the 64-thread variant's 22 µs (rocprofv3 data
+// 2026-04-16). Doubling threads-per-block trades 2x blocks for better
+// VMEM latency hiding across the Q4_0 block loop.
+//
+// Layout:
+//   Grid  = (nrows_x, 1, 1)      — one block per output row.
+//   Block = (128, 1, 1)          — two 64-wide waves.
+// Each thread handles `blocks_per_row / 128` Q4_0 blocks (row has
+// 96 blocks for hidden=3072 → ~0.75 per thread; some threads idle
+// for rows shorter than 128 Q4_0 blocks, same as llama.cpp).
+extern "C" __global__ void __launch_bounds__(128, 1)
+mul_mat_vec_q4_0_q8_1_cuda1_b128(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+
+    const int tid = threadIdx.x;          // 0..127
+    const int row = blockIdx.x;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK4_0;
+    const block_q4_0 * x = (const block_q4_0 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = tid; ib < blocks_per_row; ib += 128) {
+        const block_q4_0 * bq4 = x + ib;
+        const block_q8_1 * bq8 = y + ib;
+
+        int v0, v1, v2, v3;
+        memcpy(&v0, bq4->qs +  0, 4);
+        memcpy(&v1, bq4->qs +  4, 4);
+        memcpy(&v2, bq4->qs +  8, 4);
+        memcpy(&v3, bq4->qs + 12, 4);
+
+        const int4 q8_lo = *((const int4 *)(bq8->qs));
+        const int4 q8_hi = *((const int4 *)(bq8->qs + 16));
+
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a((v0 >> 0) & 0x0F0F0F0F, q8_lo.x, sumi);
+        sumi = ggml_cuda_dp4a((v0 >> 4) & 0x0F0F0F0F, q8_hi.x, sumi);
+        sumi = ggml_cuda_dp4a((v1 >> 0) & 0x0F0F0F0F, q8_lo.y, sumi);
+        sumi = ggml_cuda_dp4a((v1 >> 4) & 0x0F0F0F0F, q8_hi.y, sumi);
+        sumi = ggml_cuda_dp4a((v2 >> 0) & 0x0F0F0F0F, q8_lo.z, sumi);
+        sumi = ggml_cuda_dp4a((v2 >> 4) & 0x0F0F0F0F, q8_hi.z, sumi);
+        sumi = ggml_cuda_dp4a((v3 >> 0) & 0x0F0F0F0F, q8_lo.w, sumi);
+        sumi = ggml_cuda_dp4a((v3 >> 4) & 0x0F0F0F0F, q8_hi.w, sumi);
+
+        const float d4 = __half2float(bq4->d);
+        const float2 ds8 = __half22float2(bq8->ds);
+        sumf += d4 * (sumi * ds8.x - 8.0f * ds8.y);
+    }
+
+    // Cross-warp reduce: warp-local first, then LDS combine.
+    sumf = gfx906_warp_reduce_sum(sumf);
+    __shared__ float smem[2];
+    const int wave_id = tid >> 6;
+    const int lane_in_wave = tid & 63;
+    if (lane_in_wave == 0) {
+        smem[wave_id] = sumf;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        dst[row] = smem[0] + smem[1];
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_vec_q4_0_q8_1_cuda1(
     const void * __restrict__ vx, const void * __restrict__ vy,

@@ -442,6 +442,14 @@ pub fn launch_mul_mat_vec_q8_1_chunk_raw(
     // Q6K still diverges (distinct 4+2 packing; kernel layout not yet ported).
     // Opt into Q6K warp-coop via CANDLE_KQUANT_WARP_COOP=1 (still broken).
     let q6_warp_coop = std::env::var("CANDLE_KQUANT_WARP_COOP").is_ok();
+    // Q4_0 b_size=1 has a 128-thread variant (`_cuda1_b128`) that
+    // mirrors llama.cpp's `calc_nwarps=2` dispatch on gfx906 (GCN table).
+    // Measured 22.4 → target <16 µs/call via doubled threads per block,
+    // one output row per block (vs 64-thread / 2-rows). Opt-in via
+    // `CANDLE_MMVQ_B128=1` for A/B bisect; default OFF until validated.
+    let mmvq_b128 = std::env::var("CANDLE_MMVQ_B128")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(false);
     let kernel_name = if b_size == 1
         && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q5K)
     {
@@ -452,6 +460,8 @@ pub fn launch_mul_mat_vec_q8_1_chunk_raw(
         }
     } else if b_size == 1 && q6_warp_coop && matches!(dtype, GgmlDType::Q6K) {
         "mul_mat_vec_q6_K_q8_1_wc".to_string()
+    } else if b_size == 1 && mmvq_b128 && matches!(dtype, GgmlDType::Q4_0) {
+        "mul_mat_vec_q4_0_q8_1_cuda1_b128".to_string()
     } else {
         format!("{kernel_name}{b_size}")
     };
@@ -472,7 +482,15 @@ pub fn launch_mul_mat_vec_q8_1_chunk_raw(
                 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Mxfp4
             )
             || (q6_warp_coop && matches!(dtype, GgmlDType::Q6K)));
-    let cfg = if warp_coop {
+    // b128 variant for Q4_0 b_size=1 — 128 threads, 1 output row per block.
+    let use_b128 = b_size == 1 && mmvq_b128 && matches!(dtype, GgmlDType::Q4_0);
+    let cfg = if use_b128 {
+        hipdarc::driver::LaunchConfig {
+            grid_dim: (nrows as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        }
+    } else if warp_coop {
         hipdarc::driver::LaunchConfig {
             grid_dim: ((nrows as u32).div_ceil(2), 1, 1),
             block_dim: (WARP_SIZE as u32, 1, 1),
