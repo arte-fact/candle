@@ -50,6 +50,22 @@ fn try_fused_norm_rope_decode(
     offset: usize,
     seq_len: usize,
 ) -> Result<Tensor> {
+    try_fused_norm_rope_decode_out(q_or_k, norm, rotary, offset, seq_len, DType::F32)
+}
+
+/// Output-dtype-parameterised variant. For the K path under
+/// `CANDLE_KV_F16=1`, pass `DType::F16` so the fused kernel writes
+/// half-precision directly into the KvCache — skipping a per-token
+/// f32→f16 cast launch. Q stays F32 regardless (consumed by the
+/// attention kernel as F32).
+fn try_fused_norm_rope_decode_out(
+    q_or_k: &Tensor,
+    norm: Option<&AttnNorm>,
+    rotary: &super::rope::RotaryEmbedding,
+    offset: usize,
+    seq_len: usize,
+    output_dtype: DType,
+) -> Result<Tensor> {
     #[cfg(feature = "hip")]
     {
         let head_dim = q_or_k.dim(D::Minus1)?;
@@ -63,24 +79,31 @@ fn try_fused_norm_rope_decode(
             && rotary.sin().dtype() == DType::F32;
         if fusable {
             let n = norm.unwrap();
-            if let Ok(out) = candle::hip_backend::rmsnorm_rope_decode_fused(
+            if let Ok(out) = candle::hip_backend::rmsnorm_rope_decode_fused_out(
                 q_or_k,
                 n.weight(),
                 n.eps(),
                 offset,
                 rotary.cos(),
                 rotary.sin(),
+                output_dtype,
             ) {
                 return Ok(out);
             }
         }
     }
-    // Fallback: plain chain.
+    // Fallback: plain chain. Honor output_dtype via a trailing cast only
+    // when we can't use the fused kernel (rare — partial RoPE / non-HIP).
     let x = match norm {
         Some(n) => n.forward(q_or_k)?,
         None => q_or_k.clone(),
     };
-    rotary.apply_one(&x, offset)
+    let x = rotary.apply_one(&x, offset)?;
+    if output_dtype != x.dtype() {
+        x.to_dtype(output_dtype)
+    } else {
+        Ok(x)
+    }
 }
 
 /// Run scaled-dot-product attention with GQA sharing done via zero-copy
@@ -204,6 +227,21 @@ pub(crate) fn gqa_attention_k_transposed(
     mask: Option<&Tensor>,
     attn_scale: f64,
 ) -> Result<Tensor> {
+    // F16 K/V fallback for this prefill-capable path — the underlying
+    // flash-attn / rocBLAS kernels want F32 K/V. Decode (seq_len==1)
+    // reaches gqa_attention_decode_mv directly and hits the native
+    // F16 kernels, skipping this function. Cast F16→F32 here adds one
+    // launch per K and V; amortized over a full prefill pass and only
+    // relevant when CANDLE_KV_F16=1 is set.
+    let k_t_f32;
+    let v_f32;
+    let (k_t, v) = if k_t.dtype() == candle::DType::F16 || v.dtype() == candle::DType::F16 {
+        k_t_f32 = k_t.to_dtype(candle::DType::F32)?;
+        v_f32 = v.to_dtype(candle::DType::F32)?;
+        (&k_t_f32, &v_f32)
+    } else {
+        (k_t, v)
+    };
     let (b_sz, n_head, seq_len, head_dim) = q.dims4()?;
     let (kb, kkv, kd, t_k) = k_t.dims4()?;
     if (kb, kkv, kd) != (b_sz, q.dim(1)? / (q.dim(1)? / kkv), head_dim) {
@@ -847,6 +885,22 @@ impl StandardAttention {
         let _q8_bytes = b_size * _ncols_padded
             * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
 
+        // CANDLE_KV_F16: downcast K and V to F16 at the fused kernel
+        // boundary so the KvCache receives F16 tensors directly (no
+        // per-token cast launch). Q stays F32 — the attention kernel
+        // consumes Q as f32. Defaulting to F32 everywhere preserves
+        // the pre-flag behavior.
+        #[cfg(feature = "hip")]
+        let kv_out_dtype = if std::env::var("CANDLE_KV_F16")
+            .ok().as_deref().map(|s| s != "0").unwrap_or(false)
+        {
+            candle::DType::F16
+        } else {
+            candle::DType::F32
+        };
+        #[cfg(not(feature = "hip"))]
+        let kv_out_dtype = candle::DType::F32;
+
         // Q
         let q_raw = self.wq.forward_preq8(&q8_view, b_size, rhs_shape)?;
         let q_proj = q_raw
@@ -857,7 +911,8 @@ impl StandardAttention {
         // Collapses two launches (rmsnorm_f32 + rope_f32_ctr) into one
         // `rmsnorm_rope_decode_f32` launch. Falls back to the unfused
         // sequence when any precondition isn't met (partial RoPE,
-        // prefill seq_len > 1, no q_norm, non-HIP, etc).
+        // prefill seq_len > 1, no q_norm, non-HIP, etc). Q is ALWAYS
+        // produced as F32 — attention kernel consumes it as f32.
         let q = try_fused_norm_rope_decode(
             &q_proj,
             self.q_norm.as_ref(),
@@ -882,16 +937,37 @@ impl StandardAttention {
 
         // Fused k_norm + RoPE (same conditions as Q above). When k_norm
         // is absent, falls back to a bare rotary.apply_one on k_3d.
-        let k = try_fused_norm_rope_decode(
+        // Under CANDLE_KV_F16, output is F16 directly — no cast before
+        // KvCache::append.
+        let k = try_fused_norm_rope_decode_out(
             &k_3d,
             self.k_norm.as_ref(),
             &self.rotary,
             offset,
             seq_len,
+            kv_out_dtype,
         )?;
         let v = if let Some(eps) = self.v_norm_eps {
-            super::norms::v_norm(&v_pre, eps)?
-        } else { v_pre };
+            // v_norm_fused_out emits F16 directly when requested, skipping
+            // a downstream cast.
+            #[cfg(feature = "hip")]
+            {
+                if matches!(v_pre.device(), candle::Device::Hip(_))
+                    && v_pre.dtype() == candle::DType::F32
+                    && v_pre.is_contiguous()
+                {
+                    candle::hip_backend::v_norm_fused_out(&v_pre, eps, kv_out_dtype)?
+                } else {
+                    super::norms::v_norm(&v_pre, eps)?
+                }
+            }
+            #[cfg(not(feature = "hip"))]
+            { super::norms::v_norm(&v_pre, eps)? }
+        } else if kv_out_dtype != v_pre.dtype() {
+            v_pre.to_dtype(kv_out_dtype)?
+        } else {
+            v_pre
+        };
 
         Ok(Some((q, k, v, x_norm)))
     }

@@ -1218,6 +1218,22 @@ impl ModelWeights {
                     // KvCache::append needs contiguous sources.
                     let k_new = if k_new.is_contiguous() { k_new } else { k_new.contiguous()? };
                     let v_new = if v_new.is_contiguous() { v_new } else { v_new.contiguous()? };
+                    // CANDLE_KV_F16: align K/V to the cache's target
+                    // dtype. Under CANDLE_KV_F16, decode's producer
+                    // kernels (rmsnorm_rope_decode_f16out_f32,
+                    // v_norm_f16out_f32) already emit F16 — this cast
+                    // is a no-op in that hot path. For fallback paths
+                    // (e.g. prefill with b_size > 8 that hit
+                    // compute_qkv_shared_q8 instead of
+                    // compute_qkv_norm_q8_fused) it fires ONCE per
+                    // prefill call and keeps the whole cache at one
+                    // consistent dtype.
+                    #[cfg(feature = "hip")]
+                    let (k_new, v_new) = if std::env::var("CANDLE_KV_F16").ok().as_deref().map(|s| s != "0").unwrap_or(false) {
+                        let k_new = if k_new.dtype() == candle::DType::F16 { k_new } else { k_new.to_dtype(candle::DType::F16)? };
+                        let v_new = if v_new.dtype() == candle::DType::F16 { v_new } else { v_new.to_dtype(candle::DType::F16)? };
+                        (k_new, v_new)
+                    } else { (k_new, v_new) };
                     let _ = cache.append(&k_new, &v_new)?;
                 }
             }

@@ -616,6 +616,20 @@ pub fn l2_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
 /// - `x` must be on a HIP device, contiguous, and f32.
 /// - `x.rank() >= 1`.
 pub fn v_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
+    v_norm_fused_out(x, eps, DType::F32)
+}
+
+/// Output-dtype-parameterised variant of [`v_norm_fused`]. `F32` matches
+/// the default; `F16` writes __half and skips a downstream cast when
+/// feeding a F16 KvCache. Input stays f32.
+pub fn v_norm_fused_out(x: &Tensor, eps: f64, output_dtype: DType) -> Result<Tensor> {
+    if output_dtype != DType::F32 && output_dtype != DType::F16 {
+        crate::bail!(
+            "v_norm_fused_out: output_dtype must be F32 or F16, got {:?}",
+            output_dtype
+        );
+    }
+
     let dev = match x.device() {
         Device::Hip(d) => d.clone(),
         _ => crate::bail!("v_norm_fused: input must be on a HIP device"),
@@ -650,31 +664,43 @@ pub fn v_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
         None => crate::bail!("v_norm_fused: non-contiguous storage"),
     };
 
-    let out = unsafe { dev.alloc::<f32>(x.elem_count())? };
-
-    let func = dev.get_or_load_func("v_norm_f32", &kernels::UNARY)?;
-
     let cfg = LaunchConfig {
         grid_dim: (n_rows as u32, 1, 1),
         block_dim: (WARP_SIZE, 1, 1),
         shared_mem_bytes: 0,
     };
-
-    let mut builder = func.builder();
     let row_len_arg = row_len;
     let eps_f32 = eps as f32;
-    builder.arg(&row_len_arg);
-    builder.arg(&eps_f32);
-    builder.arg(&x_view);
-    builder.arg(&out);
-    unsafe { builder.launch(cfg) }.w()?;
+
+    let (out_storage_hip, out_shape_tensor) = if output_dtype == DType::F16 {
+        let out = unsafe { dev.alloc::<half::f16>(x.elem_count())? };
+        let func = dev.get_or_load_func("v_norm_f16out_f32", &kernels::UNARY)?;
+        let mut builder = func.builder();
+        builder.arg(&row_len_arg);
+        builder.arg(&eps_f32);
+        builder.arg(&x_view);
+        builder.arg(&out);
+        unsafe { builder.launch(cfg) }.w()?;
+        (HipStorage::wrap_hip_slice(out, dev.clone()),
+         <Shape as From<Vec<usize>>>::from(x.dims().to_vec()))
+    } else {
+        let out = unsafe { dev.alloc::<f32>(x.elem_count())? };
+        let func = dev.get_or_load_func("v_norm_f32", &kernels::UNARY)?;
+        let mut builder = func.builder();
+        builder.arg(&row_len_arg);
+        builder.arg(&eps_f32);
+        builder.arg(&x_view);
+        builder.arg(&out);
+        unsafe { builder.launch(cfg) }.w()?;
+        (HipStorage::wrap_hip_slice(out, dev.clone()),
+         <Shape as From<Vec<usize>>>::from(x.dims().to_vec()))
+    };
 
     drop(x_st);
 
-    let out_storage = HipStorage::wrap_hip_slice(out, dev);
     Ok(Tensor::from_storage(
-        Storage::Hip(out_storage),
-        <Shape as From<Vec<usize>>>::from(x.dims().to_vec()),
+        Storage::Hip(out_storage_hip),
+        out_shape_tensor,
         BackpropOp::none(),
         /* is_variable */ false,
     ))
@@ -716,8 +742,31 @@ pub fn rmsnorm_rope_decode_fused(
     cos: &Tensor,
     sin: &Tensor,
 ) -> Result<Tensor> {
+    rmsnorm_rope_decode_fused_out(x, weight, eps, offset, cos, sin, DType::F32)
+}
+
+/// Output-dtype-parameterised variant. `output_dtype` must be either
+/// `F32` (default, via [`rmsnorm_rope_decode_fused`]) or `F16`. F16
+/// output avoids a per-token f32→f16 cast launch when the result is
+/// destined for a F16 KV cache.
+pub fn rmsnorm_rope_decode_fused_out(
+    x: &Tensor,
+    weight: &Tensor,
+    eps: f64,
+    offset: usize,
+    cos: &Tensor,
+    sin: &Tensor,
+    output_dtype: DType,
+) -> Result<Tensor> {
     use super::g3_counters::{set, slot_ptr, CounterSlot};
     use super::HipDevice;
+
+    if output_dtype != DType::F32 && output_dtype != DType::F16 {
+        crate::bail!(
+            "rmsnorm_rope_decode_fused_out: output_dtype must be F32 or F16, got {:?}",
+            output_dtype
+        );
+    }
 
     let dev: HipDevice = match x.device() {
         Device::Hip(d) => d.clone(),
@@ -812,9 +861,6 @@ pub fn rmsnorm_rope_decode_fused(
     };
     let sin_full = sn_hip.as_hip_slice::<f32>()?.slice(0..sn_hip.as_hip_slice::<f32>()?.len());
 
-    let out = unsafe { dev.alloc::<f32>(x.elem_count())? };
-    let func = dev.get_or_load_func("rmsnorm_rope_decode_f32", &kernels::REDUCE)?;
-
     let cfg = LaunchConfig {
         grid_dim: (n_rows as u32, 1, 1),
         block_dim: (WARP_SIZE, 1, 1),
@@ -826,28 +872,53 @@ pub fn rmsnorm_rope_decode_fused(
     let eps_f32 = eps as f32;
     let stride_b: u32 = 0;
 
-    let mut builder = func.builder();
-    builder.arg(&x_view);
-    builder.arg(&w_slice);
-    builder.arg(&cos_full);
-    builder.arg(&sin_full);
-    builder.arg(&out);
-    builder.arg(&bh_u32);
-    builder.arg(&d_u32);
-    builder.arg(&eps_f32);
-    builder.arg(&stride_b);
-    builder.arg(&off_ptr);
-    unsafe { builder.launch(cfg) }.w()?;
+    // Branch on output dtype. F32 path is the original kernel; F16
+    // path uses the _f16out_ variant which writes __half and skips
+    // a downstream cast launch for F16 KV caches.
+    let (out_storage_hip, out_shape_tensor) = if output_dtype == DType::F16 {
+        let out = unsafe { dev.alloc::<half::f16>(x.elem_count())? };
+        let func = dev.get_or_load_func("rmsnorm_rope_decode_f16out_f32", &kernels::REDUCE)?;
+        let mut builder = func.builder();
+        builder.arg(&x_view);
+        builder.arg(&w_slice);
+        builder.arg(&cos_full);
+        builder.arg(&sin_full);
+        builder.arg(&out);
+        builder.arg(&bh_u32);
+        builder.arg(&d_u32);
+        builder.arg(&eps_f32);
+        builder.arg(&stride_b);
+        builder.arg(&off_ptr);
+        unsafe { builder.launch(cfg) }.w()?;
+        (HipStorage::wrap_hip_slice(out, dev.clone()),
+         <Shape as From<Vec<usize>>>::from(x.dims().to_vec()))
+    } else {
+        let out = unsafe { dev.alloc::<f32>(x.elem_count())? };
+        let func = dev.get_or_load_func("rmsnorm_rope_decode_f32", &kernels::REDUCE)?;
+        let mut builder = func.builder();
+        builder.arg(&x_view);
+        builder.arg(&w_slice);
+        builder.arg(&cos_full);
+        builder.arg(&sin_full);
+        builder.arg(&out);
+        builder.arg(&bh_u32);
+        builder.arg(&d_u32);
+        builder.arg(&eps_f32);
+        builder.arg(&stride_b);
+        builder.arg(&off_ptr);
+        unsafe { builder.launch(cfg) }.w()?;
+        (HipStorage::wrap_hip_slice(out, dev.clone()),
+         <Shape as From<Vec<usize>>>::from(x.dims().to_vec()))
+    };
 
     drop(x_st);
     drop(w_st);
     drop(cs_st);
     drop(sn_st);
 
-    let out_storage = HipStorage::wrap_hip_slice(out, dev);
     Ok(Tensor::from_storage(
-        Storage::Hip(out_storage),
-        <Shape as From<Vec<usize>>>::from(x.dims().to_vec()),
+        Storage::Hip(out_storage_hip),
+        out_shape_tensor,
         BackpropOp::none(),
         /* is_variable */ false,
     ))

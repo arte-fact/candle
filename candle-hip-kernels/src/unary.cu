@@ -446,6 +446,37 @@ extern "C" __global__ void FN_NAME(                                            \
 
 V_NORM_OP(float, v_norm_f32, sqrtf)
 
+// F16-output variant — same math, writes __half. Used when
+// CANDLE_KV_F16=1 so the V projection can feed a F16 KvCache without
+// a separate cast launch.
+extern "C" __global__ void v_norm_f16out_f32(
+    const size_t row_len,
+    const float eps,
+    const float *__restrict__ in,
+    __half *__restrict__ out
+) {
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float *row_in  = in  + (size_t)row * row_len;
+    __half      *row_out = out + (size_t)row * row_len;
+
+    float partial = 0.0f;
+    for (size_t i = lane; i < row_len; i += blockDim.x) {
+        const float v = row_in[i];
+        partial += v * v;
+    }
+    _Pragma("unroll")
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        partial += __shfl_xor(partial, mask);
+    }
+    const float mean_sq = partial / (float)row_len;
+    const float inv_norm = rsqrtf(mean_sq + eps);
+
+    for (size_t i = lane; i < row_len; i += blockDim.x) {
+        row_out[i] = __float2half(row_in[i] * inv_norm);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fused MoE router pre-amble (Phase T1.1):
 //     out[r,i] = x[r,i] / sqrt(mean(x[r,:]^2) + eps) * inv_sqrt_n * gate_s[i]
