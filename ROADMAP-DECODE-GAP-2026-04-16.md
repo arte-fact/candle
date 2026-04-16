@@ -68,41 +68,49 @@ Phases are not strictly additive (W1 and W7 both attack CPU overhead, W3 and W3a
 
 Reordered from rev. 1 by **impact** rather than effort. W3 and W1 are the two biggest levers and should land first; everything else compounds on top.
 
-### W3 — Physical gather-by-expert MoE **[NOT A WIN on Gemma-4; retained as opt-in]**
+### W3 — MoE-aware warp-coop Q8_0 MMVQ **[LANDED 2026-04-16, default ON]**
 
-**Status: landed as opt-in, default OFF (2026-04-16).** Performance measurement invalidated the original premise.
+**Status: W3-rev2 landed.** Replaces the rev1 8×-per-expert loop with a **single-launch MoE warp-coop kernel** mirroring turbo's `gfx906_mul_mat_vec_q8_0_warp_coop` config. Keeps the fused kernel for prefill (`b_size > 1`).
 
-**What was implemented** (`CANDLE_W3_GATHER=1` to enable):
-- `launch_mul_mat_vec_q8_1_chunk_raw` view-based MMVQ dispatcher (`candle-core/src/quantized/hip.rs`).
-- Per-expert branch inside `launch_indexed_moe_forward_with_q8` that loops `topk` times calling the warp-coop MMVQ kernel on expert-sliced weights. Covers both `input_dim1 == 1` (gate/up) and `input_dim1 == topk` (down).
-- Thread-local CPU-ids cache (`w3_cached_ids_set/take/clear`) in the same file, wired in `quantized_gemma4.rs` and `quantized_blocks/ffn.rs` — avoids per-projection D2H syncs.
-- `hipdarc::Stream::clone_dtoh_view` helper.
-- Extended `candle-core/examples/hip_moe_mmq_test.rs` with tokens=1 decode rows — rel-err ≤ 3e-6 vs fused kernel (essentially bit-exact).
+**Root cause (corrected from rev1):** the generic `indexed_moe_forward_q8_0_q8_1` template launched with `(64 thr × 4 warps, n_rows × batch × topk)` = 256 threads × 20,480 blocks = 5.2M concurrent threads. That over-provisions gfx906 (153K concurrent threads); the 4-warp inter-warp reduction via shared memory serialises each block. Turbo's warp-coop launches `(64 thr × 1 warp, n_rows/2 × topk × batch)` = 64 threads × 10,240 blocks = 655K threads with a **half-warp DPP reduction** — 8× less over-subscription, no shared-mem sync.
 
-**Why it doesn't win on Gemma-4-26B-A4B-Q8_0 decode:**
+**Implementation (2026-04-16):**
 
-The roadmap assumed fused-kernel per-call = 818 µs based on `7800 calls × 818 µs = 6.38 s` from the 2026-04-16 rocprofv3 baseline. That average is **dominated by the 120 prefill calls at ~46 ms each (5.52 s)** — the 7,680 decode calls averaged only **~79–112 µs**. The per-decode-call cost was already competitive.
+- **Kernel** `mul_mat_vec_q8_0_q8_1_moe_warp_coop` in `candle-hip-kernels/src/quantized.cu`. 21 VGPR, 0 scratch. Grid `((n+1)/2, topk, batch)`. Block `(64, 1, 1)`. Each block produces 2 output rows for one `(batch, topk_slot)`. `ids[task_id]` selects the expert inside the kernel — no CPU D2H sync.
+- **Dispatcher** in `candle-core/src/quantized/hip.rs` at `launch_indexed_moe_forward_with_q8`: when `batch == 1 && input_dim1 ∈ {1, topk}` and dtype is Q8_0, use the new kernel; else fall back to the existing fused kernel. **Default on** for Q8_0 decode.
+- **Opt-out**: `CANDLE_W3_GATHER=0` restores the fused kernel. Kept for A/B and as an escape hatch.
+- **Correctness**: `candle-core/examples/hip_moe_mmq_test.rs` W3 rows — rel-err ≤ 2.9e-6 vs fused (bit-exact within fp32 rounding).
 
-Per equivalent work on decode:
-| path | per call | equivalent decode cost |
-|---|---:|---:|
-| fused `indexed_moe_forward_q8_0_q8_1` | ~112 µs | 112 µs |
-| 8× warp-coop MMVQ | 17 µs | **136 µs (21 % slower)** |
+**Measured on Gemma-4-26B-A4B-Q8_0, 4 GPUs, pp512+tg128, best-of-3 uninstrumented:**
 
-Measured outcome (uninstrumented, 4-GPU, pp512+tg128, best-of-3):
+| | baseline (no W3) | W3-rev1 (8× loop) | **W3-rev2 (warp-coop)** |
+|---|---:|---:|---:|
+| pp512 | 655 t/s | 639 (−2.4 %) | 655 (no change) |
+| **tg128** | 44.81 | 42.83 (−4.4 %) | **46.37 (+3.5 %)** |
+| tg128 vs turbo | 0.671× | 0.641× | **0.695×** |
 
-| | W3 off (W3a baseline) | W3 on |
-|---|---:|---:|
-| pp512 | 655 t/s | 639 t/s (−2.4 %) |
-| **tg128** | **44.81 t/s** | **42.83 t/s (−4.4 %)** |
+**Per-call decode MoE** (from rocprofv3):
 
-Regression gate: `mmvq_q8 +69 %` (PRESERVE family FAIL).
+| kernel | calls | per-call | total |
+|---|---:|---:|---:|
+| fused `indexed_moe_forward_q8_0_q8_1` (prefill only) | 120 | 50.7 ms | 6,080 ms |
+| W3-rev2 `mul_mat_vec_q8_0_q8_1_moe_warp_coop` | 7,680 | **72 µs** | 555 ms |
 
-**When it might help:** the opt-in path is kept because shape/tile economics differ per model. Qwen3-Coder-30B-A3B at Q4_0 has smaller `n * k` per expert; the 8×-MMVQ path might pay off there. To validate, run `CANDLE_W3_GATHER=1 candle-bench bench --backend candle --bin quantized-qwen35 --model <qwen-gguf> --gpus 0,1,2,3 --prompt-len 512 --tg-len 128` and compare.
+vs turbo's warp-coop path at ~50 µs/call: candle's is 44 % slower per call, but the *savings relative to candle's old fused decode* is 305 ms aggregate GPU (fused decode was 860 ms at 112 µs/call). The residual gap to turbo's 50 µs/call is worth chasing in a W3c follow-up (probably a tighter LDS/register schedule).
 
-**Lesson** (added to MEMORY feedback): aggregate-averaged per-call µs on profile summaries can conflate prefill and decode. Split per-call-µs by `input_dim1` / `b_size` before projecting wins.
+**Retired (W3-rev1) infrastructure** — kept as dead code but unused on default:
+- Per-expert loop inside `launch_indexed_moe_forward_with_q8` (superseded by the kernel-level fix).
+- Thread-local CPU-ids cache (`w3_cached_ids_*`). No longer on the hot path but retained — may be useful for future MoE paths that need CPU ids.
+- `launch_mul_mat_vec_q8_1_chunk_raw` — kept, useful for targeted MoE variants on other dtypes.
 
-**Remaining levers:** W3's planned +10–15 pp on tg is off the table. The roadmap's 1.05× turbo goal now rests on **W1 (alloc pool), W5 (ucopy), W6 (elementwise), W7 (G2/G3)** — all CPU-overhead fixes. W3 artefacts remain in tree as the retained escape-hatch for future models.
+**Not yet covered** (future W3c):
+- Q4_0 / Q4_1 MoE decode (Qwen3-Coder-30B). Same technique applies; needs Q4_0/Q4_1 MoE kernel variants.
+- K-quant MoE (Q4_K / Q5_K / Q6_K). Lower priority; few active models use K-quant MoE.
+- Prefill MoE gather-by-expert (b_size > 1). Orthogonal to W3-rev2; needs variable-M per-expert MMQ.
+
+**Remaining levers for the 1.05× turbo goal:** W1 (alloc pool), W5 (ucopy), W2 (peer copies), W6 (elementwise), W4 (memset), W7 (G2/G3). W3 contributed +3.5 pp; the cumulative projection now shows W1-W6 landing ≈ 0.96× turbo with W7 delivering the over-turbo push.
+
+**Lesson** (memory): the generic ggml-cuda MMVQ template is **not** tuned for gfx906; the warp-coop config (1 wave, 2 rows/block, half-warp DPP reduce) is. When porting any new MMVQ-like kernel, start from the `_cuda1`/`_warp_coop` variants, not the generic template.
 
 **Implementation:**
 - **W3a — LANDED 2026-04-16.** Fused `moe_combine_weighted_sum_f32` replaces
@@ -338,13 +346,13 @@ Projections per phase (non-additive: dependencies and diminishing-returns noted)
 |---|---:|---:|---:|---:|
 | today | 43.84 | 0.66× | 282 s | 13,181 |
 | + W3a (fused moe-combine — **landed**) | 44.81 | 0.67× | 282 s | 13,181 |
-| + W3 (gather-by-expert — **net-negative, reverted to opt-in**) | — | — | — | — |
-| + W1 (alloc pool) | ~52 | 0.78× | ~50 s | 0 |
-| + W5 (ucopy clean) | ~54 | 0.81× | ~45 s | 0 |
-| + W2 (peer-to-peer) | ~57 | 0.85× | ~40 s | 0 |
-| + W6 (param bin_bcast) | ~60 | 0.90× | ~35 s | 0 |
-| + W4 (memset clean) | ~62 | 0.93× | ~28 s | 0 |
-| **+ W7 (G2/G3 active)** | **~68–72** | **1.02–1.08×** | **~12 s** | **0** |
+| + W3-rev2 (MoE warp-coop Q8_0 — **landed**) | **46.37** | **0.695×** | 282 s | 13,181 |
+| + W1 (alloc pool) | ~54 | 0.81× | ~50 s | 0 |
+| + W5 (ucopy clean) | ~56 | 0.84× | ~45 s | 0 |
+| + W2 (peer-to-peer) | ~59 | 0.88× | ~40 s | 0 |
+| + W6 (param bin_bcast) | ~62 | 0.93× | ~35 s | 0 |
+| + W4 (memset clean) | ~64 | 0.96× | ~28 s | 0 |
+| **+ W7 (G2/G3 active)** | **~70–74** | **1.05–1.11×** | **~12 s** | **0** |
 
 Revised after W3 retro: without W3's planned 8–12 pp, the parity line now sits at **W1+W5+W2+W6+W4** (≈ 0.93× turbo) and the over-turbo push depends on **W7** (G2/G3 replay) delivering. W7 is the phase that decisively beats turbo via the architecture lever turbo doesn't have. W1 alone is the biggest remaining win (projected +8–12 pp from eliminating 13,181 `hipMallocAsync` calls per decode run).
 

@@ -2992,6 +2992,105 @@ mul_mat_vec_q8_0_q8_1_cuda1(
 }
 
 // ============================================================================
+// W3-rev2: MoE-aware warp-coop Q8_0 MMVQ (gfx906 occupancy fix)
+// ============================================================================
+//
+// Single-launch MoE decode dispatcher that mirrors llamacpp-turbo's
+// `gfx906_mul_mat_vec_q8_0_warp_coop` pattern (mmvq-q8_0.cuh:8-95) but
+// adds the MoE indexing the generic ggml-cuda template
+// `indexed_moe_forward` (see `indexed_moe_forward` at the bottom of
+// this file) was using — at 4× too many threads per row and no DPP
+// reduction.
+//
+// Why this exists: the fused `indexed_moe_forward_q8_0_q8_1` kernel
+// launches with `(64 thr × 4 warps, nrows, topk)` = 256 threads per
+// workgroup and 1 row per workgroup. Measured 112 µs / decode call on
+// Gemma-4-26B-A4B vs turbo's 34 µs. The per-kernel work is identical;
+// the gap is purely the over-provisioned launch config. This kernel
+// uses the warp-coop config: 64 threads per block, 2 rows per block,
+// half-warp dot with DPP reduce. Expected: ~35 µs / call on the same
+// shape.
+//
+// Shape contract (matches `launch_indexed_moe_forward_with_q8`):
+//   vx  : [n_experts, nrows_x, ncols_x] quantised Q8_0 weights,
+//         expert stride = nrows_x * (ncols_x / QK8_0) block_q8_0s.
+//   vy  : [total_input_rows, k_padded/QK8_1] Q8_1 activations, where
+//         `total_input_rows = batch * input_dim1`.
+//   ids : [batch, topk] expert indices (unsigned int).
+//   dst : [batch, topk, nrows_x] f32.
+//
+//   input_dim1 == 1    — shared input across topk slots (gate/up).
+//   input_dim1 == topk — per-slot input (down, silu_mul(gate,up)).
+//
+// Grid: ((nrows_x+1)/2, topk, batch). Block: (64, 1, 1).
+// Each block writes 2 output rows for one (batch, topk_slot).
+// Half-warp cooperates on each output row.
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q8_0_q8_1_moe_warp_coop(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    const unsigned int * __restrict__ ids,
+    float * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int weight_expert_stride_blocks,
+    const int input_task_stride_blocks,
+    const int input_dim1)
+{
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;
+    const int row_offset = lane_id >> 5;
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int topk_slot = blockIdx.y;
+    const int batch_idx = blockIdx.z;
+    const int task_id = batch_idx * gridDim.y + topk_slot;
+    const unsigned int expert_id = ids[task_id];
+    const int input_idx = (input_dim1 == 1) ? batch_idx : task_id;
+
+    const int blocks_per_row = ncols_x / QK8_0;
+
+    const block_q8_0 * x = (const block_q8_0 *) vx
+        + expert_id * weight_expert_stride_blocks
+        + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy
+        + input_idx * input_task_stride_blocks;
+
+    float sumf = 0.0f;
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        const block_q8_0 * bq8_0 = x + ib;
+        const block_q8_1 * bq8_1 = y + ib;
+
+        // 128-bit vectorised Q8_0 weight + Q8_1 activation loads, then
+        // 8× dp4a (same body as mul_mat_vec_q8_0_q8_1_cuda1).
+        const int4 v_lo = *((const int4 *)(bq8_0->qs));
+        const int4 v_hi = *((const int4 *)(bq8_0->qs + 16));
+        const int4 u_lo = *((const int4 *)(bq8_1->qs));
+        const int4 u_hi = *((const int4 *)(bq8_1->qs + 16));
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(v_lo.x, u_lo.x, sumi);
+        sumi = ggml_cuda_dp4a(v_lo.y, u_lo.y, sumi);
+        sumi = ggml_cuda_dp4a(v_lo.z, u_lo.z, sumi);
+        sumi = ggml_cuda_dp4a(v_lo.w, u_lo.w, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.x, u_hi.x, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.y, u_hi.y, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.z, u_hi.z, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.w, u_hi.w, sumi);
+
+        const float d0 = __half2float(bq8_0->d);
+        const float d1 = __low2float(bq8_1->ds);
+        sumf += d0 * d1 * (float) sumi;
+    }
+
+    sumf = gfx906_half_warp_reduce_sum<32>(sumf);
+    if (half_lane == 0) {
+        dst[task_id * nrows_x + row] = sumf;
+    }
+}
+
+// ============================================================================
 // gfx906 warp-cooperative MMVQ kernels for K-quants (Q4_K, Q5_K, Q6_K)
 // ============================================================================
 //

@@ -1515,87 +1515,86 @@ fn launch_indexed_moe_forward_with_q8(
     let topk = idx_shape.dims()[1];
     let k_padded = pad(k, MATRIX_ROW_PADDING);
 
-    // W3 — decode gather-by-expert (b_size=1). Replaces the fused
-    // `indexed_moe_forward_{dtype}_q8_1` kernel with a per-expert
-    // warp-cooperative MMVQ loop for eligible dtypes.
+    // W3-rev2 — MoE-aware warp-coop MMVQ for decode (b_size=1).
+    // Single-kernel dispatch mirroring llamacpp-turbo's
+    // `gfx906_mul_mat_vec_q8_0_warp_coop` pattern but with indexed
+    // expert lookup done inside the kernel via `ids[blockIdx.y]`. No
+    // CPU-side sync, no per-expert launch storm.
     //
-    // **Default: OFF** after the 2026-04-16 perf validation showed
-    // this path is a net loss on Gemma-4-26B-A4B decode. Per-call
-    // fused cost for decode (b_size=1) is ~112 µs; 8× MMVQ at 17 µs
-    // each is ~136 µs — **21% slower per equivalent work**. My
-    // initial analysis misread the aggregate profile: the 818 µs
-    // per-call average was driven by the 120 prefill calls (46 ms
-    // each), not the 7680 decode calls. See the W3-retro note in
-    // ROADMAP-DECODE-GAP-2026-04-16.md §W3 and MEMORY for the
-    // corrected numbers.
+    // The kernel is defined in `candle-hip-kernels/src/quantized.cu`.
+    // Grid is `((n+1)/2, topk, batch)` with 64-thread blocks — the
+    // same gfx906 occupancy config as the non-MoE warp-coop path
+    // (`mul_mat_vec_q8_0_q8_1_cuda1`), just parameterised on the
+    // expert index. Expected: ~35 µs/call vs 112 µs/call for the
+    // fused generic kernel, ~600 ms aggregate GPU savings on
+    // Gemma-4-26B-A4B decode.
     //
-    // Kept as opt-in infrastructure (`CANDLE_W3_GATHER=1`) because
-    // it may still help non-Gemma MoE shapes (e.g. Qwen3-Coder-30B-
-    // A3B at Q4_0 has different tile/occupancy economics).
+    // Default: **on** for Q8_0 b_size=1 MoE decode. Opt out via
+    // CANDLE_W3_GATHER=0. See ROADMAP-DECODE-GAP-2026-04-16.md §W3
+    // and `project_w3_retro_2026_04_16.md` for the rev1 retro
+    // (per-expert loop was slower than the generic fused kernel;
+    // reverted here in favour of this warp-coop variant).
     //
     // Covers both MoE input layouts:
     //   input_dim1 == 1      — shared input (gate/up projections)
     //   input_dim1 == topk   — per-expert input (down projection)
     let w3_enabled = std::env::var("CANDLE_W3_GATHER")
-        .map_or(false, |v| v != "0");
+        .map_or(true, |v| v != "0");
     let w3_eligible = w3_enabled
         && batch == 1
         && (input_dim1 == 1 || input_dim1 == topk)
-        && matches!(w_dtype, GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0);
+        && matches!(w_dtype, GgmlDType::Q8_0);
     if w3_eligible {
-        // One D2H sync per call; at decode this reads `topk` u32s
-        // (typically 8 × 4 B = 32 B). MoE callers can amortise this by
-        // passing a cached CPU ids slice — see W3 step 4.
-        let ids_cpu = w3_cached_ids_take().map_or_else(
-            || dev.stream().clone_dtoh_view(ids).w(),
-            Ok,
-        )?;
-        if ids_cpu.len() < topk {
-            crate::bail!(
-                "W3 gather: ids has {} elements, need >= topk={}",
-                ids_cpu.len(),
-                topk
-            );
-        }
         let qk = w_dtype.block_size();
         let type_size = w_dtype.type_size();
-        let expert_stride = n * (k / qk) * type_size;
-        let weight_total = weight.len();
-        // Q8_1 per-row stride (bytes) in the input buffer.
-        let q8_1_row_bytes = (k_padded / GgmlDType::Q8_1.block_size())
-            * GgmlDType::Q8_1.type_size();
-        // SAFETY: MMVQ writes every element of `out` across the loop.
-        let out = unsafe { dev.alloc::<f32>(topk * n)? };
-        for slot in 0..topk {
-            let e = ids_cpu[slot] as usize;
-            let weight_offset = e * expert_stride;
-            if weight_offset + expert_stride > weight_total {
-                crate::bail!(
-                    "W3 gather: expert {e} slice [{}..{}] exceeds weight buffer len {}",
-                    weight_offset,
-                    weight_offset + expert_stride,
-                    weight_total
-                );
-            }
-            let w_view = weight.slice(weight_offset..weight_offset + expert_stride);
-            // Per-slot input: shared row (dim1=1) or slot-indexed row (dim1=topk).
-            let input_row_idx = if input_dim1 == 1 { 0 } else { slot };
-            let input_off_bytes = input_row_idx * q8_1_row_bytes;
-            let input_slot_view =
-                input_q8_1.slice(input_off_bytes..input_off_bytes + q8_1_row_bytes);
-            let dst_view = out.slice(slot * n..(slot + 1) * n);
-            launch_mul_mat_vec_q8_1_chunk_raw(
-                &w_view,
-                &input_slot_view,
-                &dst_view,
-                w_dtype,
-                /* ncols */ k,
-                /* nrows */ n,
-                /* b_size */ 1,
-                k_padded,
-                dev,
-            )?;
+        // Per-expert weight stride, in BLOCKS (not bytes) — the kernel
+        // multiplies by sizeof(block_q8_0) internally.
+        let weight_expert_stride_blocks = n * (k / qk);
+        // Q8_1 input: one row per input_dim1 slot, `k_padded / QK8_1`
+        // blocks per row.
+        let input_task_stride_blocks = k_padded / GgmlDType::Q8_1.block_size();
+
+        // Safety checks: ensure weight buffer is large enough for the
+        // highest expert we might index. Can't know without a CPU
+        // read, but validate the buffer covers all experts.
+        let weight_total_blocks = weight.len() / type_size;
+        let (n_experts, _, _) = w_shape.dims3()?;
+        if weight_expert_stride_blocks * n_experts > weight_total_blocks {
+            crate::bail!(
+                "W3 warp-coop: weight buffer has {} blocks, need {}",
+                weight_total_blocks,
+                weight_expert_stride_blocks * n_experts
+            );
         }
+
+        // SAFETY: kernel writes every (topk_slot, row) in the output.
+        let out = unsafe { dev.alloc::<f32>(topk * n)? };
+
+        let func = dev.get_or_load_func(
+            "mul_mat_vec_q8_0_q8_1_moe_warp_coop",
+            &candle_hip_kernels::QUANTIZED,
+        )?;
+        // Grid: ((n+1)/2 row-pairs, topk, batch).
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(2), topk as u32, batch as u32),
+            block_dim: (WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(weight);
+        builder.arg(input_q8_1);
+        builder.arg(ids);
+        builder.arg(&out);
+        barg!(
+            builder,
+            /* ncols_x */ k as i32,
+            /* nrows_x */ n as i32,
+            /* weight_expert_stride_blocks */ weight_expert_stride_blocks as i32,
+            /* input_task_stride_blocks */ input_task_stride_blocks as i32,
+            /* input_dim1 */ input_dim1 as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+
         let mut out_shape = in_shape.dims().to_vec();
         out_shape.pop();
         out_shape.push(n);
