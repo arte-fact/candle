@@ -37,7 +37,9 @@ FAMILY_RULES: list[tuple[str, re.Pattern]] = [
         r"mul_mat_vec_q<\(ggml_type\)8|"
         r"gfx906_mul_mat_vec_q8_0_warp_coop|mul_mat_vec_f<")),
     ("rmsnorm",          re.compile(r"\brmsnorm_|\brms_norm_f32\b")),
-    ("activation",       re.compile(r"\bugelu_f32\b|unary_gated_op")),
+    ("activation",       re.compile(
+        r"\bugelu_f32\b|unary_gated_op|"
+        r"silu_mul_split_last_f32|gelu_mul_split_last_f32")),
     ("quant_q8_1",       re.compile(r"quantize_q8_1|quantize_mmq_q8_1")),
     ("rope",             re.compile(r"\brope_f32\b|rope_neox")),
     ("kv_index",         re.compile(r"k_set_rows|k_get_rows_float")),

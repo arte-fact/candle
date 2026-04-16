@@ -287,7 +287,7 @@ SILU_MUL_OP(hip_bfloat16,  silu_mul_bf16)
 // session. Saves 2 × 5120 = 10 240 `ucopy_f32` launches + 2 buffer
 // allocations per call.
 
-#define SILU_MUL_SPLIT_LAST_OP(TYPENAME, FN_NAME)                              \
+#define ACT_MUL_SPLIT_LAST_OP(TYPENAME, ACT_FN, FN_NAME)                       \
 extern "C" __global__ void FN_NAME(                                            \
     const size_t numel,       /* output element count == N * outer */         \
     const size_t half_row,    /* N — per-row half dim */                      \
@@ -308,11 +308,12 @@ extern "C" __global__ void FN_NAME(                                            \
         const size_t in_up   = in_gate + half_row;                             \
         const TYPENAME g = gate_up[in_gate];                                   \
         const TYPENAME u = gate_up[in_up];                                     \
-        out[i] = silu_fwd(g) * u;                                              \
+        out[i] = ACT_FN(g) * u;                                                \
     }                                                                          \
 }
 
-SILU_MUL_SPLIT_LAST_OP(float, silu_mul_split_last_f32)
+ACT_MUL_SPLIT_LAST_OP(float, silu_fwd, silu_mul_split_last_f32)
+ACT_MUL_SPLIT_LAST_OP(float, gelu_fwd, gelu_mul_split_last_f32)
 
 // ---------------------------------------------------------------------------
 // Fused softplus: out[i] = log(1 + exp(x[i])), numerically stable form

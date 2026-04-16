@@ -22,10 +22,10 @@ pub use device::{HipDevice, DeviceId};
 pub use error::{HipError, WrapErr};
 pub use flash_attn::{flash_attn_decode_strided, flash_attn_decode_strided_split_k, flash_attn_fused, flash_attn_v2_fused, flash_attn_v2_kt_fused, flash_attn_v2_kt_strided_v, flash_attn_v2_kt_strided_v_dyn, gqa_attention_decode_gemv, gqa_attention_decode_mv};
 pub use fused_pointwise::{
-    fused_ffn_decode_q4_0, gelu_mul_quantize_q8_1_fused, gemma4_router_prep_fused,
-    l2_norm_fused, masked_softmax_scale_fused, moe_combine_weighted_sum_fused,
-    rms_norm_post_residual_fused, rmsnorm_q8_fused, silu_mul_split_last_fused,
-    softplus_fused, topk_moe_norm_fused,
+    fused_ffn_decode_q4_0, gelu_mul_quantize_q8_1_fused, gelu_mul_split_last_fused,
+    gemma4_router_prep_fused, l2_norm_fused, masked_softmax_scale_fused,
+    moe_combine_weighted_sum_fused, rms_norm_post_residual_fused, rmsnorm_q8_fused,
+    silu_mul_split_last_fused, softplus_fused, topk_moe_norm_fused,
 };
 pub use gated_delta_net::gated_delta_net_step_fused;
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
@@ -43,6 +43,54 @@ macro_rules! barg {
 pub enum SlicePtrOrNull<T> {
     Ptr(HipSlice<T>),
     Null(NullDevicePtr),
+}
+
+// W5: diagnostic trace for `copy_strided_src`. On `CANDLE_TRACE_UCOPY=N`,
+// prints a stack trace for the first N strided-copy launches, plus a
+// one-line summary on every subsequent 100th call. Zero overhead when
+// unset (one atomic load on the cached disabled flag).
+static UCOPY_TRACE_LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static UCOPY_TRACE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn trace_ucopy_maybe(src_l: &Layout, el_count: usize) {
+    let limit = *UCOPY_TRACE_LIMIT.get_or_init(|| {
+        std::env::var("CANDLE_TRACE_UCOPY")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    if limit == 0 {
+        return;
+    }
+    let n = UCOPY_TRACE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let verbose = n < limit;
+    if !verbose && (n % 100 != 0) {
+        return;
+    }
+    let shape = src_l.shape();
+    let strides = src_l.stride();
+    eprintln!(
+        "[UCOPY #{n}] shape={:?} strides={:?} el={} off={}",
+        shape.dims(),
+        strides,
+        el_count,
+        src_l.start_offset()
+    );
+    if verbose {
+        // Rust 1.65+: std::backtrace::Backtrace::force_capture
+        let bt = std::backtrace::Backtrace::force_capture();
+        // Filter out the stdlib + builtin frames — keep only frames that
+        // mention candle or quantized_* models.
+        for line in format!("{bt}").lines() {
+            if line.contains("candle")
+                || line.contains("quantized_")
+                || line.contains("hip_backend")
+            {
+                eprintln!("    {line}");
+            }
+        }
+    }
 }
 
 impl<T: DeviceRepr> SlicePtrOrNull<T> {
@@ -2131,6 +2179,11 @@ impl BackendStorage for HipStorage {
         if el_count == 0 {
             return Ok(());
         }
+        // W5 diagnostic: CANDLE_TRACE_UCOPY=N prints a stack trace for
+        // the first N strided copies + every Nth subsequent call.
+        // Lets us spot which model-forward callsites are firing the
+        // most `Tensor::contiguous()` / strided-copy kernels.
+        trace_ucopy_maybe(src_l, el_count);
         let cfg = LaunchConfig::for_num_elems(el_count as u32);
         let dev = &self.device;
         let ds = SlicePtrOrNull::params_from_layout(dev, src_l)?;

@@ -398,8 +398,9 @@ Projections per phase (non-additive: dependencies and diminishing-returns noted)
 | + W3a (fused moe-combine — **landed**) | 44.81 | 0.67× | 282 s | 13,181 |
 | + W3-rev2 (MoE warp-coop Q8_0 — **landed**) | 46.37 | 0.695× | 282 s | 13,181 |
 | + W3d (gelu_mul_quantize fused — **landed**) | 47.45 | 0.711× | 282 s | 13,181 |
-| + W1 (pool threshold 1 MiB → 64 MiB — **landed**) | **47.65** | **0.714×** | 282 s | ~1,100 |
-| + W1b (pool diagnostics / further tuning) | ~49 | 0.73× | ~50 s | 0 |
+| + W1 (pool threshold 1 MiB → 64 MiB — **landed**) | 47.65 | 0.714× | 282 s | ~1,100 |
+| + W5 (gelu_mul_split_last fused — **landed partial**) | **47.68** | **0.715×** | ~280 s | ~1,100 |
+| + W5b (attention transpose fast-path) | ~49 | 0.73× | ~50 s | 0 |
 | + W5 (ucopy clean) | ~56 | 0.84× | ~45 s | 0 |
 | + W2 (peer-to-peer) | ~59 | 0.88× | ~40 s | 0 |
 | + W6 (param bin_bcast) | ~62 | 0.93× | ~35 s | 0 |

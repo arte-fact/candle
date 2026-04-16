@@ -125,27 +125,40 @@ pub fn softplus_fused(x: &Tensor) -> Result<Tensor> {
 /// A fresh f32 tensor with the same shape as `gate_up` except the last
 /// dim is halved.
 pub fn silu_mul_split_last_fused(gate_up: &Tensor) -> Result<Tensor> {
+    act_mul_split_last_fused_impl(gate_up, "silu_mul_split_last_f32")
+}
+
+/// W5: GELU variant of `silu_mul_split_last_fused` for Gemma-family
+/// DenseMlps (`activation = gelu`). Same fused single-pass pattern that
+/// reads the fused gate_up matmul output in-place and eliminates the
+/// two `.narrow(...).contiguous()` copies.
+pub fn gelu_mul_split_last_fused(gate_up: &Tensor) -> Result<Tensor> {
+    act_mul_split_last_fused_impl(gate_up, "gelu_mul_split_last_f32")
+}
+
+fn act_mul_split_last_fused_impl(
+    gate_up: &Tensor,
+    kernel_name: &'static str,
+) -> Result<Tensor> {
     let dev = match gate_up.device() {
         Device::Hip(d) => d.clone(),
-        _ => crate::bail!("silu_mul_split_last_fused: input must be on HIP"),
+        _ => crate::bail!("{kernel_name}: input must be on HIP"),
     };
     if gate_up.dtype() != DType::F32 {
         crate::bail!(
-            "silu_mul_split_last_fused: input must be f32, got {:?}",
+            "{kernel_name}: input must be f32, got {:?}",
             gate_up.dtype()
         );
     }
     if !gate_up.is_contiguous() {
-        crate::bail!("silu_mul_split_last_fused: input must be contiguous");
+        crate::bail!("{kernel_name}: input must be contiguous");
     }
     let dims = gate_up.dims();
     let last = *dims
         .last()
-        .ok_or_else(|| crate::Error::Msg("silu_mul_split_last_fused: empty shape".into()))?;
+        .ok_or_else(|| crate::Error::Msg(format!("{kernel_name}: empty shape")))?;
     if last % 2 != 0 {
-        crate::bail!(
-            "silu_mul_split_last_fused: last dim must be even, got {last}"
-        );
+        crate::bail!("{kernel_name}: last dim must be even, got {last}");
     }
     let half_row = last / 2;
     let out_numel: usize = dims[..dims.len() - 1].iter().product::<usize>() * half_row;
@@ -158,18 +171,18 @@ pub fn silu_mul_split_last_fused(gate_up: &Tensor) -> Result<Tensor> {
     let (x_st, x_l) = gate_up.storage_and_layout();
     let x_hip = match &*x_st {
         Storage::Hip(s) => s,
-        _ => crate::bail!("silu_mul_split_last_fused: storage is not HIP"),
+        _ => crate::bail!("{kernel_name}: storage is not HIP"),
     };
     let x_slice = x_hip.as_hip_slice::<f32>()?;
     let x_view = match x_l.contiguous_offsets() {
         Some((lo, hi)) => x_slice.slice(lo..hi),
-        None => crate::bail!("silu_mul_split_last_fused: non-contiguous storage"),
+        None => crate::bail!("{kernel_name}: non-contiguous storage"),
     };
 
     // SAFETY: populated by the kernel below.
     let out = unsafe { dev.alloc::<f32>(out_numel)? };
 
-    let func = dev.get_or_load_func("silu_mul_split_last_f32", &kernels::UNARY)?;
+    let func = dev.get_or_load_func(kernel_name, &kernels::UNARY)?;
 
     const BLOCK: u32 = 256;
     let grid = ((out_numel as u32) + BLOCK - 1) / BLOCK;
