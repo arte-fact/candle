@@ -47,6 +47,15 @@ pub enum CounterSlot {
     /// head_dim * sizeof(T) bytes). One slot suffices for all rope
     /// calls in a forward pass.
     RopeOffsetBytes = 1,
+    /// Current token count (= index_pos + seq_len = total KV length)
+    /// for `const_set_f32_ctr` and `copy2d_f32_ctr`. These kernels
+    /// need the live KV sequence length to size their output or
+    /// compute strides.
+    CurrentT = 2,
+    /// Number of K-chunks for `gqa_decode_split_chunk_d{256,512}_f32_ctr`
+    /// and `gqa_decode_split_combine_d{256,512}_f32_ctr`. Derived
+    /// from `ceil(L_k_iter / chunk_t)`.
+    NChunks = 3,
 }
 
 /// Number of slots; sized for 16 future counters.

@@ -871,10 +871,18 @@ impl DecodePlan {
     /// Call this once before each replay (tokens 5, 6, 7, ...).
     pub fn advance_counters(&mut self) {
         self.replay_count += 1;
-        let skip_ptr = std::env::var("CANDLE_G2_SKIP_PTR_ADVANCE").is_ok();
-        let skip_scalar = std::env::var("CANDLE_G2_SKIP_SCALAR_ADVANCE").is_ok();
-        let skip_delta: Option<i64> = std::env::var("CANDLE_G2_SKIP_DELTA")
-            .ok().and_then(|s| s.parse().ok());
+        // Pre-compute env-var checks ONCE per call, not per arg.
+        // (Before this fix, 3 env::var lookups × 132 iterations = 396
+        // syscalls per replay — measured as ~0.5 ms on Linux.)
+        static SKIP_PTR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SKIP_SCALAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SKIP_DELTA: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+        let skip_ptr = *SKIP_PTR.get_or_init(|| std::env::var("CANDLE_G2_SKIP_PTR_ADVANCE").is_ok());
+        let skip_scalar = *SKIP_SCALAR.get_or_init(|| std::env::var("CANDLE_G2_SKIP_SCALAR_ADVANCE").is_ok());
+        let skip_delta = *SKIP_DELTA.get_or_init(|| {
+            std::env::var("CANDLE_G2_SKIP_DELTA")
+                .ok().and_then(|s| s.parse().ok())
+        });
         for (i, dyn_indices) in self.dynamic_args.iter().enumerate() {
             for (k, &arg_idx) in dyn_indices.iter().enumerate() {
                 if let DynArgKind::Counter(delta) = self.dynamic_kinds[i][k] {
@@ -1006,8 +1014,12 @@ impl DecodePlan {
     /// sentinel keeps them alive). Dynamic args must have been
     /// advanced/patched before calling this.
     pub unsafe fn replay(&self, dev: &HipDevice) -> crate::Result<()> {
-        let debug = std::env::var("CANDLE_G2_DEBUG").is_ok();
-        let trace_replay = std::env::var("CANDLE_G2_V1_TRACE").is_ok();
+        // Cache env-var checks so they don't fire 3 syscalls per replay.
+        static DEBUG_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static TRACE_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static OP_PROFILE_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let debug = *DEBUG_FLAG.get_or_init(|| std::env::var("CANDLE_G2_DEBUG").is_ok());
+        let trace_replay = *TRACE_FLAG.get_or_init(|| std::env::var("CANDLE_G2_V1_TRACE").is_ok());
         if trace_replay {
             let n_memcpy = self.ops.iter().filter(|o| o.is_memcpy()).count();
             eprintln!(
@@ -1025,7 +1037,7 @@ impl DecodePlan {
         // by kernel name. Prints a sorted summary at the end. This is
         // expensive (forces serial GPU execution) so use only for
         // diagnostics.
-        let op_profile = std::env::var("CANDLE_G2_OP_PROFILE").is_ok();
+        let op_profile = *OP_PROFILE_FLAG.get_or_init(|| std::env::var("CANDLE_G2_OP_PROFILE").is_ok());
 
         // Multi-device: track the active device ordinal and only call
         // `hipSetDevice` when it changes. Single-device plans pay one
