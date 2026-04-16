@@ -961,6 +961,164 @@ static __device__ __forceinline__ void gqa_decode_mv_fast_impl(
     }
 }
 
+// ------------------------------------------------------------------
+// F16 K/V variant — same kernel shape but K and V are stored as __half
+// in the KV cache. Q stays F32, mask stays F32, output stays F32.
+// Cuts KV-cache HBM bandwidth ~2× vs the all-F32 path; upcast to F32
+// happens per-element after the VMEM load, so the math pipeline is
+// unchanged. Paired with the Rust-side KvCache::new_with_dtype(F16)
+// opt-in under CANDLE_KV_F16=1.
+// ------------------------------------------------------------------
+template <int D, int BLOCK_SIZE>
+static __device__ __forceinline__ void gqa_decode_mv_fast_f16kv_impl(
+    const float * __restrict__ q,
+    const __half * __restrict__ k,
+    const __half * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep,
+    int mask_b_stride, int L_k_iter)
+{
+    static_assert(D % 2 == 0, "D must be even");
+    static_assert(BLOCK_SIZE == WARP_SIZE, "f16kv fast impl: single-warp block");
+    static_assert(D / 2 >= BLOCK_SIZE, "D/2 must be >= BLOCK_SIZE");
+    static_assert((D / 2) % BLOCK_SIZE == 0, "D/2 must be a multiple of BLOCK_SIZE");
+    constexpr int NCOLS2 = D / 2;
+    constexpr int F2_PER_LANE = NCOLS2 / BLOCK_SIZE;
+
+    const int h_idx = blockIdx.y;
+    const int b_idx = blockIdx.z;
+    const int lane  = threadIdx.x;
+    const int h_kv  = (n_rep > 1) ? (h_idx / n_rep) : h_idx;
+
+    const int64_t q_off  = ((int64_t)(b_idx * H_q) + h_idx) * D;
+    const int64_t kv_off = ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)L_k * D;
+
+    const float2  * q2       = (const float2  *)(q + q_off);
+    const __half2 * k2_base  = (const __half2 *)(k + kv_off);
+    const __half2 * v2_base  = (const __half2 *)(v + kv_off);
+    float *         o_ptr    = out + q_off;
+
+    const float * mask_row = (mask != nullptr)
+        ? mask + (int64_t)b_idx * (int64_t)mask_b_stride
+        : nullptr;
+
+    // Q stays F32 — same float2 register pattern as the F32 kernel.
+    float2 q_reg[F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        q_reg[i] = q2[lane + i * BLOCK_SIZE];
+    }
+    float o_reg[2 * F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < 2 * F2_PER_LANE; ++i) o_reg[i] = 0.0f;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    const int L_k_effective = (L_k_iter >= 0) ? L_k_iter : L_k;
+
+    for (int t = 0; t < L_k_effective; ++t) {
+        const __half2 * k_row = k2_base + (int64_t)t * NCOLS2;
+        const __half2 * v_row = v2_base + (int64_t)t * NCOLS2;
+
+        // Issue K and V loads together (half the VMEM bytes vs the
+        // float2 path — D=256 becomes 512 B/row instead of 1 KiB).
+        __half2 k_vals_h[F2_PER_LANE];
+        __half2 v_vals_h[F2_PER_LANE];
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            k_vals_h[i] = k_row[lane + i * BLOCK_SIZE];
+            v_vals_h[i] = v_row[lane + i * BLOCK_SIZE];
+        }
+
+        // Q · K — upcast K to f32 per element.
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            const float2 k_f = __half22float2(k_vals_h[i]);
+            partial += q_reg[i].x * k_f.x + q_reg[i].y * k_f.y;
+        }
+
+        float s_t = v2_warp_reduce_sum(partial) * scale;
+        if (mask_row != nullptr) s_t += mask_row[t];
+
+        const float m_new = fmaxf(m_i, s_t);
+        const float alpha = gfx906_fast_exp(m_i - m_new);
+        const float p     = gfx906_fast_exp(s_t - m_new);
+
+        // V · attn accumulate — upcast V to f32 per element.
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            const float2 v_f = __half22float2(v_vals_h[i]);
+            o_reg[2*i]     = alpha * o_reg[2*i]     + p * v_f.x;
+            o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * v_f.y;
+        }
+
+        l_i = alpha * l_i + p;
+        m_i = m_new;
+    }
+
+    const float inv_l = gfx906_rcp(l_i);
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        const int base = 2 * (lane + i * BLOCK_SIZE);
+        o_ptr[base]     = o_reg[2*i]     * inv_l;
+        o_ptr[base + 1] = o_reg[2*i + 1] * inv_l;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d256_f16kv(
+    const float * __restrict__ q, const __half * __restrict__ k,
+    const __half * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_fast_f16kv_impl<256, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                           scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d512_f16kv(
+    const float * __restrict__ q, const __half * __restrict__ k,
+    const __half * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, int L_k_iter)
+{
+    gqa_decode_mv_fast_f16kv_impl<512, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                           scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d256_f16kv_ctr(
+    const float * __restrict__ q, const __half * __restrict__ k,
+    const __half * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, const int * __restrict__ L_k_iter_ptr)
+{
+    const int L_k_iter = *L_k_iter_ptr;
+    gqa_decode_mv_fast_f16kv_impl<256, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                           scale, n_rep, mask_b_stride, L_k_iter);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_mv_fast_d512_f16kv_ctr(
+    const float * __restrict__ q, const __half * __restrict__ k,
+    const __half * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ out,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride, const int * __restrict__ L_k_iter_ptr)
+{
+    const int L_k_iter = *L_k_iter_ptr;
+    gqa_decode_mv_fast_f16kv_impl<512, 64>(q, k, v, mask, out, B, H_q, H_kv, L_k,
+                                           scale, n_rep, mask_b_stride, L_k_iter);
+}
+
 extern "C" __global__ void __launch_bounds__(64, 1)
 gqa_decode_mv_fast_d256_f32(
     const float * __restrict__ q, const float * __restrict__ k,
@@ -1166,6 +1324,144 @@ static __device__ __forceinline__ void gqa_decode_split_chunk_impl(
         partial_m[pml_off] = m_i;
         partial_l[pml_off] = l_i;
     }
+}
+
+// F16 K/V variant — same chunk split, but K and V are __half in HBM.
+template <int D, int BLOCK_SIZE>
+static __device__ __forceinline__ void gqa_decode_split_chunk_f16kv_impl(
+    const float * __restrict__ q,
+    const __half * __restrict__ k,
+    const __half * __restrict__ v,
+    const float * __restrict__ mask,
+    float * __restrict__ partial_o,
+    float * __restrict__ partial_m,
+    float * __restrict__ partial_l,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep,
+    int mask_b_stride, int chunk_t, int n_chunks)
+{
+    static_assert(D % 2 == 0, "D must be even");
+    static_assert(BLOCK_SIZE == WARP_SIZE, "split f16kv: single-warp block");
+    static_assert(D / 2 >= BLOCK_SIZE, "D/2 must be >= BLOCK_SIZE");
+    static_assert((D / 2) % BLOCK_SIZE == 0, "D/2 must be multiple of BLOCK_SIZE");
+    constexpr int NCOLS2 = D / 2;
+    constexpr int F2_PER_LANE = NCOLS2 / BLOCK_SIZE;
+
+    const int chunk_idx = blockIdx.x;
+    const int h_idx     = blockIdx.y;
+    const int b_idx     = blockIdx.z;
+    const int lane      = threadIdx.x;
+
+    const int t0 = chunk_idx * chunk_t;
+    if (t0 >= L_k) return;
+    const int t1 = (t0 + chunk_t < L_k) ? (t0 + chunk_t) : L_k;
+
+    const int h_kv = (n_rep > 1) ? (h_idx / n_rep) : h_idx;
+
+    const int64_t q_off  = ((int64_t)(b_idx * H_q) + h_idx) * D;
+    const int64_t kv_off = ((int64_t)(b_idx * H_kv) + h_kv) * (int64_t)L_k * D;
+
+    const float2  * q2       = (const float2  *)(q + q_off);
+    const __half2 * k2_base  = (const __half2 *)(k + kv_off);
+    const __half2 * v2_base  = (const __half2 *)(v + kv_off);
+
+    const float * mask_row = (mask != nullptr)
+        ? mask + (int64_t)b_idx * (int64_t)mask_b_stride
+        : nullptr;
+
+    float2 q_reg[F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        q_reg[i] = q2[lane + i * BLOCK_SIZE];
+    }
+    float o_reg[2 * F2_PER_LANE];
+    #pragma unroll
+    for (int i = 0; i < 2 * F2_PER_LANE; ++i) o_reg[i] = 0.0f;
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    for (int t = t0; t < t1; ++t) {
+        const __half2 * k_row = k2_base + (int64_t)t * NCOLS2;
+        const __half2 * v_row = v2_base + (int64_t)t * NCOLS2;
+
+        __half2 k_vals_h[F2_PER_LANE];
+        __half2 v_vals_h[F2_PER_LANE];
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            k_vals_h[i] = k_row[lane + i * BLOCK_SIZE];
+            v_vals_h[i] = v_row[lane + i * BLOCK_SIZE];
+        }
+
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            const float2 k_f = __half22float2(k_vals_h[i]);
+            partial += q_reg[i].x * k_f.x + q_reg[i].y * k_f.y;
+        }
+
+        float s_t = v2_warp_reduce_sum(partial) * scale;
+        if (mask_row != nullptr) s_t += mask_row[t];
+
+        const float m_new = fmaxf(m_i, s_t);
+        const float alpha = gfx906_fast_exp(m_i - m_new);
+        const float p     = gfx906_fast_exp(s_t - m_new);
+
+        #pragma unroll
+        for (int i = 0; i < F2_PER_LANE; ++i) {
+            const float2 v_f = __half22float2(v_vals_h[i]);
+            o_reg[2*i]     = alpha * o_reg[2*i]     + p * v_f.x;
+            o_reg[2*i + 1] = alpha * o_reg[2*i + 1] + p * v_f.y;
+        }
+        l_i = alpha * l_i + p;
+        m_i = m_new;
+    }
+
+    const int64_t pml_off = ((int64_t)(b_idx * H_q) + h_idx) * (int64_t)n_chunks + chunk_idx;
+    const int64_t po_off  = pml_off * (int64_t)D;
+    float * po_ptr = partial_o + po_off;
+    #pragma unroll
+    for (int i = 0; i < F2_PER_LANE; ++i) {
+        const int base = 2 * (lane + i * BLOCK_SIZE);
+        po_ptr[base]     = o_reg[2*i];
+        po_ptr[base + 1] = o_reg[2*i + 1];
+    }
+    if (lane == 0) {
+        partial_m[pml_off] = m_i;
+        partial_l[pml_off] = l_i;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_split_chunk_d256_f16kv(
+    const float * __restrict__ q, const __half * __restrict__ k,
+    const __half * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ partial_o,
+    float * __restrict__ partial_m,
+    float * __restrict__ partial_l,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride,
+    int chunk_t, int n_chunks)
+{
+    gqa_decode_split_chunk_f16kv_impl<256, 64>(
+        q, k, v, mask, partial_o, partial_m, partial_l,
+        B, H_q, H_kv, L_k, scale, n_rep, mask_b_stride, chunk_t, n_chunks);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+gqa_decode_split_chunk_d512_f16kv(
+    const float * __restrict__ q, const __half * __restrict__ k,
+    const __half * __restrict__ v, const float * __restrict__ mask,
+    float * __restrict__ partial_o,
+    float * __restrict__ partial_m,
+    float * __restrict__ partial_l,
+    int B, int H_q, int H_kv, int L_k,
+    float scale, int n_rep, int mask_b_stride,
+    int chunk_t, int n_chunks)
+{
+    gqa_decode_split_chunk_f16kv_impl<512, 64>(
+        q, k, v, mask, partial_o, partial_m, partial_l,
+        B, H_q, H_kv, L_k, scale, n_rep, mask_b_stride, chunk_t, n_chunks);
 }
 
 extern "C" __global__ void __launch_bounds__(64, 1)

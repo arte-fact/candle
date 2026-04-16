@@ -1433,8 +1433,14 @@ pub fn gqa_attention_decode_mv(
             k.dims(), q.dims()
         );
     }
-    if !k.is_contiguous() || k.dtype() != DType::F32 {
-        crate::bail!("gqa_attention_decode_mv: k must be f32 contiguous");
+    if !k.is_contiguous() {
+        crate::bail!("gqa_attention_decode_mv: k must be contiguous");
+    }
+    if k.dtype() != DType::F32 && k.dtype() != DType::F16 {
+        crate::bail!(
+            "gqa_attention_decode_mv: k dtype must be f32 or f16, got {:?}",
+            k.dtype()
+        );
     }
     let (vb, v_nkv, v_lk, vd) = v.dims4()?;
     if (vb, v_nkv, v_lk, vd) != (b, n_kv, l_k_alloc, d) {
@@ -1443,9 +1449,19 @@ pub fn gqa_attention_decode_mv(
             v.dims(), (b, n_kv, l_k_alloc, d)
         );
     }
-    if !v.is_contiguous() || v.dtype() != DType::F32 {
-        crate::bail!("gqa_attention_decode_mv: v must be f32 contiguous");
+    if !v.is_contiguous() {
+        crate::bail!("gqa_attention_decode_mv: v must be contiguous");
     }
+    if v.dtype() != k.dtype() {
+        crate::bail!(
+            "gqa_attention_decode_mv: k ({:?}) and v ({:?}) must share dtype",
+            k.dtype(), v.dtype()
+        );
+    }
+    // F16 K/V path: reduces HBM bandwidth ~2x vs F32. The attention math
+    // still runs in f32 internally (Q stays f32, output stays f32); only
+    // the VMEM loads from the KV cache are halved.
+    let kv_is_f16 = k.dtype() == DType::F16;
     if n_head % n_kv != 0 {
         crate::bail!("gqa_attention_decode_mv: n_head % n_kv != 0");
     }
@@ -1479,7 +1495,18 @@ pub fn gqa_attention_decode_mv(
     let g2_enabled = std::env::var("CANDLE_G2_REPLAY")
         .map(|v| v != "0" && v != "false")
         .unwrap_or(false);
-    let (kernel_name, block_dim_x): (&str, u32) = if use_fast {
+    // F16 K/V falls back to F32 kernels when `use_fast == false` (head
+    // dims outside {256, 512}) — no F16 variants exist for those yet,
+    // so we keep F32 as the floor.
+    let (kernel_name, block_dim_x): (&str, u32) = if use_fast && kv_is_f16 {
+        match (d, g2_enabled) {
+            (256, true)  => ("gqa_decode_mv_fast_d256_f16kv_ctr", WARP_SIZE),
+            (256, false) => ("gqa_decode_mv_fast_d256_f16kv",     WARP_SIZE),
+            (512, true)  => ("gqa_decode_mv_fast_d512_f16kv_ctr", WARP_SIZE),
+            (512, false) => ("gqa_decode_mv_fast_d512_f16kv",     WARP_SIZE),
+            _ => unreachable!(),
+        }
+    } else if use_fast {
         match (d, g2_enabled) {
             (256, true)  => ("gqa_decode_mv_fast_d256_f32_ctr", WARP_SIZE),
             (256, false) => ("gqa_decode_mv_fast_d256_f32",     WARP_SIZE),
@@ -1488,6 +1515,11 @@ pub fn gqa_attention_decode_mv(
             _ => unreachable!(),
         }
     } else {
+        if kv_is_f16 {
+            crate::bail!(
+                "gqa_attention_decode_mv: F16 K/V only supported with use_fast=true (D in {{256, 512}}), got D={d}"
+            );
+        }
         match d {
             64 => ("gqa_decode_mv_d64_f32", WARP_SIZE),
             128 => ("gqa_decode_mv_d128_f32", WARP_SIZE),
@@ -1532,9 +1564,27 @@ pub fn gqa_attention_decode_mv(
             sl.slice(off..sl.len())
         }};
     }
+    macro_rules! hv_f16 {
+        ($s:expr, $l:expr) => {{
+            let h = match &*$s { Storage::Hip(s) => s, _ => panic!("not HIP") };
+            let sl = h.as_hip_slice::<half::f16>()?;
+            let off = $l.start_offset();
+            sl.slice(off..sl.len())
+        }};
+    }
     let q_v = hv!(q_st, q_l);
-    let k_v = hv!(k_st, k_l);
-    let v_v = hv!(v_st, v_l);
+    // K/V can be either F32 or F16; extract per dtype. We hold both
+    // `Option`s so the same unified dispatch block below can pick.
+    let (k_v_f32, k_v_f16) = if kv_is_f16 {
+        (None, Some(hv_f16!(k_st, k_l)))
+    } else {
+        (Some(hv!(k_st, k_l)), None)
+    };
+    let (v_v_f32, v_v_f16) = if kv_is_f16 {
+        (None, Some(hv_f16!(v_st, v_l)))
+    } else {
+        (Some(hv!(v_st, v_l)), None)
+    };
     let m_v = m_owned.as_ref().map(|(st, l)| {
         let h = match &**st { Storage::Hip(s) => s, _ => panic!("not HIP") };
         let sl = h.as_hip_slice::<f32>().unwrap();
@@ -1600,9 +1650,11 @@ pub fn gqa_attention_decode_mv(
         let scratch_m = unsafe { dev.alloc::<f32>(b * n_head * n_chunks)? };
         let scratch_l = unsafe { dev.alloc::<f32>(b * n_head * n_chunks)? };
 
-        let split_name = match d {
-            256 => "gqa_decode_split_chunk_d256_f32",
-            512 => "gqa_decode_split_chunk_d512_f32",
+        let split_name = match (d, kv_is_f16) {
+            (256, false) => "gqa_decode_split_chunk_d256_f32",
+            (512, false) => "gqa_decode_split_chunk_d512_f32",
+            (256, true)  => "gqa_decode_split_chunk_d256_f16kv",
+            (512, true)  => "gqa_decode_split_chunk_d512_f16kv",
             _ => unreachable!(),
         };
         let combine_name = match d {
@@ -1629,7 +1681,12 @@ pub fn gqa_attention_decode_mv(
         let n_chunks_i = n_chunks as i32;
 
         let mut bld = split_func.builder();
-        bld.arg(&q_v); bld.arg(&k_v); bld.arg(&v_v);
+        bld.arg(&q_v);
+        if kv_is_f16 {
+            bld.arg(k_v_f16.as_ref().unwrap()); bld.arg(v_v_f16.as_ref().unwrap());
+        } else {
+            bld.arg(k_v_f32.as_ref().unwrap()); bld.arg(v_v_f32.as_ref().unwrap());
+        }
         match m_v.as_ref() {
             Some(v) => { bld.arg(v); }
             None => { bld.arg(&hipdarc::driver::NullDevicePtr::default()); }
@@ -1676,7 +1733,12 @@ pub fn gqa_attention_decode_mv(
         };
 
         let mut bld = func.builder();
-        bld.arg(&q_v); bld.arg(&k_v); bld.arg(&v_v);
+        bld.arg(&q_v);
+        if kv_is_f16 {
+            bld.arg(k_v_f16.as_ref().unwrap()); bld.arg(v_v_f16.as_ref().unwrap());
+        } else {
+            bld.arg(k_v_f32.as_ref().unwrap()); bld.arg(v_v_f32.as_ref().unwrap());
+        }
         match m_v.as_ref() {
             Some(v) => { bld.arg(v); }
             None => { bld.arg(&hipdarc::driver::NullDevicePtr::default()); }
