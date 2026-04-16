@@ -99,9 +99,18 @@ impl ModelWeights {
         let embed_tensor = gg.tensor("token_embd.weight")?;
         let embed_tokens = Embedding::new(embed_tensor.dequantize(dev0)?, cfg.hidden_size);
 
-        // Parallel per-layer load. Each rayon worker gets its own cheap Gguf
-        // clone (Arc bumps only) retargeted to that layer's device.
-        let layers: Vec<Layer> = (0..cfg.block_count)
+        // Parallel per-layer load via a SCOPED rayon pool. Threads are
+        // joined when `pool` drops at the end of this function, so they
+        // don't spin on futex during decode (the global `into_par_iter`
+        // pool kept ~32 workers alive for the process lifetime and cost
+        // 13.8 cores of sys CPU on 4-GPU MoE decode).
+        let n_upload_threads = (devices.len() * 2).max(2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_upload_threads)
+            .build()
+            .map_err(|e| candle::Error::Msg(format!("rayon pool build: {e}")))?;
+        let layers: Vec<Layer> = pool.install(|| {
+            (0..cfg.block_count)
             .into_par_iter()
             .map(|il| -> Result<Layer> {
                 let prefix = format!("blk.{il}");
@@ -132,7 +141,8 @@ impl ModelWeights {
                     device: layer_device,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        })?;
 
         // Output norm + lm_head on the device of the last layer.
         let last_dev = devices[layer_to_device[cfg.block_count - 1]].clone();

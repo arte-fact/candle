@@ -30,6 +30,9 @@ use candle_nn::Embedding;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+#[cfg(feature = "hip")]
+use candle::hip_backend::decode_cache::DecodeState;
+
 /// Helper used by the H1 n_kv-padding code path: pull `seq_len` (dim 2) from
 /// either the shared Q tensor or from x_norm.
 fn q_precomputed_shape_or_none(
@@ -178,36 +181,9 @@ pub struct ModelWeights {
     /// and the dominant decode cost on gemma4 (which slowed 31% on
     /// candle vs 3% on turbo at long-cache decode before this fix).
     kv_caches: Vec<Option<candle_nn::kv_cache::KvCache>>,
-    /// G2/G3 decode replay state. See `quantized_llama::DecodeState`.
-    /// Single-device only for now — multi-device pipeline-parallel layouts
-    /// fall through to the normal forward path.
+    /// G2/G3 decode replay state (opt-in via `CANDLE_G2_REPLAY=1`).
     #[cfg(feature = "hip")]
-    decode_state: DecodeState,
-}
-
-/// Mirror of `quantized_llama::DecodeState` — kept private to this module
-/// since it transitively references `decode_cache::{RecordedOp, DecodePlan,
-/// DecodeGraph}`. See the llama path for the protocol.
-#[cfg(feature = "hip")]
-enum DecodeState {
-    Init,
-    WarmUp,
-    /// Token 3: first recording captured. `input_ptrs` is the list of
-    /// per-token external-input device pointers (1 element for dense
-    /// Gemma4 = layer_in only; 2 elements for E4B = [layer_in,
-    /// inp_per_layer]). `input_bytes` mirrors the byte size of each
-    /// input; it must match between the two recordings.
-    Recorded1 {
-        ops: Vec<candle::hip_backend::decode_cache::RecordedOp>,
-        input_ptrs: Vec<usize>,
-        input_bytes: Vec<usize>,
-    },
-    Replay(candle::hip_backend::decode_cache::DecodePlan),
-    Graph {
-        plan: candle::hip_backend::decode_cache::DecodePlan,
-        graph: candle::hip_backend::decode_cache::DecodeGraph,
-        captured_l_k: usize,
-    },
+    decode_state: candle::hip_backend::decode_cache::DecodeState,
 }
 
 impl ModelWeights {
@@ -393,12 +369,28 @@ impl ModelWeights {
             None
         };
 
-        // ----- build layers in parallel via rayon --------------------------
+        // ----- build layers in parallel via a SCOPED rayon pool ------------
         // Each rayon worker pulls a cheap Gguf clone for its layer's device,
         // then loads attn / norms / FFN / per-layer-embed from the shared
         // mmap'd blob in one shot. With 4 MI50s and gemma4 31B (~17 GB Q4_0)
         // this drops model build time from ~52 s (sequential) to ~6 s.
-        let layers: Vec<LayerWeights> = (0..block_count)
+        //
+        // IMPORTANT: use a LOCAL `ThreadPool` scoped to this function, not
+        // the global `into_par_iter()` pool. The global pool spawns
+        // `available_parallelism()` workers (~32 on a 16c/32t host) that
+        // persist for the process lifetime and spin on futex waits during
+        // decode — measured ~440 s of sys CPU across a 35 s decode run
+        // (13.8 cores of host overhead for GPU work). Limiting to
+        // `devices.len() * 2` and dropping the pool after load collapses
+        // the post-load thread count to 0 extra workers. +19 % tg64 on
+        // gemma4-26B Q8_0 4-GPU.
+        let n_upload_threads = (devices.len() * 2).max(2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_upload_threads)
+            .build()
+            .map_err(|e| candle::Error::Msg(format!("rayon pool build: {e}")))?;
+        let layers: Vec<LayerWeights> = pool.install(|| {
+            (0..block_count)
             .into_par_iter()
             .map(|il| -> Result<LayerWeights> {
                 let block_prefix = format!("blk.{il}");
@@ -651,7 +643,8 @@ impl ModelWeights {
                     device: layer_device,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        })?;
         let _ = head_count; // silence "unused" if metadata reads more than we use
 
         // ----- output norm + lm_head live on the device of the last layer --
@@ -691,7 +684,7 @@ impl ModelWeights {
             per_layer_embeddings,
             kv_caches,
             #[cfg(feature = "hip")]
-            decode_state: DecodeState::Init,
+            decode_state: candle::hip_backend::decode_cache::DecodeState::Init,
         }
         .with_tok_embeddings(tok_embeddings))
     }
@@ -712,50 +705,7 @@ impl ModelWeights {
         // read fresh data from a stable address — no External patching
         // needed for slots that were stable across the two recordings.
         #[cfg(feature = "hip")]
-        let g2_in_replay = matches!(
-            self.decode_state,
-            DecodeState::Replay(_) | DecodeState::Graph { .. }
-        );
-        // V2-3b: also resume on Recorded1 — second captured forward
-        // (recording-#2 run) needs to consume the cursor positions
-        // that recording #1 populated.
-        // V2-5a: also resume on WarmUp because
-        // `decode_alloc_start_record` was followed by an immediate
-        // pause in the post-forward state-machine branch, so the
-        // FIRST recorded forward needs to resume (in Recording mode)
-        // before its prelude allocs.  Between-forward main-loop
-        // allocs stay in the normal pool (decode_alloc Paused
-        // outside the forward).
-        #[cfg(feature = "hip")]
-        let g2_in_post_warmup = matches!(
-            self.decode_state,
-            DecodeState::Recorded1 { .. }
-        );
-        #[cfg(feature = "hip")]
-        let g2_in_warmup = matches!(
-            self.decode_state,
-            DecodeState::WarmUp
-        );
-        #[cfg(feature = "hip")]
-        if g2_in_replay || g2_in_post_warmup {
-            // Recorded1 → replay existing recorded entries,
-            // Replay/Graph → same.
-            candle::hip_backend::hipdarc::driver::decode_alloc_resume();
-            if std::env::var("CANDLE_G2_ALLOC_TRACE").is_ok() {
-                eprintln!("[G2-alloc] forward start (resume replaying): mode={:?}",
-                    candle::hip_backend::hipdarc::driver::decode_alloc_get_mode());
-            }
-        } else if g2_in_warmup {
-            // WarmUp (rec #1) → enter Recording mode for this forward
-            // so in-forward allocs append to the per-device tables.
-            candle::hip_backend::hipdarc::driver::decode_alloc_set_mode(
-                candle::hip_backend::hipdarc::driver::DecodeAllocMode::Recording
-            );
-            if std::env::var("CANDLE_G2_ALLOC_TRACE").is_ok() {
-                eprintln!("[G2-alloc] forward start (resume recording): mode={:?}",
-                    candle::hip_backend::hipdarc::driver::decode_alloc_get_mode());
-            }
-        }
+        self.g2_pre_forward_alloc_setup();
 
         // ── Phase timing (CANDLE_G2_PHASE_TIME=1) ───────────────────────
         //
@@ -784,17 +734,7 @@ impl ModelWeights {
         // data. Multi-device support is therefore opt-in and conditional
         // on `CANDLE_G2_MULTI_DEV=1` while it's still being validated.
         #[cfg(feature = "hip")]
-        let g2_eligible = seq_len == 1
-            && index_pos > 0
-            && {
-                let single_device = {
-                    let d0 = &self.layers[0].device;
-                    self.layers.iter().all(|l| device_eq(&l.device, d0))
-                };
-                single_device || std::env::var("CANDLE_G2_MULTI_DEV").is_ok()
-            }
-            && std::env::var("CANDLE_G2_REPLAY").is_ok()
-            && std::env::var("CANDLE_G2_DISABLE").is_err();
+        let g2_eligible = self.g2_is_eligible(seq_len, index_pos);
 
         // Phase P auto-gate. T-major K + mat-vec decode kernel is now a
         // win both on its own (+3.9 %) AND under G2 replay (+2.5 % vs
@@ -1032,308 +972,21 @@ impl ModelWeights {
 
         #[cfg(feature = "hip")]
         let t_prelude_swa = _t_swa_start.elapsed();
-        #[cfg(feature = "hip")]
-        let _t_fastpath_start = std::time::Instant::now();
-
-        // Diagnostic: dump the address + first values of each anchored
-        // input on replay calls to verify that decode_alloc is returning
-        // the same slot AND that the prelude's memcpy refreshed the data.
-        #[cfg(feature = "hip")]
-        if g2_eligible && g2_in_replay && std::env::var("CANDLE_G2_REPLAY_TRACE").is_ok() {
-            let head: Vec<f32> = layer_in.narrow(1, 0, 1)?.flatten_all()?
-                .to_device(&candle::Device::Cpu)?.to_vec1()?;
-            let head4: Vec<f32> = head.iter().take(4).copied().collect();
-            eprintln!(
-                "[G2-gemma4] replay layer_in ptr=0x{:x} first4={:?}",
-                Self::hip_device_ptr(&layer_in)?, head4
-            );
-        }
-
         // ── G2/G3 fast path: replay captured kernel sequence ──
-        //
-        // `layer_in` (post CPU-embed + transfer + scale) is anchor #0,
-        // `inp_per_layer` (when E4B is active) is anchor #1. Both are
-        // freshly allocated each call → memcpy into the captured anchor
-        // address + patch external arg slots to the anchor pointer. Same
-        // trick the llama path uses, just with two inputs instead of one.
         #[cfg(feature = "hip")]
         if g2_eligible {
-            let layer_in_param = layer_in_anchor.as_ref().unwrap().clone();
-            let inp_per_layer_param = inp_per_layer_anchor.clone();
-            // Build the per-call (input_idx, fresh_ptr) list once and reuse
-            // it for both Replay and Graph branches.
-            //   #0 = layer_in
-            //   #1 = inp_per_layer (E4B only)
-            //   #2.. = SWA masks (one per device + sliding-window pair)
-            let fresh_inputs: Vec<(usize, usize)> = {
-                let mut v = vec![(0usize, Self::hip_device_ptr(&layer_in_param)?)];
-                if let Some(ref ipl) = inp_per_layer_param {
-                    v.push((1, Self::hip_device_ptr(ipl)?));
-                }
-                let mask_idx_base = v.len();
-                for (i, (_key, t)) in swa_mask_anchors.iter().enumerate() {
-                    v.push((mask_idx_base + i, Self::hip_device_ptr(t)?));
-                }
-                v
-            };
-
-            // Common helper: patch the captured arg slots that read from
-            // each external input to the live (per-call) device pointer.
-            //
-            // Both `layer_in` and `inp_per_layer` are computed with HIP
-            // recording paused, so their producing ops are NOT in the
-            // plan; the captured kernels read the addresses directly.
-            // Across the two recordings the addresses differ → those
-            // args were marked External; patching points them at the
-            // live tensor each replay. The `Tensor` clones held in
-            // scope keep the GPU buffers alive through replay.
-            let dev_for_replay = Self::hip_device_from_tensor(&layer_in_param)?;
-            let stage_inputs = |plan: &mut candle::hip_backend::decode_cache::DecodePlan,
-                                _dev: &candle::hip_backend::HipDevice|
-             -> Result<()> {
-                for &(idx, fresh_ptr) in &fresh_inputs {
-                    if plan.input_count() == 0 {
-                        // Single-input legacy plan — patch every external
-                        // slot to the live pointer.
-                        plan.patch_all_externals(fresh_ptr);
-                    } else {
-                        plan.patch_external_input(idx, fresh_ptr);
-                    }
-                }
-                Ok(())
-            };
-
-            match &mut self.decode_state {
-                DecodeState::Graph { plan, graph, captured_l_k } => {
-                    use candle::hip_backend::hipdarc;
-                    let current_t = index_pos + seq_len;
-                    let pad_default: usize = if std::env::var("CANDLE_G2_REPLAY").is_ok() { 256 } else { 1 };
-                    let pad_t = std::env::var("CANDLE_NKV_PAD")
-                        .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(pad_default);
-                    let live_l_k = if pad_t > 1 {
-                        ((current_t + pad_t - 1) / pad_t) * pad_t
-                    } else {
-                        current_t
-                    };
-                    if live_l_k != *captured_l_k {
-                        eprintln!("[G3-gemma4] pad boundary crossed (captured={} live={}), rebuilding",
-                            captured_l_k, live_l_k);
-                        self.decode_state = DecodeState::Init;
-                    } else {
-                        hipdarc::driver::decode_alloc_resume();
-                        stage_inputs(plan, &dev_for_replay)?;
-                        if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
-                            plan.advance_counters();
-                        }
-                        // Phase T2: refresh the device-resident counter
-                        // buffer slots before launching the captured graph.
-                        // L_k_iter for the captured gqa_decode_mv_fast_*_ctr
-                        // kernels reads from CounterSlot::LkIter; without
-                        // this update the kernels see whatever value the
-                        // slot held at recording time and produce stale
-                        // attention output.
-                        candle::hip_backend::g3_counters::set(
-                            &dev_for_replay,
-                            candle::hip_backend::g3_counters::CounterSlot::LkIter,
-                            current_t as u32,
-                        )?;
-                        // V2-1: same validator hook as Replay branch —
-                        // graph capture is driven by the same plan so
-                        // the same patch-integrity check applies.
-                        plan.validate_inputs(&fresh_inputs)?;
-                        unsafe { graph.patch_and_launch(plan, &dev_for_replay)?; }
-                        if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
-                            let _ = dev_for_replay.stream().synchronize();
-                        }
-                        hipdarc::driver::decode_alloc_pause();
-                        hipdarc::driver::decode_alloc_reset();
-                        let out = plan.output_tensor(&dev_for_replay)?;
-                        if phase_time {
-                            let t_fp = _t_fastpath_start.elapsed();
-                            let t_total = _t_forward_start.elapsed();
-                            eprintln!(
-                                "[G2-time graph] li={:>5}us pe={:>5}us swa={:>5}us fp={:>5}us total={:>6}us",
-                                t_prelude_li.as_micros(), t_prelude_pe.as_micros(),
-                                t_prelude_swa.as_micros(), t_fp.as_micros(),
-                                t_total.as_micros(),
-                            );
-                        }
-                        return Ok(out);
-                    }
-                }
-                DecodeState::Replay(plan) => {
-                    let max_replays = std::env::var("CANDLE_G2_REPLAY_MAX")
-                        .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4);
-                    if std::env::var("CANDLE_G2_REPLAY").is_ok()
-                        && plan.replay_count() < max_replays
-                    {
-                        use candle::hip_backend::hipdarc;
-                        hipdarc::driver::decode_alloc_resume();
-                        stage_inputs(plan, &dev_for_replay)?;
-                        if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
-                            plan.advance_counters();
-                        }
-                        // Phase T2: refresh device-resident counter buffer
-                        // (same rationale as the Graph branch above —
-                        // replay shortcuts the gqa_attention_decode_mv
-                        // call site that would normally write the slot).
-                        let current_t_for_ctr = index_pos + seq_len;
-                        candle::hip_backend::g3_counters::set(
-                            &dev_for_replay,
-                            candle::hip_backend::g3_counters::CounterSlot::LkIter,
-                            current_t_for_ctr as u32,
-                        )?;
-                        // V2-1: validate external patching before we
-                        // launch — catches stale ptr / missed input_id
-                        // before the kernels crash on garbage addresses.
-                        plan.validate_inputs(&fresh_inputs)?;
-                        if std::env::var("CANDLE_G2_ALLOC_CURSOR_TRACE").is_ok() {
-                            let c = candle::hip_backend::hipdarc::driver::decode_alloc_cursors_by_device();
-                            eprintln!("[V2-3] pre-replay cursors-by-dev: {:?}", c);
-                            let h = candle::hip_backend::hipdarc::driver::decode_alloc_head_entries(5);
-                            for (dev, head) in h {
-                                eprintln!(
-                                    "[V2-3] dev {} head entries: {:?}",
-                                    dev,
-                                    head.iter().map(|(s, p)| format!("({}, 0x{:x})", s, p)).collect::<Vec<_>>(),
-                                );
-                            }
-                        }
-                        unsafe { plan.replay(&dev_for_replay)?; }
-                        // Phase-time: optional sync-here-to-measure-GPU.
-                        // CANDLE_G2_SYNC_REPLAY=1 makes the fp timing
-                        // include actual GPU execution; without this flag
-                        // it only measures launch/dispatch overhead.
-                        if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
-                            let _ = dev_for_replay.stream().synchronize();
-                        }
-                        // Diagnostic for K10: dump the first 8 logits to
-                        // confirm whether the captured plan actually
-                        // produces fresh output per replay or stays
-                        // stuck. If they're byte-identical across
-                        // multiple replays, the plan has at least one
-                        // critical arg that wasn't recognized as
-                        // dynamic (Counter/External), so its kernel
-                        // re-runs with stale data.
-                        if std::env::var("CANDLE_G2_REPLAY_TRACE").is_ok() {
-                            let _ = dev_for_replay.stream().synchronize();
-                            let out = plan.output_tensor(&dev_for_replay)?;
-                            let head: Vec<f32> = out
-                                .narrow(out.rank() - 1, 0, 8.min(out.dim(out.rank()-1)?))?
-                                .flatten_all()?.to_vec1()?;
-                            eprintln!(
-                                "[G2-gemma4] replay#{} idx={} output head: {:?}",
-                                plan.replay_count(), index_pos, head
-                            );
-                            // Also dump inp_per_layer first 4 if present —
-                            // verify the prelude is actually refreshing the
-                            // anchor the captured per-layer kernels read from.
-                            if let Some(ref ipl) = inp_per_layer_param {
-                                let ipl_head: Vec<f32> = ipl
-                                    .narrow(ipl.rank() - 1, 0, 4.min(ipl.dim(ipl.rank()-1)?))?
-                                    .flatten_all()?
-                                    .to_vec1()?;
-                                eprintln!(
-                                    "[G2-gemma4] replay#{} inp_per_layer ptr=0x{:x} head4={:?}",
-                                    plan.replay_count(),
-                                    Self::hip_device_ptr(ipl)?,
-                                    ipl_head
-                                );
-                            }
-                        }
-                        // K13 deeper diagnostic: peek at every captured op's
-                        // output buffer. Print only on replays 1 and 2 so we
-                        // can diff between them. Ops whose head is identical
-                        // across both replays despite different inputs are
-                        // the ones reading from stale state somewhere.
-                        if std::env::var("CANDLE_G2_PEEK_OPS").is_ok()
-                            && plan.replay_count() <= 2
-                        {
-                            let peeks = plan.peek_op_outputs(&dev_for_replay, 4);
-                            for (i, name, head) in peeks {
-                                eprintln!(
-                                    "[G2-peek r{}] op[{:>4}] {:>40} {}",
-                                    plan.replay_count(), i, name,
-                                    match head {
-                                        Some(v) => format!("head={:?}", v),
-                                        None => "(unknown output arg)".to_string(),
-                                    }
-                                );
-                            }
-                        }
-                        // Even deeper: dump per-op arg pointer lists once
-                        // (replay 1 only). Look for buffer-chain breaks
-                        // between consecutive ops.
-                        if std::env::var("CANDLE_G2_PEEK_ARGS").is_ok()
-                            && plan.replay_count() == 1
-                        {
-                            for (i, name, args, sizes) in plan.peek_op_args() {
-                                let arg_strs: Vec<String> = args.iter().zip(sizes.iter())
-                                    .map(|(v, sz)| if *sz == 8 {
-                                        format!("0x{:012x}", v)
-                                    } else {
-                                        format!("{}", *v as i64)
-                                    })
-                                    .collect();
-                                eprintln!(
-                                    "[G2-args] op[{:>4}] {:>40} args=[{}]",
-                                    i, name, arg_strs.join(", ")
-                                );
-                            }
-                        }
-                        let g3_enabled = std::env::var("CANDLE_G3_GRAPH").is_ok();
-                        let g3_after = std::env::var("CANDLE_G3_AFTER")
-                            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(2);
-                        let should_capture = g3_enabled && plan.replay_count() == g3_after;
-                        if should_capture {
-                            let current_t = index_pos + seq_len;
-                            let pad_t_env: usize = std::env::var("CANDLE_NKV_PAD")
-                                .ok().and_then(|s| s.parse::<usize>().ok())
-                                .unwrap_or(if g3_enabled || std::env::var("CANDLE_G2_REPLAY").is_ok() { 256 } else { 1 });
-                            let live_l_k = if pad_t_env > 1 {
-                                ((current_t + pad_t_env - 1) / pad_t_env) * pad_t_env
-                            } else {
-                                current_t
-                            };
-                            eprintln!("[G3-gemma4] capturing graph after {} replays (L_k_padded={})",
-                                g3_after, live_l_k);
-                            hipdarc::driver::decode_alloc_pause();
-                            hipdarc::driver::decode_alloc_reset();
-                            let output = plan.output_tensor(&dev_for_replay)?;
-                            let old = std::mem::replace(&mut self.decode_state, DecodeState::Init);
-                            if let DecodeState::Replay(plan) = old {
-                                match unsafe { candle::hip_backend::decode_cache::DecodeGraph::capture(&plan, &dev_for_replay) } {
-                                    Ok(graph) => {
-                                        eprintln!("[G3-gemma4] graph captured successfully");
-                                        self.decode_state = DecodeState::Graph {
-                                            plan, graph, captured_l_k: live_l_k,
-                                        };
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[G3-gemma4] graph capture failed: {:?} — staying in Replay", e);
-                                        self.decode_state = DecodeState::Replay(plan);
-                                    }
-                                }
-                            }
-                            return Ok(output);
-                        }
-                        hipdarc::driver::decode_alloc_pause();
-                        hipdarc::driver::decode_alloc_reset();
-                        let out = plan.output_tensor(&dev_for_replay)?;
-                        if phase_time {
-                            let t_fp = _t_fastpath_start.elapsed();
-                            let t_total = _t_forward_start.elapsed();
-                            eprintln!(
-                                "[G2-time replay] li={:>5}us pe={:>5}us swa={:>5}us fp={:>5}us total={:>6}us",
-                                t_prelude_li.as_micros(), t_prelude_pe.as_micros(),
-                                t_prelude_swa.as_micros(), t_fp.as_micros(),
-                                t_total.as_micros(),
-                            );
-                        }
-                        return Ok(out);
-                    }
-                }
-                _ => {}
+            if let Some(out) = self.try_g2_replay(
+                index_pos,
+                seq_len,
+                &layer_in,
+                inp_per_layer.as_ref(),
+                &swa_mask_anchors,
+                t_prelude_li,
+                t_prelude_pe,
+                t_prelude_swa,
+                _t_forward_start,
+            )? {
+                return Ok(out);
             }
         }
         if std::env::var("CANDLE_GEMMA4_DEBUG_MOE").is_ok() {
@@ -1409,6 +1062,8 @@ impl ModelWeights {
             std::collections::HashMap::new();
 
         // ----- transformer block loop --------------------------------------
+        #[cfg(feature = "hip")]
+        let _t_layer_loop_start = std::time::Instant::now();
         for il in 0..self.layers.len() {
             let (has_kv, kv_source_idx, layer_device, sliding_window_size) = {
                 let l = &self.layers[il];
@@ -2362,165 +2017,21 @@ impl ModelWeights {
             logits
         };
 
-        // ── G2: Post-forward recording state machine ────────────────────
-        //
-        // Mirrors `quantized_llama::forward`. Anchors `layer_in_anchor`
-        // as input #0; for E4B, also anchors `inp_per_layer_anchor` as
-        // input #1. The captured plan reads from both anchor addresses;
-        // `Recorded1` stashes the per-input ptr tuple from the first
-        // recording so it can pair with the second to derive the
-        // External patch slots.
+        // ── G2: Post-forward recording state machine ──
         #[cfg(feature = "hip")]
         if g2_eligible {
-            use candle::hip_backend::decode_cache;
-            use candle::hip_backend::hipdarc::driver as hdrv;
-
-            let in_anchor = layer_in_anchor.as_ref().unwrap();
-            let inp_per_layer_anchor_ref = inp_per_layer_anchor.as_ref();
-            if decode_cache::is_recording() {
-                if let Some(recording) = decode_cache::stop_recording() {
-                    // Snapshot per-input pointers + sizes for this token.
-                    // Order matches `fresh_inputs` in the fast path:
-                    //   #0 layer_in
-                    //   #1 inp_per_layer (E4B)
-                    //   #2.. SWA masks
-                    let mut cur_ptrs: Vec<usize> = vec![Self::hip_device_ptr(in_anchor)?];
-                    let mut cur_bytes: Vec<usize> =
-                        vec![in_anchor.elem_count() * in_anchor.dtype().size_in_bytes()];
-                    if let Some(t) = inp_per_layer_anchor_ref {
-                        cur_ptrs.push(Self::hip_device_ptr(t)?);
-                        cur_bytes.push(t.elem_count() * t.dtype().size_in_bytes());
-                    }
-                    for (_key, t) in &swa_mask_anchors {
-                        cur_ptrs.push(Self::hip_device_ptr(t)?);
-                        cur_bytes.push(t.elem_count() * t.dtype().size_in_bytes());
-                    }
-
-                    match std::mem::replace(&mut self.decode_state, DecodeState::Init) {
-                        DecodeState::WarmUp => {
-                            // A1 — decode_alloc_start_replay arms the table
-                            // for the next forward's use.  V2-3b: immediately
-                            // PAUSE so that allocations made between now and
-                            // the start of the next forward (main loop
-                            // sampler + `Tensor::new(tokens, device)`) go
-                            // through the normal pool instead of consuming
-                            // recorded slots.  The next forward calls
-                            // `decode_alloc_resume()` at the top to re-enter
-                            // replay mode for its own allocations — keeping
-                            // the cursor aligned between recording #2 and
-                            // all subsequent replays.
-                            hdrv::decode_alloc_start_replay();
-                            hdrv::decode_alloc_pause();
-                            eprintln!(
-                                "[G2-gemma4] token 3 recorded: {} ops, {} alloc entries, ptrs={:x?}",
-                                recording.len(),
-                                hdrv::decode_alloc_entry_count(),
-                                cur_ptrs,
-                            );
-                            self.decode_state = DecodeState::Recorded1 {
-                                ops: recording,
-                                input_ptrs: cur_ptrs,
-                                input_bytes: cur_bytes,
-                            };
-                        }
-                        DecodeState::Recorded1 { ops: first, input_ptrs: prev_ptrs, input_bytes: prev_bytes } => {
-                            let output_ptr = Self::hip_device_ptr(&result)?;
-                            let output_f32_count = result.elem_count();
-                            let output_shape = result.dims().to_vec();
-
-                            // Build the per-input anchor list. `bytes`
-                            // mirrors the live-tensor size; if it's
-                            // changed between the two recordings (it
-                            // shouldn't for decode), bail.
-                            if prev_ptrs.len() != cur_ptrs.len()
-                                || prev_bytes != cur_bytes
-                            {
-                                eprintln!("[G2-gemma4] input shape changed between recordings — aborting");
-                                hdrv::decode_alloc_stop();
-                                self.decode_state = DecodeState::Init;
-                            } else {
-                                let inputs: Vec<decode_cache::ExternalInput> = prev_ptrs
-                                    .iter()
-                                    .zip(cur_ptrs.iter())
-                                    .zip(cur_bytes.iter())
-                                    .map(|((&a, &b), &n)| decode_cache::ExternalInput {
-                                        first_ptr: a,
-                                        second_ptr: b,
-                                        bytes: n,
-                                    })
-                                    .collect();
-
-                                if let Some(mut plan) = decode_cache::DecodePlan::from_two_recordings_with_inputs(
-                                    &first,
-                                    &recording,
-                                    output_ptr,
-                                    output_f32_count,
-                                    output_shape,
-                                    &inputs,
-                                ) {
-                                    for (i, &b) in cur_bytes.iter().enumerate() {
-                                        plan.set_input_anchor_bytes_at(i, b);
-                                    }
-                                    eprintln!(
-                                        "[G2-gemma4] plan ready: {} ops, {} dynamic/{} fixed, {} external patches, {} input anchors",
-                                        plan.len(),
-                                        plan.dynamic_arg_count(),
-                                        plan.fixed_arg_count(),
-                                        plan.external_patch_count(),
-                                        plan.input_count(),
-                                    );
-                                    for i in 0..plan.input_count() {
-                                        if let Some(a) = plan.input_anchor(i) {
-                                            eprintln!("[G2-gemma4]   anchor #{}: ptr=0x{:x} bytes={}", i, a.ptr, a.bytes);
-                                        }
-                                    }
-                                    hdrv::decode_alloc_pause();
-                                    hdrv::decode_alloc_reset();
-                                    self.decode_state = DecodeState::Replay(plan);
-                                } else {
-                                    eprintln!("[G2-gemma4] plan build failed — recordings diverged");
-                                    hdrv::decode_alloc_stop();
-                                    self.decode_state = DecodeState::Init;
-                                }
-                            }
-                        }
-                        _ => {
-                            hdrv::decode_alloc_stop();
-                            self.decode_state = DecodeState::Init;
-                        }
-                    }
-                }
-            } else {
-                // A1 — kernel recording moves to TOP of next forward (after
-                // prelude).  But `decode_alloc_start_record` fires here
-                // at the Init → WarmUp transition so the FIRST recorded
-                // forward's prelude allocates through the alloc table too,
-                // keeping the anchor tensors (layer_in, inp_per_layer, SWA
-                // masks) at stable pool slots across both recordings.
-                //
-                // V2-5a: immediately pause after start_record so the
-                // main-loop allocations that fire BETWEEN this forward
-                // and the next (e.g. `Tensor::new(tokens, device)` in
-                // main.rs before the next forward call) do NOT land in
-                // the decode_alloc table.  Without this, the between-
-                // forwards 4-byte input becomes entries[0] on dev 0
-                // and desyncs rec #2's cursor on the first 11264-byte
-                // layer_in alloc.  The next forward calls
-                // decode_alloc_resume() at its top (Recorded1 or Replay
-                // state handling at the top of forward), so in-forward
-                // allocs still hit the table in their correct order.
-                if matches!(&self.decode_state, DecodeState::Init) {
-                    hdrv::decode_alloc_start_record();
-                    hdrv::decode_alloc_pause();
-                    self.decode_state = DecodeState::WarmUp;
-                }
-            }
+            self.g2_post_forward(
+                &result,
+                layer_in_anchor.as_ref(),
+                inp_per_layer_anchor.as_ref(),
+                &swa_mask_anchors,
+            )?;
         }
 
         #[cfg(feature = "hip")]
         if phase_time {
             let t_total = _t_forward_start.elapsed();
-            let t_loop = _t_loop_end.duration_since(_t_fastpath_start);
+            let t_loop = _t_loop_end.duration_since(_t_layer_loop_start);
             eprintln!(
                 "[G2-time normal] li={:>5}us pe={:>5}us swa={:>5}us layers={:>5}us total={:>6}us",
                 t_prelude_li.as_micros(), t_prelude_pe.as_micros(),
@@ -2529,6 +2040,539 @@ impl ModelWeights {
             );
         }
         Ok(result)
+    }
+
+    // ── G2/G3 private helpers (extracted from forward) ────────────────────
+
+    /// Resume or arm the decode_alloc table at the start of forward()
+    /// based on the current `decode_state`. Must run BEFORE the prelude
+    /// so prelude allocations land in the correct pool slots.
+    #[cfg(feature = "hip")]
+    fn g2_pre_forward_alloc_setup(&self) {
+        let trace = std::env::var("CANDLE_G2_ALLOC_TRACE").is_ok();
+        match &self.decode_state {
+            DecodeState::Replay(_) | DecodeState::Graph { .. } | DecodeState::Recorded1 { .. } => {
+                candle::hip_backend::hipdarc::driver::decode_alloc_resume();
+                if trace {
+                    eprintln!(
+                        "[G2-alloc] forward start (resume replaying): mode={:?}",
+                        candle::hip_backend::hipdarc::driver::decode_alloc_get_mode()
+                    );
+                }
+            }
+            DecodeState::WarmUp => {
+                candle::hip_backend::hipdarc::driver::decode_alloc_set_mode(
+                    candle::hip_backend::hipdarc::driver::DecodeAllocMode::Recording,
+                );
+                if trace {
+                    eprintln!(
+                        "[G2-alloc] forward start (resume recording): mode={:?}",
+                        candle::hip_backend::hipdarc::driver::decode_alloc_get_mode()
+                    );
+                }
+            }
+            DecodeState::Init => {}
+        }
+    }
+
+    /// Check whether G2/G3 replay is eligible for this forward call.
+    #[cfg(feature = "hip")]
+    fn g2_is_eligible(&self, seq_len: usize, index_pos: usize) -> bool {
+        seq_len == 1
+            && index_pos > 0
+            && {
+                let single_device = {
+                    let d0 = &self.layers[0].device;
+                    self.layers.iter().all(|l| device_eq(&l.device, d0))
+                };
+                single_device || std::env::var("CANDLE_G2_MULTI_DEV").is_ok()
+            }
+            && std::env::var("CANDLE_G2_REPLAY").is_ok()
+            && std::env::var("CANDLE_G2_DISABLE").is_err()
+    }
+
+    /// G2/G3 fast path: if the decode_state is Graph or Replay, execute
+    /// the captured plan directly and return `Some(output)`.  Returns
+    /// `None` when the state machine hasn't reached replay yet (WarmUp,
+    /// Recorded1, Init) and the caller should fall through to the normal
+    /// layer loop.
+    ///
+    /// # Arguments
+    /// * `index_pos`, `seq_len` — token position info
+    /// * `layer_in` — anchor #0 tensor
+    /// * `inp_per_layer` — anchor #1 tensor (E4B only)
+    /// * `swa_mask_anchors` — anchors #2+ (SWA masks, sorted)
+    /// * `t_prelude_li`, `t_prelude_pe`, `t_prelude_swa` — phase timings
+    /// * `forward_start` — instant the forward call began
+    #[cfg(feature = "hip")]
+    fn try_g2_replay(
+        &mut self,
+        index_pos: usize,
+        seq_len: usize,
+        layer_in: &Tensor,
+        inp_per_layer: Option<&Tensor>,
+        swa_mask_anchors: &[((String, usize), Tensor)],
+        t_prelude_li: std::time::Duration,
+        t_prelude_pe: std::time::Duration,
+        t_prelude_swa: std::time::Duration,
+        forward_start: std::time::Instant,
+    ) -> Result<Option<Tensor>> {
+        let phase_time = std::env::var("CANDLE_G2_PHASE_TIME").is_ok();
+        let fastpath_start = std::time::Instant::now();
+
+        // Diagnostic: dump anchor addresses on replay calls.
+        if matches!(self.decode_state, DecodeState::Replay(_) | DecodeState::Graph { .. })
+            && std::env::var("CANDLE_G2_REPLAY_TRACE").is_ok()
+        {
+            let head: Vec<f32> = layer_in
+                .narrow(1, 0, 1)?
+                .flatten_all()?
+                .to_device(&candle::Device::Cpu)?
+                .to_vec1()?;
+            let head4: Vec<f32> = head.iter().take(4).copied().collect();
+            eprintln!(
+                "[G2-gemma4] replay layer_in ptr=0x{:x} first4={:?}",
+                candle::hip_backend::decode_cache::hip_device_ptr(layer_in)?,
+                head4
+            );
+        }
+
+        // Build the per-call (input_idx, fresh_ptr) list for external patching.
+        let fresh_inputs: Vec<(usize, usize)> = {
+            let mut v = vec![(
+                0usize,
+                candle::hip_backend::decode_cache::hip_device_ptr(layer_in)?,
+            )];
+            if let Some(ipl) = inp_per_layer {
+                v.push((1, candle::hip_backend::decode_cache::hip_device_ptr(ipl)?));
+            }
+            let mask_idx_base = v.len();
+            for (i, (_key, t)) in swa_mask_anchors.iter().enumerate() {
+                v.push((
+                    mask_idx_base + i,
+                    candle::hip_backend::decode_cache::hip_device_ptr(t)?,
+                ));
+            }
+            v
+        };
+
+        let dev_for_replay =
+            candle::hip_backend::decode_cache::hip_device_from_tensor(layer_in)?;
+
+        // Helper closure: patch external arg slots to live pointers.
+        let stage_inputs =
+            |plan: &mut candle::hip_backend::decode_cache::DecodePlan,
+             _dev: &candle::hip_backend::HipDevice|
+             -> Result<()> {
+                for &(idx, fresh_ptr) in &fresh_inputs {
+                    if plan.input_count() == 0 {
+                        plan.patch_all_externals(fresh_ptr);
+                    } else {
+                        plan.patch_external_input(idx, fresh_ptr);
+                    }
+                }
+                Ok(())
+            };
+
+        match &mut self.decode_state {
+            DecodeState::Graph {
+                plan,
+                graph,
+                captured_l_k,
+            } => {
+                use candle::hip_backend::hipdarc;
+                let current_t = index_pos + seq_len;
+                let pad_default: usize =
+                    if std::env::var("CANDLE_G2_REPLAY").is_ok() { 256 } else { 1 };
+                let pad_t = std::env::var("CANDLE_NKV_PAD")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(pad_default);
+                let live_l_k = if pad_t > 1 {
+                    ((current_t + pad_t - 1) / pad_t) * pad_t
+                } else {
+                    current_t
+                };
+                if live_l_k != *captured_l_k {
+                    eprintln!(
+                        "[G3-gemma4] pad boundary crossed (captured={} live={}), rebuilding",
+                        captured_l_k, live_l_k
+                    );
+                    self.decode_state = DecodeState::Init;
+                    return Ok(None);
+                }
+                hipdarc::driver::decode_alloc_resume();
+                stage_inputs(plan, &dev_for_replay)?;
+                if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
+                    plan.advance_counters();
+                }
+                candle::hip_backend::g3_counters::set(
+                    &dev_for_replay,
+                    candle::hip_backend::g3_counters::CounterSlot::LkIter,
+                    current_t as u32,
+                )?;
+                plan.validate_inputs(&fresh_inputs)?;
+                unsafe {
+                    graph.patch_and_launch(plan, &dev_for_replay)?;
+                }
+                if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
+                    let _ = dev_for_replay.stream().synchronize();
+                }
+                hipdarc::driver::decode_alloc_pause();
+                hipdarc::driver::decode_alloc_reset();
+                let out = plan.output_tensor(&dev_for_replay)?;
+                if phase_time {
+                    let t_fp = fastpath_start.elapsed();
+                    let t_total = forward_start.elapsed();
+                    eprintln!(
+                        "[G2-time graph] li={:>5}us pe={:>5}us swa={:>5}us fp={:>5}us total={:>6}us",
+                        t_prelude_li.as_micros(),
+                        t_prelude_pe.as_micros(),
+                        t_prelude_swa.as_micros(),
+                        t_fp.as_micros(),
+                        t_total.as_micros(),
+                    );
+                }
+                return Ok(Some(out));
+            }
+            DecodeState::Replay(plan) => {
+                let max_replays = std::env::var("CANDLE_G2_REPLAY_MAX")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(4);
+                if std::env::var("CANDLE_G2_REPLAY").is_ok()
+                    && plan.replay_count() < max_replays
+                {
+                    use candle::hip_backend::hipdarc;
+                    hipdarc::driver::decode_alloc_resume();
+                    stage_inputs(plan, &dev_for_replay)?;
+                    if std::env::var("CANDLE_G2_NO_ADVANCE").is_err() {
+                        plan.advance_counters();
+                    }
+                    let current_t_for_ctr = index_pos + seq_len;
+                    candle::hip_backend::g3_counters::set(
+                        &dev_for_replay,
+                        candle::hip_backend::g3_counters::CounterSlot::LkIter,
+                        current_t_for_ctr as u32,
+                    )?;
+                    plan.validate_inputs(&fresh_inputs)?;
+                    if std::env::var("CANDLE_G2_ALLOC_CURSOR_TRACE").is_ok() {
+                        let c =
+                            candle::hip_backend::hipdarc::driver::decode_alloc_cursors_by_device();
+                        eprintln!("[V2-3] pre-replay cursors-by-dev: {:?}", c);
+                        let h =
+                            candle::hip_backend::hipdarc::driver::decode_alloc_head_entries(5);
+                        for (dev, head) in h {
+                            eprintln!(
+                                "[V2-3] dev {} head entries: {:?}",
+                                dev,
+                                head.iter()
+                                    .map(|(s, p)| format!("({}, 0x{:x})", s, p))
+                                    .collect::<Vec<_>>(),
+                            );
+                        }
+                    }
+                    unsafe {
+                        plan.replay(&dev_for_replay)?;
+                    }
+                    if std::env::var("CANDLE_G2_SYNC_REPLAY").is_ok() {
+                        let _ = dev_for_replay.stream().synchronize();
+                    }
+                    // K10/K13 diagnostics
+                    if std::env::var("CANDLE_G2_REPLAY_TRACE").is_ok() {
+                        let _ = dev_for_replay.stream().synchronize();
+                        let out = plan.output_tensor(&dev_for_replay)?;
+                        let head: Vec<f32> = out
+                            .narrow(
+                                out.rank() - 1,
+                                0,
+                                8.min(out.dim(out.rank() - 1)?),
+                            )?
+                            .flatten_all()?
+                            .to_vec1()?;
+                        eprintln!(
+                            "[G2-gemma4] replay#{} idx={} output head: {:?}",
+                            plan.replay_count(),
+                            index_pos,
+                            head
+                        );
+                        if let Some(ipl) = inp_per_layer {
+                            let ipl_head: Vec<f32> = ipl
+                                .narrow(
+                                    ipl.rank() - 1,
+                                    0,
+                                    4.min(ipl.dim(ipl.rank() - 1)?),
+                                )?
+                                .flatten_all()?
+                                .to_vec1()?;
+                            eprintln!(
+                                "[G2-gemma4] replay#{} inp_per_layer ptr=0x{:x} head4={:?}",
+                                plan.replay_count(),
+                                candle::hip_backend::decode_cache::hip_device_ptr(ipl)?,
+                                ipl_head
+                            );
+                        }
+                    }
+                    if std::env::var("CANDLE_G2_PEEK_OPS").is_ok()
+                        && plan.replay_count() <= 2
+                    {
+                        let peeks = plan.peek_op_outputs(&dev_for_replay, 4);
+                        for (i, name, head) in peeks {
+                            eprintln!(
+                                "[G2-peek r{}] op[{:>4}] {:>40} {}",
+                                plan.replay_count(),
+                                i,
+                                name,
+                                match head {
+                                    Some(v) => format!("head={:?}", v),
+                                    None => "(unknown output arg)".to_string(),
+                                }
+                            );
+                        }
+                    }
+                    if std::env::var("CANDLE_G2_PEEK_ARGS").is_ok()
+                        && plan.replay_count() == 1
+                    {
+                        for (i, name, args, sizes) in plan.peek_op_args() {
+                            let arg_strs: Vec<String> = args
+                                .iter()
+                                .zip(sizes.iter())
+                                .map(|(v, sz): (&u64, &usize)| {
+                                    if *sz == 8 {
+                                        format!("0x{:012x}", v)
+                                    } else {
+                                        format!("{}", *v as i64)
+                                    }
+                                })
+                                .collect();
+                            eprintln!(
+                                "[G2-args] op[{:>4}] {:>40} args=[{}]",
+                                i,
+                                name,
+                                arg_strs.join(", ")
+                            );
+                        }
+                    }
+                    let g3_enabled = std::env::var("CANDLE_G3_GRAPH").is_ok();
+                    let g3_after = std::env::var("CANDLE_G3_AFTER")
+                        .ok()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(2);
+                    let should_capture =
+                        g3_enabled && plan.replay_count() == g3_after;
+                    if should_capture {
+                        let current_t = index_pos + seq_len;
+                        let pad_t_env: usize = std::env::var("CANDLE_NKV_PAD")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(
+                                if g3_enabled
+                                    || std::env::var("CANDLE_G2_REPLAY").is_ok()
+                                {
+                                    256
+                                } else {
+                                    1
+                                },
+                            );
+                        let live_l_k = if pad_t_env > 1 {
+                            ((current_t + pad_t_env - 1) / pad_t_env) * pad_t_env
+                        } else {
+                            current_t
+                        };
+                        eprintln!(
+                            "[G3-gemma4] capturing graph after {} replays (L_k_padded={})",
+                            g3_after, live_l_k
+                        );
+                        hipdarc::driver::decode_alloc_pause();
+                        hipdarc::driver::decode_alloc_reset();
+                        let output = plan.output_tensor(&dev_for_replay)?;
+                        let old = std::mem::replace(
+                            &mut self.decode_state,
+                            DecodeState::Init,
+                        );
+                        if let DecodeState::Replay(plan) = old {
+                            match unsafe {
+                                candle::hip_backend::decode_cache::DecodeGraph::capture(
+                                    &plan,
+                                    &dev_for_replay,
+                                )
+                            } {
+                                Ok(graph) => {
+                                    eprintln!(
+                                        "[G3-gemma4] graph captured successfully"
+                                    );
+                                    self.decode_state = DecodeState::Graph {
+                                        plan,
+                                        graph,
+                                        captured_l_k: live_l_k,
+                                    };
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[G3-gemma4] graph capture failed: {:?} — staying in Replay",
+                                        e
+                                    );
+                                    self.decode_state =
+                                        DecodeState::Replay(plan);
+                                }
+                            }
+                        }
+                        return Ok(Some(output));
+                    }
+                    hipdarc::driver::decode_alloc_pause();
+                    hipdarc::driver::decode_alloc_reset();
+                    let out = plan.output_tensor(&dev_for_replay)?;
+                    if phase_time {
+                        let t_fp = fastpath_start.elapsed();
+                        let t_total = forward_start.elapsed();
+                        eprintln!(
+                            "[G2-time replay] li={:>5}us pe={:>5}us swa={:>5}us fp={:>5}us total={:>6}us",
+                            t_prelude_li.as_micros(),
+                            t_prelude_pe.as_micros(),
+                            t_prelude_swa.as_micros(),
+                            t_fp.as_micros(),
+                            t_total.as_micros(),
+                        );
+                    }
+                    return Ok(Some(out));
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// Post-forward G2 recording state machine. Handles the Init→WarmUp→
+    /// Recorded1→Replay transitions, capturing kernel recordings and
+    /// building the `DecodePlan` from two consecutive forward calls.
+    #[cfg(feature = "hip")]
+    fn g2_post_forward(
+        &mut self,
+        result: &Tensor,
+        layer_in_anchor: Option<&Tensor>,
+        inp_per_layer_anchor: Option<&Tensor>,
+        swa_mask_anchors: &[((String, usize), Tensor)],
+    ) -> Result<()> {
+        use candle::hip_backend::decode_cache;
+        use candle::hip_backend::hipdarc::driver as hdrv;
+
+        let in_anchor = layer_in_anchor.unwrap();
+
+        if decode_cache::is_recording() {
+            if let Some(recording) = decode_cache::stop_recording() {
+                // Snapshot per-input pointers + sizes.
+                let mut cur_ptrs: Vec<usize> =
+                    vec![decode_cache::hip_device_ptr(in_anchor)?];
+                let mut cur_bytes: Vec<usize> =
+                    vec![in_anchor.elem_count() * in_anchor.dtype().size_in_bytes()];
+                if let Some(t) = inp_per_layer_anchor {
+                    cur_ptrs.push(decode_cache::hip_device_ptr(t)?);
+                    cur_bytes.push(t.elem_count() * t.dtype().size_in_bytes());
+                }
+                for (_key, t) in swa_mask_anchors {
+                    cur_ptrs.push(decode_cache::hip_device_ptr(t)?);
+                    cur_bytes.push(t.elem_count() * t.dtype().size_in_bytes());
+                }
+
+                match std::mem::replace(&mut self.decode_state, DecodeState::Init) {
+                    DecodeState::WarmUp => {
+                        hdrv::decode_alloc_start_replay();
+                        hdrv::decode_alloc_pause();
+                        eprintln!(
+                            "[G2-gemma4] token 3 recorded: {} ops, {} alloc entries, ptrs={:x?}",
+                            recording.len(),
+                            hdrv::decode_alloc_entry_count(),
+                            cur_ptrs,
+                        );
+                        self.decode_state = DecodeState::Recorded1 {
+                            ops: recording,
+                            input_ptrs: cur_ptrs,
+                            input_bytes: cur_bytes,
+                        };
+                    }
+                    DecodeState::Recorded1 {
+                        ops: first,
+                        input_ptrs: prev_ptrs,
+                        input_bytes: prev_bytes,
+                    } => {
+                        let output_ptr = decode_cache::hip_device_ptr(result)?;
+                        let output_f32_count = result.elem_count();
+                        let output_shape = result.dims().to_vec();
+
+                        if prev_ptrs.len() != cur_ptrs.len() || prev_bytes != cur_bytes {
+                            eprintln!(
+                                "[G2-gemma4] input shape changed between recordings — aborting"
+                            );
+                            hdrv::decode_alloc_stop();
+                            self.decode_state = DecodeState::Init;
+                        } else {
+                            let inputs: Vec<decode_cache::ExternalInput> = prev_ptrs
+                                .iter()
+                                .zip(cur_ptrs.iter())
+                                .zip(cur_bytes.iter())
+                                .map(|((&a, &b), &n)| decode_cache::ExternalInput {
+                                    first_ptr: a,
+                                    second_ptr: b,
+                                    bytes: n,
+                                })
+                                .collect();
+
+                            if let Some(mut plan) =
+                                decode_cache::DecodePlan::from_two_recordings_with_inputs(
+                                    &first,
+                                    &recording,
+                                    output_ptr,
+                                    output_f32_count,
+                                    output_shape,
+                                    &inputs,
+                                )
+                            {
+                                for (i, &b) in cur_bytes.iter().enumerate() {
+                                    plan.set_input_anchor_bytes_at(i, b);
+                                }
+                                eprintln!(
+                                    "[G2-gemma4] plan ready: {} ops, {} dynamic/{} fixed, {} external patches, {} input anchors",
+                                    plan.len(),
+                                    plan.dynamic_arg_count(),
+                                    plan.fixed_arg_count(),
+                                    plan.external_patch_count(),
+                                    plan.input_count(),
+                                );
+                                for i in 0..plan.input_count() {
+                                    if let Some(a) = plan.input_anchor(i) {
+                                        eprintln!(
+                                            "[G2-gemma4]   anchor #{}: ptr=0x{:x} bytes={}",
+                                            i, a.ptr, a.bytes
+                                        );
+                                    }
+                                }
+                                hdrv::decode_alloc_pause();
+                                hdrv::decode_alloc_reset();
+                                self.decode_state = DecodeState::Replay(plan);
+                            } else {
+                                eprintln!(
+                                    "[G2-gemma4] plan build failed — recordings diverged"
+                                );
+                                hdrv::decode_alloc_stop();
+                                self.decode_state = DecodeState::Init;
+                            }
+                        }
+                    }
+                    _ => {
+                        hdrv::decode_alloc_stop();
+                        self.decode_state = DecodeState::Init;
+                    }
+                }
+            }
+        } else {
+            // Init → WarmUp: arm the decode_alloc table for recording.
+            if matches!(&self.decode_state, DecodeState::Init) {
+                hdrv::decode_alloc_start_record();
+                hdrv::decode_alloc_pause();
+                self.decode_state = DecodeState::WarmUp;
+            }
+        }
+        Ok(())
     }
 
     pub fn clear_kv_cache(&mut self) {
@@ -2541,33 +2585,10 @@ impl ModelWeights {
         // captured plan stale.
         #[cfg(feature = "hip")]
         {
-            self.decode_state = DecodeState::Init;
+            self.decode_state = candle::hip_backend::decode_cache::DecodeState::Init;
         }
     }
 
-    /// Extract the raw HIP device pointer from a tensor's storage. Used by
-    /// the G2/G3 replay path to anchor the per-token input tensor.
-    #[cfg(feature = "hip")]
-    fn hip_device_ptr(t: &Tensor) -> Result<usize> {
-        let (storage, layout) = t.storage_and_layout();
-        match &*storage {
-            candle::Storage::Hip(hip) => {
-                let base = hip.slice.device_ptr() as usize;
-                let offset_bytes = layout.start_offset() * t.dtype().size_in_bytes();
-                Ok(base + offset_bytes)
-            }
-            _ => candle::bail!("expected HIP storage for decode replay"),
-        }
-    }
-
-    /// Extract the HipDevice from a tensor.
-    #[cfg(feature = "hip")]
-    fn hip_device_from_tensor(t: &Tensor) -> Result<candle::hip_backend::HipDevice> {
-        match t.device() {
-            candle::Device::Hip(dev) => Ok(dev.clone()),
-            _ => candle::bail!("expected HIP device for decode replay"),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

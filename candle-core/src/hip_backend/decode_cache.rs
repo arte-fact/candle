@@ -1776,3 +1776,79 @@ impl DecodeGraph {
         self.dynamic_ops.len()
     }
 }
+
+// ============================================================================
+// DecodeState — shared G2/G3 state machine used by all quantized models
+// ============================================================================
+
+/// G2/G3 state machine for decode op cache and HIP graph replay.
+///
+/// Tokens 1-2: warm up (pool + KvCache init).
+/// Token 3: record ops + decode-alloc record (capture buffer addresses).
+/// Token 4: record ops + decode-alloc replay (stable addresses) → build plan.
+/// Token 5+: replay (G2 direct launch loop) or HIP graph launch (G3).
+///
+/// Opt-in via `CANDLE_G2_REPLAY=1`. G3 graph capture additionally
+/// requires `CANDLE_G3_GRAPH=1`.
+pub enum DecodeState {
+    /// Token 1: cold init.
+    Init,
+    /// Token 2: warm-up (pool stabilizing).
+    WarmUp,
+    /// Token 3: first recording captured (decode-alloc was in record mode).
+    /// `input_ptrs` / `input_bytes`: per-anchor device pointers and sizes
+    /// captured from this recording (single-element for llama, multi for
+    /// gemma4 with layer_in + inp_per_layer + SWA masks).
+    Recorded1 {
+        ops: Vec<RecordedOp>,
+        input_ptrs: Vec<usize>,
+        input_bytes: Vec<usize>,
+    },
+    /// Plan built from two recordings, ready for direct replay.
+    Replay(DecodePlan),
+    /// HIP graph captured — single-call execution per decode token.
+    /// Valid only while the live n_kv-padded L_k matches `captured_l_k`.
+    Graph {
+        plan: DecodePlan,
+        graph: DecodeGraph,
+        captured_l_k: usize,
+    },
+}
+
+impl std::fmt::Debug for DecodeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Init => write!(f, "Init"),
+            Self::WarmUp => write!(f, "WarmUp"),
+            Self::Recorded1 { ops, .. } => write!(f, "Recorded1({} ops)", ops.len()),
+            Self::Replay(plan) => write!(f, "Replay({} ops)", plan.len()),
+            Self::Graph { plan, .. } => write!(f, "Graph({} ops)", plan.len()),
+        }
+    }
+}
+
+// ============================================================================
+// Tensor utilities for G2/G3 — shared by all quantized models
+// ============================================================================
+
+/// Extract the raw HIP device pointer from a tensor's storage.
+/// Used by G2/G3 replay paths to anchor per-token input tensors.
+pub fn hip_device_ptr(t: &crate::Tensor) -> crate::Result<usize> {
+    let (storage, layout) = t.storage_and_layout();
+    match &*storage {
+        crate::Storage::Hip(hip) => {
+            let base = hip.slice.device_ptr() as usize;
+            let offset_bytes = layout.start_offset() * t.dtype().size_in_bytes();
+            Ok(base + offset_bytes)
+        }
+        _ => crate::bail!("expected HIP storage for decode replay"),
+    }
+}
+
+/// Extract the HipDevice from a tensor.
+pub fn hip_device_from_tensor(t: &crate::Tensor) -> crate::Result<super::HipDevice> {
+    match t.device() {
+        crate::Device::Hip(dev) => Ok(dev.clone()),
+        _ => crate::bail!("expected HIP device for decode replay"),
+    }
+}

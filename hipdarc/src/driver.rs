@@ -1798,20 +1798,30 @@ impl<'a> LaunchArgs<'a> {
         // symbolic kernel name in addition to the raw handle so the
         // recorder can attach human-readable labels to each captured
         // op (essential for diagnosing replay-state bugs).
-        LAUNCH_RECORDER.with(|rec| {
-            if let Some(ref cb) = *rec.borrow() {
-                cb(
-                    self.func.raw,
-                    self.func.name.as_str(),
-                    cfg.grid_dim,
-                    cfg.block_dim,
-                    cfg.shared_mem_bytes,
-                    self.stream.raw(),
-                    &args,
-                    &sizes,
-                );
-            }
-        });
+        //
+        // Hot-path fast check: skip the thread-local lookup entirely when
+        // no recorder is installed anywhere in the process. Atomic-relaxed
+        // load is one L1 hit (~1 ns) vs the full thread-local + RefCell
+        // borrow (~10 ns). At ~500 kernel launches per decode token this
+        // is ~5 µs saved per token, ~0.2 % of a 26 ms token budget — small
+        // individually, but this sits on the hot-hottest path of the whole
+        // engine.
+        if LAUNCH_RECORDER_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            LAUNCH_RECORDER.with(|rec| {
+                if let Some(ref cb) = *rec.borrow() {
+                    cb(
+                        self.func.raw,
+                        self.func.name.as_str(),
+                        cfg.grid_dim,
+                        cfg.block_dim,
+                        cfg.shared_mem_bytes,
+                        self.stream.raw(),
+                        &args,
+                        &sizes,
+                    );
+                }
+            });
+        }
 
         check_hip(sys::hipModuleLaunchKernel(
             self.func.raw,
@@ -1851,14 +1861,40 @@ thread_local! {
     pub static LAUNCH_RECORDER: std::cell::RefCell<Option<LaunchRecorderFn>> = std::cell::RefCell::new(None);
 }
 
+/// Process-wide fast-path flag. `true` iff at least one thread currently
+/// has a `LAUNCH_RECORDER` installed. When `false`, `LaunchArgs::launch`
+/// skips the thread-local lookup entirely — a single relaxed atomic load
+/// costs ~1 ns vs ~10 ns for `thread_local!` + `RefCell::borrow`.
+///
+/// This is sound because the thread-local recorder can only be set from
+/// the same thread that will issue subsequent launches; toggling this
+/// flag happens under `set_launch_recorder` on that same thread before
+/// the next launch observes it. We never need Acquire/Release here
+/// because there is no cross-thread data dependency — every installer
+/// of a recorder only reads it back on its own thread.
+pub static LAUNCH_RECORDER_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Set the launch recorder callback. Returns the previous one (if any).
 pub fn set_launch_recorder(recorder: Option<LaunchRecorderFn>) -> Option<LaunchRecorderFn> {
-    LAUNCH_RECORDER.with(|r| {
+    let now_active = recorder.is_some();
+    let prev = LAUNCH_RECORDER.with(|r| {
         let mut r = r.borrow_mut();
         let prev = r.take();
         *r = recorder;
         prev
-    })
+    });
+    // Fast-path flag: true iff at least one thread has an installed
+    // recorder. We approximate "at least one" by latching true whenever
+    // anyone installs a recorder and only clearing on uninstall when
+    // OUR thread is uninstalling. That is safe because G2 uses a single
+    // recording thread at a time (the model forward's thread).
+    if now_active {
+        LAUNCH_RECORDER_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    } else if prev.is_some() {
+        LAUNCH_RECORDER_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    prev
 }
 
 /// Convenience macro to push a scalar kernel argument.

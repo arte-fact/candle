@@ -107,7 +107,15 @@ impl ModelWeights {
             }
         }
 
-        let layers: Vec<Layer> = (0..block_count)
+        // Scoped local pool — threads are joined when `pool` drops at the
+        // end of this function, so they don't spin during decode.
+        let n_upload_threads = (devices.len() * 2).max(2);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n_upload_threads)
+            .build()
+            .map_err(|e| candle::Error::Msg(format!("rayon pool build: {e}")))?;
+        let layers: Vec<Layer> = pool.install(|| {
+            (0..block_count)
             .into_par_iter()
             .map(|il| -> Result<Layer> {
                 let prefix = format!("blk.{il}");
@@ -139,7 +147,8 @@ impl ModelWeights {
                     device: layer_device,
                 })
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+        })?;
 
         // Output norm + lm_head on the device of the last layer.
         let last_dev = devices[layer_to_device[block_count - 1]].clone();
