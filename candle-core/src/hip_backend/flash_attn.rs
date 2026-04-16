@@ -1768,3 +1768,189 @@ pub fn gqa_attention_decode_mv(
         false,
     ))
 }
+
+// ============================================================================
+// Task #2 — Decomposed decode attention entry point.
+// ----------------------------------------------------------------------------
+// Runs the 3-kernel chain:
+//   (A) gqa_decode_gemv_qk_d{256,512}_f32_b128   → scores[B, H_q, 1, L_k]
+//   (B) masked_softmax_scale_fused               → attn[B, H_q, 1, L_k]
+//   (C) gqa_decode_gemv_v_d{256,512}_f32_b128    → out[B, H_q, 1, D]
+//
+// Opt-in via `CANDLE_ATTN_DECOMPOSED=1`. Purpose: evaluate whether
+// decomposed attention beats fused `gqa_decode_mv_fast_d{256,512}_f32`
+// on gfx906 (where fused fuses Q·K / softmax / V·attn with online-softmax
+// but can't use 128-thread blocks without per-T sync regression).
+//
+// Constraints:
+//   * Decode only (L_q = 1).
+//   * D ∈ {256, 512} (SWA / global head dims for gemma4-E4B).
+//   * Q, K, V all f32 contiguous on the same HIP device.
+//   * `l_k_iter` is the ACTUAL K length to attend to. For n_kv-padded
+//     callers, K/V are (B, H_kv, l_k_alloc, D) with l_k_iter ≤ l_k_alloc;
+//     scores are computed for ALL l_k_alloc positions and the mask
+//     (caller-supplied for padded positions) zeros the out-of-range
+//     attention weights.
+// ============================================================================
+#[allow(clippy::too_many_arguments)]
+pub fn gqa_attention_decode_mv_decomposed(
+    q: &Tensor,                 // (B, n_head, 1, D) f32 contiguous
+    k: &Tensor,                 // (B, n_kv_head, L_k_alloc, D) f32 contiguous
+    v: &Tensor,                 // (B, n_kv_head, L_k_alloc, D) f32 contiguous
+    mask: Option<&Tensor>,      // optional additive f32 mask (1,1,1,L_k) or (B,1,1,L_k)
+    scale: f64,
+    _l_k_iter: usize,           // accepted for signature compat; masking handles padding
+) -> Result<Tensor> {
+    let dev = match q.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("gqa_attention_decode_mv_decomposed: q must be HIP"),
+    };
+    let (b, n_head, l_q, d) = q.dims4()?;
+    if l_q != 1 {
+        crate::bail!(
+            "gqa_attention_decode_mv_decomposed: requires L_q=1, got {l_q}"
+        );
+    }
+    if !matches!(d, 256 | 512) {
+        crate::bail!(
+            "gqa_attention_decode_mv_decomposed: only D ∈ {{256, 512}}, got {d}"
+        );
+    }
+    if q.dtype() != DType::F32 || !q.is_contiguous() {
+        crate::bail!("gqa_attention_decode_mv_decomposed: q must be f32 contiguous");
+    }
+    if k.dtype() != DType::F32 || !k.is_contiguous()
+        || v.dtype() != DType::F32 || !v.is_contiguous()
+    {
+        crate::bail!("gqa_attention_decode_mv_decomposed: K/V must be f32 contiguous");
+    }
+
+    let (_, n_kv, l_k_alloc, _) = k.dims4()?;
+    if n_head % n_kv != 0 {
+        crate::bail!("gqa_attention_decode_mv_decomposed: n_head % n_kv != 0");
+    }
+    let n_rep = n_head / n_kv;
+
+    // ------------------------------------------------------------------
+    // Kernel A: Q·K gemv.
+    // scores layout matches (B, H_q, 1, L_k) so masked_softmax_scale picks
+    // up the last-dim reduction directly.
+    // ------------------------------------------------------------------
+    let scores = unsafe { dev.alloc::<f32>(b * n_head * l_k_alloc)? };
+
+    let qk_name = match d {
+        256 => "gqa_decode_gemv_qk_d256_f32_b128",
+        512 => "gqa_decode_gemv_qk_d512_f32_b128",
+        _ => unreachable!(),
+    };
+    let qk_func = dev.get_or_load_func(qk_name, &kernels::FLASH_ATTN_V2)?;
+
+    let (q_st, q_l) = q.storage_and_layout();
+    let (k_st, k_l) = k.storage_and_layout();
+    let (v_st, v_l) = v.storage_and_layout();
+
+    macro_rules! hv {
+        ($s:expr, $l:expr) => {{
+            let h = match &*$s { Storage::Hip(s) => s, _ => panic!("not HIP") };
+            let sl = h.as_hip_slice::<f32>()?;
+            let off = $l.start_offset();
+            sl.slice(off..sl.len())
+        }};
+    }
+    let q_view = hv!(q_st, q_l);
+    let k_view = hv!(k_st, k_l);
+    let v_view = hv!(v_st, v_l);
+
+    let qk_cfg = LaunchConfig {
+        grid_dim: (l_k_alloc as u32, n_head as u32, b as u32),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    {
+        let mut bld = qk_func.builder();
+        bld.arg(&q_view);
+        bld.arg(&k_view);
+        bld.arg(&scores);
+        let l_k_i = l_k_alloc as i32;
+        let nhq = n_head as i32;
+        let nhkv = n_kv as i32;
+        let nrep_i = n_rep as i32;
+        bld.arg(&l_k_i);
+        bld.arg(&nhq);
+        bld.arg(&nhkv);
+        bld.arg(&nrep_i);
+        unsafe { bld.launch(qk_cfg) }.w()?;
+    }
+    drop(q_st);
+    drop(k_st);
+
+    // Wrap scores as a Tensor for the softmax step.
+    let scores_storage = HipStorage::wrap_hip_slice(scores, dev.clone());
+    let scores_tensor = Tensor::from_storage(
+        Storage::Hip(scores_storage),
+        <Shape as From<(usize, usize, usize, usize)>>::from((b, n_head, 1usize, l_k_alloc)),
+        BackpropOp::none(),
+        false,
+    );
+
+    // ------------------------------------------------------------------
+    // Kernel B: fused masked_softmax_scale (reuse existing kernel).
+    // ------------------------------------------------------------------
+    let attn_weights = crate::hip_backend::masked_softmax_scale_fused(
+        &scores_tensor, mask, scale,
+    )?;
+
+    // ------------------------------------------------------------------
+    // Kernel C: attn_weights · V → out.
+    // ------------------------------------------------------------------
+    let v_name = match d {
+        256 => "gqa_decode_gemv_v_d256_f32_b128",
+        512 => "gqa_decode_gemv_v_d512_f32_b128",
+        _ => unreachable!(),
+    };
+    let v_func = dev.get_or_load_func(v_name, &kernels::FLASH_ATTN_V2)?;
+
+    let out = unsafe { dev.alloc::<f32>(b * n_head * d)? };
+
+    let (aw_st, aw_l) = attn_weights.storage_and_layout();
+    let aw_view = hv!(aw_st, aw_l);
+
+    // Dynamic LDS for attn_weights broadcast — sized exactly to L_k_alloc.
+    // Grid splits D across blocks to avoid CU starvation: (D/128, H_q, B)
+    // → 16 blocks for D=256 on E4B SWA (up from 8 with the original
+    // "one block per (b, h_q)" layout — profile showed that version ran
+    // 201 µs/call vs the 26 µs baseline because only 8 × 2 = 16 waves
+    // were active on a 240-wave-slot GPU).
+    const D_CHUNK: usize = 128;
+    let n_d_chunks = d / D_CHUNK;
+    let v_cfg = LaunchConfig {
+        grid_dim: (n_d_chunks as u32, n_head as u32, b as u32),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: (l_k_alloc * std::mem::size_of::<f32>()) as u32,
+    };
+    {
+        let mut bld = v_func.builder();
+        bld.arg(&aw_view);
+        bld.arg(&v_view);
+        bld.arg(&out);
+        let l_k_i = l_k_alloc as i32;
+        let nhq = n_head as i32;
+        let nhkv = n_kv as i32;
+        let nrep_i = n_rep as i32;
+        bld.arg(&l_k_i);
+        bld.arg(&nhq);
+        bld.arg(&nhkv);
+        bld.arg(&nrep_i);
+        unsafe { bld.launch(v_cfg) }.w()?;
+    }
+    drop(aw_st);
+    drop(v_st);
+
+    let os = HipStorage::wrap_hip_slice(out, dev);
+    Ok(Tensor::from_storage(
+        Storage::Hip(os),
+        <Shape as From<(usize, usize, usize, usize)>>::from((b, n_head, 1usize, d)),
+        BackpropOp::none(),
+        false,
+    ))
+}

@@ -1605,3 +1605,212 @@ gqa_decode_split_combine_d512_f32(
     gqa_decode_split_combine_impl<512, 64, 16>(
         partial_o, partial_m, partial_l, out, B, H_q, n_chunks);
 }
+
+// =====================================================================
+// Task #2 — DECOMPOSED attention for gemma4-E4B decode
+// ---------------------------------------------------------------------
+// Replaces the fused `gqa_decode_mv_fast_impl` with a 3-kernel chain:
+//
+//   (A) `gqa_decode_gemv_qk_d{N}_f32_b128`  → scores[b, h_q, t]
+//   (B)  softmax/masked_softmax_scale_f32    → attn[b, h_q, t]  (reuse)
+//   (C) `gqa_decode_gemv_v_d{N}_f32_b128`   → out[b, h_q, d]
+//
+// Rationale (Task #4 rocprofv3 data + web cross-check):
+//   - llama.cpp runs E4B decode attention as 3 kernels, not fused. Its
+//     `mul_mat_vec_f<f32,f32,1,128>` completes a single gemv at ~8.7 µs/call
+//     while candle's fused `gqa_decode_mv_fast_d256_f32` takes 29.9 µs/call.
+//   - candle's fused kernel has a serial chain per T (Q·K reduce → m_i
+//     update → alpha/p exp → V·attn accumulate) that limits ILP. Decomposed
+//     kernels are pure gemvs with a single reduce at the tail — compiler
+//     freely schedules VMEM/ALU.
+//   - AMD ROCm composable_kernel rejects fused FA on MI50 (Issue #1140
+//     closed-not-planned). gfx906 community (nlzy, iacopPBK) all use
+//     decomposed gemvs. Validated architectural direction.
+//   - Previously-attempted 128-thread FUSED kernel regressed (see
+//     line 845-852 above) because `__syncthreads` per T iteration dominates.
+//     In the decomposed path, cross-wave sync is ONCE at the tail of each
+//     gemv — amortized over D iterations. No regression.
+//
+// Block layout (both A and C):
+//   BLOCK_SIZE = 128 (2 waves of 64 threads each on gfx906).
+//   Per-wave DPP sum reduce using `gfx906_warp_reduce_sum` (Phase J redo).
+//   Cross-wave combine via 2-slot LDS + __syncthreads.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// Kernel A: Q·K dot for ALL L_k positions (decode, L_q=1).
+// ---------------------------------------------------------------------
+// Grid:  (L_k, H_q, B)           — one block per (batch, q_head, K-row).
+// Block: (128, 1, 1)             — 2 waves cooperating.
+// Writes scores[B, H_q, 1, L_k] in row-major (for B*H_q*L_k outputs).
+//
+// Each thread strides D in steps of BLOCK_SIZE, accumulates partial
+// dot product. Tail warp-reduces within each wave; lane 0 of each wave
+// writes its partial to LDS; one final warp-wide add produces the scalar.
+//
+// NB: scale is applied in the downstream softmax_scale, not here — keeps
+// kernel A purely a gemv.
+template <int D>
+static __device__ __forceinline__ void gqa_decode_gemv_qk_b128_impl(
+    const float * __restrict__ q,        // (B, H_q, 1, D)
+    const float * __restrict__ k,        // (B, H_kv, L_k, D)
+    float * __restrict__ scores,         // (B, H_q, 1, L_k)
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    static_assert(D % 2 == 0, "D must be even for float2 loads");
+    constexpr int BLOCK_SIZE = 128;
+    constexpr int D2 = D / 2;
+    constexpr int F2_PER_THREAD = (D2 + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    const int t     = blockIdx.x;        // K position
+    const int h_q   = blockIdx.y;
+    const int b     = blockIdx.z;
+    const int tid   = threadIdx.x;
+
+    const int h_kv  = (n_rep > 1) ? (h_q / n_rep) : h_q;
+
+    const int64_t q_off = ((int64_t)(b * H_q) + h_q) * D;
+    const int64_t k_off = (((int64_t)(b * H_kv) + h_kv) * L_k + t) * D;
+
+    const float2 * q2 = (const float2 *)(q + q_off);
+    const float2 * k2 = (const float2 *)(k + k_off);
+
+    // Per-thread partial dot — each thread handles F2_PER_THREAD float2 pairs.
+    float partial = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < F2_PER_THREAD; ++i) {
+        const int col2 = tid + i * BLOCK_SIZE;
+        if (col2 < D2) {
+            const float2 qv = q2[col2];
+            const float2 kv = k2[col2];
+            partial += qv.x * kv.x + qv.y * kv.y;
+        }
+    }
+
+    // Wave-local DPP reduce (7 cycles on gfx906 — Phase J).
+    partial = v2_warp_reduce_sum(partial);
+
+    // Cross-wave combine: 2 waves, 2 LDS slots.
+    __shared__ float smem[2];
+    const int wave_id      = tid >> 6;
+    const int lane_in_wave = tid & 63;
+    if (lane_in_wave == 0) {
+        smem[wave_id] = partial;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float final_sum = smem[0] + smem[1];
+        // scores[b, h_q, 0, t] — layout (B, H_q, 1, L_k).
+        scores[((int64_t)(b * H_q) + h_q) * L_k + t] = final_sum;
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1)
+gqa_decode_gemv_qk_d256_f32_b128(
+    const float * __restrict__ q, const float * __restrict__ k,
+    float * __restrict__ scores,
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    gqa_decode_gemv_qk_b128_impl<256>(q, k, scores, L_k, H_q, H_kv, n_rep);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1)
+gqa_decode_gemv_qk_d512_f32_b128(
+    const float * __restrict__ q, const float * __restrict__ k,
+    float * __restrict__ scores,
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    gqa_decode_gemv_qk_b128_impl<512>(q, k, scores, L_k, H_q, H_kv, n_rep);
+}
+
+// ---------------------------------------------------------------------
+// Kernel C: weighted-V accumulate. Reads post-softmax attn weights,
+// multiplies against V, writes per-(b, h_q) output row.
+// ---------------------------------------------------------------------
+// Grid:  (H_q, B, 1)           — one block per (batch, q_head).
+// Block: (128, 1, 1)           — 2 waves; each thread owns D/128 output d's.
+//
+// Hot loop: for each t in [0, L_k), read attn[t] (LDS-hit after preload)
+// and V[b, h_kv, t, own_d], FMA into per-thread accumulator. After loop,
+// each thread writes its own d slot — no reduction needed across threads
+// (they own disjoint output positions).
+//
+// `attn` has layout (B, H_q, 1, L_k). We preload the whole row into LDS
+// once per block so the T-loop re-reads LDS instead of HBM.
+// Grid is (D/D_CHUNK, H_q, B). Each block computes a D_CHUNK slice of
+// the output for (b, h_q). Thread-per-d within the D_CHUNK; loops over
+// L_k and accumulates per-d. With D_CHUNK=BLOCK_SIZE, each thread owns
+// exactly one output d. Writes out[b, h_q, d_base + tid].
+//
+// Why grid.x = D/BLOCK_SIZE instead of 1: the original 1-block-per-
+// (b,h_q) version launched only H_q=8 blocks on gfx906 (60 CUs), leaving
+// 50+ CUs idle and pushing this kernel to 201 µs/call (vs the 26 µs of
+// the existing split-chunk fused baseline). Splitting D across blocks
+// brings block count to (D/BLOCK_SIZE) * H_q * B = 2 * 8 * 1 = 16 on
+// D=256, and 4 * 8 * 1 = 32 on D=512. Still modest, but eliminates the
+// CU-starvation ceiling.
+template <int D>
+static __device__ __forceinline__ void gqa_decode_gemv_v_b128_impl(
+    const float * __restrict__ attn,    // (B, H_q, 1, L_k) post-softmax
+    const float * __restrict__ v,       // (B, H_kv, L_k, D)
+    float * __restrict__ out,           // (B, H_q, 1, D)
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    constexpr int BLOCK_SIZE = 128;
+    constexpr int D_CHUNK = BLOCK_SIZE;  // one thread per d within chunk.
+    static_assert(D % D_CHUNK == 0, "D must be a multiple of D_CHUNK");
+
+    const int d_chunk_idx = blockIdx.x;
+    const int h_q         = blockIdx.y;
+    const int b           = blockIdx.z;
+    const int tid         = threadIdx.x;
+
+    const int h_kv = (n_rep > 1) ? (h_q / n_rep) : h_q;
+    const int d    = d_chunk_idx * D_CHUNK + tid;
+
+    const int64_t attn_off = ((int64_t)(b * H_q) + h_q) * L_k;
+    const int64_t v_off    = ((int64_t)(b * H_kv) + h_kv) * L_k * D + (int64_t)d;
+    const int64_t out_off  = ((int64_t)(b * H_q) + h_q) * D + (int64_t)d;
+
+    const float * attn_ptr = attn + attn_off;
+    const float * v_ptr    = v + v_off;
+    float       * out_ptr  = out + out_off;
+
+    // Broadcast attn row to all threads via dynamic LDS so the T-loop
+    // re-reads LDS instead of HBM.
+    extern __shared__ float attn_lds[];
+    for (int t = tid; t < L_k; t += BLOCK_SIZE) {
+        attn_lds[t] = attn_ptr[t];
+    }
+    __syncthreads();
+
+    // Single accumulator — each thread owns exactly ONE d position.
+    float acc = 0.0f;
+
+    // V[b, h_kv, t, d] where d = d_chunk_idx * 128 + tid.
+    // Stride between consecutive T rows = D, so V access is
+    // v_ptr[t * D] for our owned d.
+    for (int t = 0; t < L_k; ++t) {
+        acc += attn_lds[t] * v_ptr[(int64_t)t * D];
+    }
+
+    *out_ptr = acc;
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1)
+gqa_decode_gemv_v_d256_f32_b128(
+    const float * __restrict__ attn, const float * __restrict__ v,
+    float * __restrict__ out,
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    gqa_decode_gemv_v_b128_impl<256>(attn, v, out, L_k, H_q, H_kv, n_rep);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1)
+gqa_decode_gemv_v_d512_f32_b128(
+    const float * __restrict__ attn, const float * __restrict__ v,
+    float * __restrict__ out,
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    gqa_decode_gemv_v_b128_impl<512>(attn, v, out, L_k, H_q, H_kv, n_rep);
+}

@@ -1357,12 +1357,28 @@ impl ModelWeights {
                         let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
                         let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
                         let l_k_iter = pad_info.map(|(t_cur, _)| t_cur).unwrap_or(k_c.dim(2)?);
-                        candle::hip_backend::gqa_attention_decode_mv(
-                            q_precomputed, &k_c, &v_c,
-                            attention_mask.as_ref(),
-                            self.layers[il].attn.attn_scale,
-                            l_k_iter,
-                        )?
+                        // Task #2: opt-in decomposed attention (gemv_qk → softmax → gemv_v).
+                        // Per-op micro-bench shows parity-to-slight-win vs the fused
+                        // gqa_decode_mv_fast (41 vs 43 µs). Gate behind
+                        // CANDLE_ATTN_DECOMPOSED=1 until validated across full decode.
+                        let use_decomposed = std::env::var("CANDLE_ATTN_DECOMPOSED")
+                            .map(|v| v != "0" && v != "false")
+                            .unwrap_or(false);
+                        if use_decomposed {
+                            candle::hip_backend::gqa_attention_decode_mv_decomposed(
+                                q_precomputed, &k_c, &v_c,
+                                attention_mask.as_ref(),
+                                self.layers[il].attn.attn_scale,
+                                l_k_iter,
+                            )?
+                        } else {
+                            candle::hip_backend::gqa_attention_decode_mv(
+                                q_precomputed, &k_c, &v_c,
+                                attention_mask.as_ref(),
+                                self.layers[il].attn.attn_scale,
+                                l_k_iter,
+                            )?
+                        }
                     } else {
                         // Prefill: reuse the legacy D-major fast path by
                         // transposing T-major K to (B, H, D, T) once per
