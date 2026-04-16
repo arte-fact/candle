@@ -68,18 +68,41 @@ Phases are not strictly additive (W1 and W7 both attack CPU overhead, W3 and W3a
 
 Reordered from rev. 1 by **impact** rather than effort. W3 and W1 are the two biggest levers and should land first; everything else compounds on top.
 
-### W3 — Physical gather-by-expert MoE **[biggest single win, lead]**
+### W3 — Physical gather-by-expert MoE **[NOT A WIN on Gemma-4; retained as opt-in]**
 
-**Target:** replace `indexed_moe_forward_q8_0_q8_1` (818 µs/call, 6.38 s/run) with `gather → N×MMVQ → scatter`. Each activated expert becomes an independent MMVQ launch — the 60 MI50 CUs run multiple experts in parallel instead of one-expert-per-workgroup serially.
+**Status: landed as opt-in, default OFF (2026-04-16).** Performance measurement invalidated the original premise.
 
-**Why first:** biggest GPU-time recovery (~5 s aggregate, ~10–15 pp tg). Uses candle's already-winning MMVQ Q8 kernel (35 µs/call) as the hot path, so closing MoE gap actually **leverages** a candle strength.
+**What was implemented** (`CANDLE_W3_GATHER=1` to enable):
+- `launch_mul_mat_vec_q8_1_chunk_raw` view-based MMVQ dispatcher (`candle-core/src/quantized/hip.rs`).
+- Per-expert branch inside `launch_indexed_moe_forward_with_q8` that loops `topk` times calling the warp-coop MMVQ kernel on expert-sliced weights. Covers both `input_dim1 == 1` (gate/up) and `input_dim1 == topk` (down).
+- Thread-local CPU-ids cache (`w3_cached_ids_set/take/clear`) in the same file, wired in `quantized_gemma4.rs` and `quantized_blocks/ffn.rs` — avoids per-projection D2H syncs.
+- `hipdarc::Stream::clone_dtoh_view` helper.
+- Extended `candle-core/examples/hip_moe_mmq_test.rs` with tokens=1 decode rows — rel-err ≤ 3e-6 vs fused kernel (essentially bit-exact).
 
-**Projected gain:** 6.57 s → ~1.0 s MoE kernel time on aggregate, **+10–15 pp tg**. If we also land W3a, add +2–3 pp.
+**Why it doesn't win on Gemma-4-26B-A4B-Q8_0 decode:**
 
-**Evidence:**
-- `indexed_moe_forward_q8_0_q8_1`: 7,800 × **818 µs** = 6.38 s (61.5 % GPU)
-- Turbo equivalent path: `mul_mat_vec_q<Q8>` (34 µs × ~30k calls) + `mm_ids_helper<8>` (51 µs × 116) ≈ 1.0 s
-- Candle's own MMVQ at 35 µs/call already beats turbo's — per-call competitiveness is not the issue, serialisation is
+The roadmap assumed fused-kernel per-call = 818 µs based on `7800 calls × 818 µs = 6.38 s` from the 2026-04-16 rocprofv3 baseline. That average is **dominated by the 120 prefill calls at ~46 ms each (5.52 s)** — the 7,680 decode calls averaged only **~79–112 µs**. The per-decode-call cost was already competitive.
+
+Per equivalent work on decode:
+| path | per call | equivalent decode cost |
+|---|---:|---:|
+| fused `indexed_moe_forward_q8_0_q8_1` | ~112 µs | 112 µs |
+| 8× warp-coop MMVQ | 17 µs | **136 µs (21 % slower)** |
+
+Measured outcome (uninstrumented, 4-GPU, pp512+tg128, best-of-3):
+
+| | W3 off (W3a baseline) | W3 on |
+|---|---:|---:|
+| pp512 | 655 t/s | 639 t/s (−2.4 %) |
+| **tg128** | **44.81 t/s** | **42.83 t/s (−4.4 %)** |
+
+Regression gate: `mmvq_q8 +69 %` (PRESERVE family FAIL).
+
+**When it might help:** the opt-in path is kept because shape/tile economics differ per model. Qwen3-Coder-30B-A3B at Q4_0 has smaller `n * k` per expert; the 8×-MMVQ path might pay off there. To validate, run `CANDLE_W3_GATHER=1 candle-bench bench --backend candle --bin quantized-qwen35 --model <qwen-gguf> --gpus 0,1,2,3 --prompt-len 512 --tg-len 128` and compare.
+
+**Lesson** (added to MEMORY feedback): aggregate-averaged per-call µs on profile summaries can conflate prefill and decode. Split per-call-µs by `input_dim1` / `b_size` before projecting wins.
+
+**Remaining levers:** W3's planned +10–15 pp on tg is off the table. The roadmap's 1.05× turbo goal now rests on **W1 (alloc pool), W5 (ucopy), W6 (elementwise), W7 (G2/G3)** — all CPU-overhead fixes. W3 artefacts remain in tree as the retained escape-hatch for future models.
 
 **Implementation:**
 - **W3a — LANDED 2026-04-16.** Fused `moe_combine_weighted_sum_f32` replaces
@@ -314,18 +337,18 @@ Projections per phase (non-additive: dependencies and diminishing-returns noted)
 | state | tg128 | vs turbo | sys CPU (rocprof) | hipMallocAsync |
 |---|---:|---:|---:|---:|
 | today | 43.84 | 0.66× | 282 s | 13,181 |
-| + W3 (defuse MoE) | ~52 | 0.78× | 275 s | 13,181 |
-| + W3a (fast_sum fuse) | ~53 | 0.80× | 275 s | 13,181 |
-| + W1 (alloc pool) | ~58 | 0.87× | ~50 s | 0 |
-| + W2 (peer-to-peer) | ~61 | 0.91× | ~45 s | 0 |
-| + W5 (ucopy clean) | ~63 | 0.95× | ~40 s | 0 |
-| + W6 (param bin_bcast) | ~66 | 0.99× | ~35 s | 0 |
-| + W4 (memset clean) | ~67 | 1.00× | ~28 s | 0 |
-| **+ W7 (G2/G3 active)** | **~72–76** | **1.08–1.14×** | **~12 s** | **0** |
+| + W3a (fused moe-combine — **landed**) | 44.81 | 0.67× | 282 s | 13,181 |
+| + W3 (gather-by-expert — **net-negative, reverted to opt-in**) | — | — | — | — |
+| + W1 (alloc pool) | ~52 | 0.78× | ~50 s | 0 |
+| + W5 (ucopy clean) | ~54 | 0.81× | ~45 s | 0 |
+| + W2 (peer-to-peer) | ~57 | 0.85× | ~40 s | 0 |
+| + W6 (param bin_bcast) | ~60 | 0.90× | ~35 s | 0 |
+| + W4 (memset clean) | ~62 | 0.93× | ~28 s | 0 |
+| **+ W7 (G2/G3 active)** | **~68–72** | **1.02–1.08×** | **~12 s** | **0** |
 
-W7 is the phase that decisively beats turbo. W1–W6 bring us to parity; W7 is where candle's G2/G3 architecture lever — which turbo doesn't have — is cashed in.
+Revised after W3 retro: without W3's planned 8–12 pp, the parity line now sits at **W1+W5+W2+W6+W4** (≈ 0.93× turbo) and the over-turbo push depends on **W7** (G2/G3 replay) delivering. W7 is the phase that decisively beats turbo via the architecture lever turbo doesn't have. W1 alone is the biggest remaining win (projected +8–12 pp from eliminating 13,181 `hipMallocAsync` calls per decode run).
 
-**Fallback plan if W7 hits blockers** (multi-device MoE capture is non-trivial): the W1–W6 stack alone lands us at ~0.99–1.00× turbo on uninstrumented tg128, with headroom from additional cleanup (e.g., promote `k_bin_bcast`-equivalent candle kernel to handle `topk_moe_norm`+`fast_sum` together).
+**Fallback plan if W7 hits blockers**: W1–W6 lands ≈ 0.90–0.93× turbo. Additional push would come from revisiting the MoE path (W3b gather-by-expert for prefill + physical MoE for large b_size) or from unplanned wins in W1 itself (driver sys-time drop can exceed linear projections once ioctl amplification is removed).
 
 ## Validation harness
 

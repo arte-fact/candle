@@ -1897,7 +1897,24 @@ impl ModelWeights {
                 let flat_tokens = b_sz_ff * seq_len_ff;
                 let n_experts = routing_weights.dim(candle::D::Minus1)?;
                 let rw_flat = routing_weights.reshape((flat_tokens, n_experts))?;
+                // W3 step 4: only sync topk_ids to CPU when W3 gather
+                // is enabled — otherwise the D2H per layer has no
+                // consumer and adds a stream drain for nothing.
+                #[cfg(feature = "hip")]
+                let w3_gather_on = std::env::var("CANDLE_W3_GATHER")
+                    .map_or(false, |v| v != "0");
+                #[cfg(not(feature = "hip"))]
+                let w3_gather_on = false;
+
                 let (topk_ids, topk_weights) = if let Some((w, ids)) = topk_fused {
+                    #[cfg(feature = "hip")]
+                    {
+                        if w3_gather_on {
+                            let ids_cpu: Vec<u32> =
+                                ids.flatten_all()?.to_vec1::<u32>()?;
+                            candle::quantized::hip::w3_cached_ids_set(ids_cpu);
+                        }
+                    }
                     (ids, w)
                 } else {
                     let topk_ids = {
@@ -1908,8 +1925,18 @@ impl ModelWeights {
                             .contiguous()?;
                         // A3 / EPLB diagnostic — observe routing while ids live
                         // on CPU.  No-op when CANDLE_EPLB_PRINT / _DUMP unset.
-                        if let Ok(v) = ids.flatten_all()?.to_vec1::<u32>() {
+                        let v: Vec<u32> = ids
+                            .flatten_all()?
+                            .to_vec1::<u32>()
+                            .unwrap_or_default();
+                        if !v.is_empty() {
                             crate::models::quantized_blocks::eplb::observe(&v, il);
+                        }
+                        #[cfg(feature = "hip")]
+                        {
+                            if w3_gather_on && !v.is_empty() {
+                                candle::quantized::hip::w3_cached_ids_set(v);
+                            }
                         }
                         ids.to_device(&device)?
                     };
@@ -2056,6 +2083,12 @@ impl ModelWeights {
                     }
                 };
                 let moe_summed = moe_summed.reshape((b_sz_ff, seq_len_ff, hidden))?;
+
+                // W3 cache cleanup: ensure no stale topk_ids leak to
+                // the next MoE layer.
+                #[cfg(feature = "hip")]
+                candle::quantized::hip::w3_cached_ids_clear();
+
                 let moe_normed = moe_branch.post_norm.forward(&moe_summed)?;
 
                 // Debug: zero out outputs for isolation

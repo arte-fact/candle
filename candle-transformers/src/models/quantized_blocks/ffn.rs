@@ -459,20 +459,46 @@ impl MoeExperts {
         };
         // T1.2 fast path: fused softmax+topk+norm on GPU.  Falls back
         // to the legacy CPU arg_sort chain when not applicable.
+        //
+        // W3 step 4: only sync topk_ids to CPU when W3 gather is on
+        // (opt-in via CANDLE_W3_GATHER=1). The cache is reset at end
+        // of the MoE layer so the next layer doesn't pick up stale
+        // ids.
+        #[cfg(feature = "hip")]
+        let w3_gather_on = std::env::var("CANDLE_W3_GATHER")
+            .map_or(false, |v| v != "0");
+
         let (topk_weights, topk_ids) = if let Some((w, ids)) =
             try_topk_fused(&router_logits, self.num_experts_per_tok)
         {
+            #[cfg(feature = "hip")]
+            {
+                if w3_gather_on {
+                    let ids_cpu: Vec<u32> =
+                        ids.flatten_all()?.to_vec1::<u32>()?;
+                    candle::quantized::hip::w3_cached_ids_set(ids_cpu);
+                }
+            }
             (w, ids)
         } else {
             let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
             let cpu = candle::Device::Cpu;
             let rw_cpu = routing_weights.to_device(&cpu)?;
-            let topk_ids_cpu = rw_cpu
+            let topk_ids_cpu_tensor = rw_cpu
                 .arg_sort_last_dim(false)?
                 .narrow(D::Minus1, 0, self.num_experts_per_tok)?
                 .contiguous()?;
+            #[cfg(feature = "hip")]
+            {
+                if w3_gather_on {
+                    let ids_cpu: Vec<u32> = topk_ids_cpu_tensor
+                        .flatten_all()?
+                        .to_vec1::<u32>()?;
+                    candle::quantized::hip::w3_cached_ids_set(ids_cpu);
+                }
+            }
             let hip_dev = candle::Device::Hip(dev.clone());
-            let topk_ids = topk_ids_cpu.to_device(&hip_dev)?;
+            let topk_ids = topk_ids_cpu_tensor.to_device(&hip_dev)?;
             let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
             let topk_weights = (&topk_weights
                 / topk_weights.sum_keepdim(D::Minus1)?.broadcast_as(topk_weights.shape())?)?;
@@ -508,6 +534,12 @@ impl MoeExperts {
         } else {
             candle::bail!("MoE has no expert weights");
         };
+
+        // End-of-layer cleanup: drop the stashed ids so the next MoE
+        // layer doesn't pick up stale values (its own ids will be set
+        // on entry).
+        #[cfg(feature = "hip")]
+        candle::quantized::hip::w3_cached_ids_clear();
 
         let topk_weights = topk_weights.unsqueeze(D::Minus1)?;
         let weighted = moe_out.broadcast_mul(&topk_weights)?;

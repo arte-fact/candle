@@ -3,11 +3,52 @@ use crate::quantized::k_quants::GgmlType;
 use crate::{backend::BackendDevice, hip_backend::WrapErr};
 use crate::{Result};
 use half::f16;
+use std::cell::RefCell;
 
 use hipdarc::driver::{HipSlice, HipView};
 
 use crate::hip_backend::HipDevice;
 use crate::HipStorage;
+
+// ---------------------------------------------------------------------------
+// W3 — cached topk ids for per-layer MoE dispatch.
+//
+// The W3 branch in `launch_indexed_moe_forward_with_q8` reads the
+// topk_ids on CPU to pick expert weight slices. Doing this separately
+// for each projection (gate, up, down) triples the D2H syncs per MoE
+// layer. To amortise: `MoeExperts::forward_shared_q8_decode` calls
+// `w3_cached_ids_set` ONCE after topk is available, then the three
+// subsequent `indexed_moe_forward(_preq8)` calls pick it up via
+// `w3_cached_ids_take`. The cache is reset (take-once semantics) after
+// each consumer to avoid leaking stale ids across layers.
+//
+// Thread-local: matches how HIP streams are already per-thread.
+thread_local! {
+    static W3_TOPK_IDS_CACHE: RefCell<Option<Vec<u32>>> = const { RefCell::new(None) };
+}
+
+/// Stash a CPU-resident copy of `topk_ids` for the imminent MoE
+/// dispatch. Caller must ensure the vec contains at least `topk`
+/// contiguous u32s in the layout `indexed_moe_forward_*` expects
+/// (`[topk]` for decode batch=1). Any previously stashed value is
+/// dropped.
+pub fn w3_cached_ids_set(ids: Vec<u32>) {
+    W3_TOPK_IDS_CACHE.with(|c| *c.borrow_mut() = Some(ids));
+}
+
+/// Retrieve a clone of the stashed CPU topk-ids. `None` when nothing
+/// was stashed. Callers fall back to `stream.clone_dtoh_view(ids)` in
+/// that case. The stash stays — use `w3_cached_ids_clear` at the end
+/// of the MoE layer so stale ids don't leak into the next layer.
+pub fn w3_cached_ids_take() -> Option<Vec<u32>> {
+    W3_TOPK_IDS_CACHE.with(|c| c.borrow().clone())
+}
+
+/// Drop any stashed CPU topk-ids. Call at the end of a MoE layer to
+/// avoid holding the vec past its validity window.
+pub fn w3_cached_ids_clear() {
+    W3_TOPK_IDS_CACHE.with(|c| *c.borrow_mut() = None);
+}
 
 /// Convenience macro to push scalar kernel arguments (mirrors the one in
 /// hip_backend/mod.rs which is not exported).
@@ -350,8 +391,38 @@ pub fn launch_mul_mat_vec_q8_1_chunk(
     ncols_padded: usize,
     dev: &HipDevice,
 ) -> Result<()> {
+    // Full-buffer path. Forwards to the view-based `_raw` variant with
+    // the whole padded slice.
+    let data_view = data.inner.slice(0..data.inner.len());
+    launch_mul_mat_vec_q8_1_chunk_raw(
+        &data_view, y_q8_1, dst, dtype, ncols, nrows, b_size, ncols_padded, dev,
+    )
+}
+
+/// View-based MMVQ launcher — like `launch_mul_mat_vec_q8_1_chunk` but
+/// takes an already-sliced weight `HipView<u8>` instead of a full
+/// `PaddedHipSlice`. Used by W3 per-expert MoE gather where we slice a
+/// 3D quantised weight `[n_experts, n, k]` to one expert's tile by byte
+/// offset before dispatching.
+///
+/// The expert's slice must cover exactly `n * (k / dtype.block_size())
+/// * dtype.type_size()` bytes — the same stride formula the fused
+/// `indexed_moe_forward` kernel uses at
+/// `candle-hip-kernels/src/quantized.cu:5297`.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_mul_mat_vec_q8_1_chunk_raw(
+    data_view: &hipdarc::driver::HipView<'_, u8>,
+    y_q8_1: &hipdarc::driver::HipView<'_, u8>,
+    dst: &hipdarc::driver::HipView<'_, f32>,
+    dtype: GgmlDType,
+    ncols: usize,
+    nrows: usize,
+    b_size: usize,
+    ncols_padded: usize,
+    dev: &HipDevice,
+) -> Result<()> {
     if b_size == 0 || b_size > 8 {
-        crate::bail!("launch_mul_mat_vec_q8_1_chunk: bsize must be 1..=8, got {b_size}")
+        crate::bail!("launch_mul_mat_vec_q8_1_chunk_raw: bsize must be 1..=8, got {b_size}")
     }
     let kernel_name = match dtype {
         GgmlDType::Q4_0 => "mul_mat_vec_q4_0_q8_1_cuda",
@@ -394,7 +465,6 @@ pub fn launch_mul_mat_vec_q8_1_chunk(
     // Q4K/Q5K warp-coop kernels correct after Phase B3-redo (pair-layout fix
     // landed 2026-04-13). Q6K still diverges; opt in via
     // CANDLE_KQUANT_WARP_COOP=1 once fixed.
-    let q6_warp_coop = std::env::var("CANDLE_KQUANT_WARP_COOP").is_ok();
     let warp_coop = b_size == 1
         && (matches!(
                 dtype,
@@ -424,7 +494,7 @@ pub fn launch_mul_mat_vec_q8_1_chunk(
     };
 
     let mut builder = func.builder();
-    builder.arg(&data.inner);
+    builder.arg(data_view);
     builder.arg(y_q8_1);
     builder.arg(dst);
     barg!(
@@ -1248,8 +1318,16 @@ fn indexed_moe_forward_turbo_moe(
 
     // Pick mmq_x based on expected bucket fill. Small fill wastes a tile;
     // large fill shrinks grid. mmq_x=32 is a safe default at ~32 tok/expert.
+    //
+    // P3 sweep: env override `CANDLE_MOE_MMQ_X={8,16,32,64}` forces the
+    // tile width for offline bench-driven picking.  Leave unset in prod.
     let avg = total_pos / n_experts;
-    let mmq_x: usize = if avg >= 48 {
+    let mmq_x: usize = if let Ok(s) = std::env::var("CANDLE_MOE_MMQ_X") {
+        match s.parse::<usize>() {
+            Ok(v @ (8 | 16 | 32 | 64)) => v,
+            _ => return Ok(None),
+        }
+    } else if avg >= 48 {
         64
     } else if avg >= 24 {
         32
@@ -1436,6 +1514,94 @@ fn launch_indexed_moe_forward_with_q8(
     let input_dim1 = in_shape.dims()[1];
     let topk = idx_shape.dims()[1];
     let k_padded = pad(k, MATRIX_ROW_PADDING);
+
+    // W3 — decode gather-by-expert (b_size=1). Replaces the fused
+    // `indexed_moe_forward_{dtype}_q8_1` kernel with a per-expert
+    // warp-cooperative MMVQ loop for eligible dtypes.
+    //
+    // **Default: OFF** after the 2026-04-16 perf validation showed
+    // this path is a net loss on Gemma-4-26B-A4B decode. Per-call
+    // fused cost for decode (b_size=1) is ~112 µs; 8× MMVQ at 17 µs
+    // each is ~136 µs — **21% slower per equivalent work**. My
+    // initial analysis misread the aggregate profile: the 818 µs
+    // per-call average was driven by the 120 prefill calls (46 ms
+    // each), not the 7680 decode calls. See the W3-retro note in
+    // ROADMAP-DECODE-GAP-2026-04-16.md §W3 and MEMORY for the
+    // corrected numbers.
+    //
+    // Kept as opt-in infrastructure (`CANDLE_W3_GATHER=1`) because
+    // it may still help non-Gemma MoE shapes (e.g. Qwen3-Coder-30B-
+    // A3B at Q4_0 has different tile/occupancy economics).
+    //
+    // Covers both MoE input layouts:
+    //   input_dim1 == 1      — shared input (gate/up projections)
+    //   input_dim1 == topk   — per-expert input (down projection)
+    let w3_enabled = std::env::var("CANDLE_W3_GATHER")
+        .map_or(false, |v| v != "0");
+    let w3_eligible = w3_enabled
+        && batch == 1
+        && (input_dim1 == 1 || input_dim1 == topk)
+        && matches!(w_dtype, GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0);
+    if w3_eligible {
+        // One D2H sync per call; at decode this reads `topk` u32s
+        // (typically 8 × 4 B = 32 B). MoE callers can amortise this by
+        // passing a cached CPU ids slice — see W3 step 4.
+        let ids_cpu = w3_cached_ids_take().map_or_else(
+            || dev.stream().clone_dtoh_view(ids).w(),
+            Ok,
+        )?;
+        if ids_cpu.len() < topk {
+            crate::bail!(
+                "W3 gather: ids has {} elements, need >= topk={}",
+                ids_cpu.len(),
+                topk
+            );
+        }
+        let qk = w_dtype.block_size();
+        let type_size = w_dtype.type_size();
+        let expert_stride = n * (k / qk) * type_size;
+        let weight_total = weight.len();
+        // Q8_1 per-row stride (bytes) in the input buffer.
+        let q8_1_row_bytes = (k_padded / GgmlDType::Q8_1.block_size())
+            * GgmlDType::Q8_1.type_size();
+        // SAFETY: MMVQ writes every element of `out` across the loop.
+        let out = unsafe { dev.alloc::<f32>(topk * n)? };
+        for slot in 0..topk {
+            let e = ids_cpu[slot] as usize;
+            let weight_offset = e * expert_stride;
+            if weight_offset + expert_stride > weight_total {
+                crate::bail!(
+                    "W3 gather: expert {e} slice [{}..{}] exceeds weight buffer len {}",
+                    weight_offset,
+                    weight_offset + expert_stride,
+                    weight_total
+                );
+            }
+            let w_view = weight.slice(weight_offset..weight_offset + expert_stride);
+            // Per-slot input: shared row (dim1=1) or slot-indexed row (dim1=topk).
+            let input_row_idx = if input_dim1 == 1 { 0 } else { slot };
+            let input_off_bytes = input_row_idx * q8_1_row_bytes;
+            let input_slot_view =
+                input_q8_1.slice(input_off_bytes..input_off_bytes + q8_1_row_bytes);
+            let dst_view = out.slice(slot * n..(slot + 1) * n);
+            launch_mul_mat_vec_q8_1_chunk_raw(
+                &w_view,
+                &input_slot_view,
+                &dst_view,
+                w_dtype,
+                /* ncols */ k,
+                /* nrows */ n,
+                /* b_size */ 1,
+                k_padded,
+                dev,
+            )?;
+        }
+        let mut out_shape = in_shape.dims().to_vec();
+        out_shape.pop();
+        out_shape.push(n);
+        out_shape[1] = topk;
+        return Ok((HipStorage::wrap_hip_slice(out, dev.clone()), out_shape.into()));
+    }
 
     // SAFETY: indexed_moe_forward_*_q8_1 writes every element of `out`.
     let outsize = batch * topk * n;
@@ -1630,6 +1796,7 @@ impl QHipStorage {
                 self.dtype()
             );
         }
+
         launch_indexed_moe_forward_with_q8(
             &self.data.inner.slice(0..self.data.inner.len()),
             self_shape,

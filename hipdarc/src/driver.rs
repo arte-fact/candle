@@ -368,6 +368,34 @@ impl HipStream {
         Ok(dst)
     }
 
+    /// Copy from a device view to a new host Vec.
+    ///
+    /// Analog of `clone_dtoh` for `HipView` (e.g. the `topk_ids` GPU view
+    /// fed into W3 per-expert MoE dispatch). Synchronous — blocks until
+    /// the copy completes.
+    pub fn clone_dtoh_view<T: DeviceRepr>(
+        &self,
+        src: &HipView<'_, T>,
+    ) -> Result<Vec<T>, DriverError> {
+        if src.len() == 0 {
+            return Ok(Vec::new());
+        }
+        let mut dst = Vec::with_capacity(src.len());
+        let size = src.len() * std::mem::size_of::<T>();
+        unsafe {
+            check_hip(sys::hipMemcpyAsync(
+                dst.as_mut_ptr() as *mut c_void,
+                src.device_ptr() as *const c_void,
+                size,
+                sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+                self.raw,
+            ))?;
+            check_hip(sys::hipStreamSynchronize(self.raw))?;
+            dst.set_len(src.len());
+        }
+        Ok(dst)
+    }
+
     /// Copy from one device allocation to another (must be same length).
     pub fn memcpy_dtod<T: DeviceRepr>(
         &self,
