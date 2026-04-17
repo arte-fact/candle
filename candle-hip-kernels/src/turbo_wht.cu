@@ -151,14 +151,17 @@ static __device__ __forceinline__ void turbo_wht_256_impl(
     const float * in  = src + group_idx * 256;
     float       * out = dst + group_idx * 256;
 
-    // Build effective 256-elem sign arrays from 128-elem bases: first
-    // half uses the base; second half uses the base with a lane-wise
-    // XOR sign (flips signs on even-indexed lanes). The resulting 256-
-    // element pattern is guaranteed distinct from either base.
+    // Build effective 256-elem sign arrays from 128-elem bases. Upper
+    // half uses the same base array with a parity-flip — identical
+    // construction for both s1 and s2 so the inverse kernel (which
+    // swaps the template params) exactly undoes the forward. The
+    // previous draft had an asymmetric flip (s2_hi negated while s1_hi
+    // was not) which left a residual sign on odd lanes post-roundtrip.
+    const float flip = (tid & 1) ? 1.0f : -1.0f;
     const float s1_lo = S1_128[tid];
-    const float s1_hi = (tid & 1) ? S1_128[tid] : -S1_128[tid];
+    const float s1_hi = flip * S1_128[tid];
     const float s2_lo = S2_128[tid];
-    const float s2_hi = (tid & 1) ? -S2_128[tid] : S2_128[tid];
+    const float s2_hi = flip * S2_128[tid];
 
     x[tid]       = in[tid]       * s1_lo;
     x[tid + 128] = in[tid + 128] * s1_hi;
