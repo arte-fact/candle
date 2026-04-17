@@ -106,6 +106,38 @@ impl HipDevice {
         self.set_current()?;
         unsafe { check_hip(sys::hipDeviceSynchronize()) }
     }
+
+    /// Check whether this device can directly access `peer`'s memory.
+    /// Sets the current device to `self` as a side effect.
+    pub fn can_access_peer(&self, peer: &HipDevice) -> Result<bool, DriverError> {
+        self.set_current()?;
+        let mut can = 0i32;
+        unsafe {
+            check_hip(sys::hipDeviceCanAccessPeer(&mut can, self.ordinal, peer.ordinal))?;
+        }
+        Ok(can != 0)
+    }
+
+    /// Enable peer access from this device to `peer`. Idempotent —
+    /// returns `Ok(())` if peer access is already enabled.
+    pub fn enable_peer_access(&self, peer: &HipDevice) -> Result<(), DriverError> {
+        if self.ordinal == peer.ordinal {
+            return Ok(());
+        }
+        self.set_current()?;
+        // flags must be 0 per HIP spec; "already enabled" returns
+        // hipErrorPeerAccessAlreadyEnabled which we treat as success.
+        unsafe {
+            let rc = sys::hipDeviceEnablePeerAccess(peer.ordinal, 0);
+            if rc == sys::hipError_t::hipSuccess
+                || rc == sys::hipError_t::hipErrorPeerAccessAlreadyEnabled
+            {
+                Ok(())
+            } else {
+                Err(DriverError::Hip(rc))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +459,60 @@ impl HipStream {
         let mut dst = self.alloc::<T>(src.len)?;
         self.memcpy_dtod(&mut dst, src)?;
         Ok(dst)
+    }
+
+    /// Synchronous peer copy — blocks until complete. Does NOT need a
+    /// stream; works purely via `hipMemcpyPeer`. Useful as a fallback
+    /// when peer-stream semantics are unreliable.
+    pub fn memcpy_peer_blocking<T: DeviceRepr>(
+        dst: &mut HipSlice<T>,
+        dst_device: &HipDevice,
+        src: &HipSlice<T>,
+        src_device: &HipDevice,
+    ) -> Result<(), DriverError> {
+        assert_eq!(dst.len, src.len, "peer copy length mismatch");
+        if src.len == 0 {
+            return Ok(());
+        }
+        let size = src.len * std::mem::size_of::<T>();
+        unsafe {
+            check_hip(sys::hipMemcpyPeer(
+                dst.ptr,
+                dst_device.ordinal,
+                src.ptr as *const c_void,
+                src_device.ordinal,
+                size,
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// Peer-to-peer async copy from `src` on `src_device` to `dst` on
+    /// this stream's device. Caller must have enabled peer access on
+    /// both devices (`HipDevice::enable_peer_access`). Sync with
+    /// `self.synchronize()` before reading from `dst`.
+    pub fn memcpy_peer_async<T: DeviceRepr>(
+        &self,
+        dst: &mut HipSlice<T>,
+        src: &HipSlice<T>,
+        src_device: &HipDevice,
+    ) -> Result<(), DriverError> {
+        assert_eq!(dst.len, src.len, "peer copy length mismatch");
+        if src.len == 0 {
+            return Ok(());
+        }
+        let size = src.len * std::mem::size_of::<T>();
+        unsafe {
+            check_hip(sys::hipMemcpyPeerAsync(
+                dst.ptr,
+                self.device.ordinal,
+                src.ptr as *const c_void,
+                src_device.ordinal,
+                size,
+                self.raw,
+            ))?;
+        }
+        Ok(())
     }
 
     /// Copy from host slice into an existing device allocation.

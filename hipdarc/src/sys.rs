@@ -70,6 +70,8 @@ pub enum hipError_t {
     hipErrorInvalidHandle = 400,
     hipErrorNotFound = 500,
     hipErrorNotReady = 600,
+    hipErrorPeerAccessAlreadyEnabled = 704,
+    hipErrorPeerAccessNotEnabled = 705,
     hipErrorLaunchFailure = 719,
     hipErrorUnknown = 999,
 }
@@ -154,6 +156,30 @@ extern "C" {
         src: *const c_void,
         size_bytes: size_t,
         kind: hipMemcpyKind,
+        stream: hipStream_t,
+    ) -> hipError_t;
+
+    // Peer-to-peer device access
+    pub fn hipDeviceCanAccessPeer(
+        can_access_peer: *mut c_int,
+        device: c_int,
+        peer_device: c_int,
+    ) -> hipError_t;
+    pub fn hipDeviceEnablePeerAccess(peer_device: c_int, flags: c_uint) -> hipError_t;
+    pub fn hipDeviceDisablePeerAccess(peer_device: c_int) -> hipError_t;
+    pub fn hipMemcpyPeer(
+        dst: *mut c_void,
+        dst_device: c_int,
+        src: *const c_void,
+        src_device: c_int,
+        size_bytes: size_t,
+    ) -> hipError_t;
+    pub fn hipMemcpyPeerAsync(
+        dst: *mut c_void,
+        dst_device: c_int,
+        src: *const c_void,
+        src_device: c_int,
+        size_bytes: size_t,
         stream: hipStream_t,
     ) -> hipError_t;
 

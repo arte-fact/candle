@@ -17,6 +17,7 @@ pub mod decode_cache;
 mod fused_pointwise;
 pub mod q8_kv_cache;
 pub mod turbo_kv_cache;
+pub mod cluster;
 mod gated_delta_net;
 pub mod g3_counters;
 mod utils;
