@@ -24,6 +24,7 @@ use crate::{DType, Result, Shape, Storage, Tensor};
 use hipdarc::driver::{HipSlice, LaunchConfig};
 
 const BLOCK_SIZE_V: u32 = 128;
+const BLOCK_SIZE_QK: u32 = 128;
 
 const QK8_0: usize = 32;
 const BLOCK_Q8_0_BYTES: usize = 34; // sizeof(half) + 32 int8
@@ -385,6 +386,115 @@ pub fn gqa_decode_gemv_v_q8(
     Ok(Tensor::from_storage(
         Storage::Hip(storage),
         Shape::from((b, h_q, 1, d)),
+        crate::op::BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
+/// Q·K gemv with a Q8_0 K cache — Q8 variant of
+/// `gqa_decode_gemv_qk_d{N}_f32_b128` in flash_attn_v2.cu.
+///
+/// `q`: (B, H_q, 1, D) F32.
+/// `k_cache`: (B, H_kv, T_max, D/32) Q8_0 blocks (from `QKvCache::k_slab()`).
+/// Returns raw (un-scaled) scores (B, H_q, 1, L_k); the caller is expected
+/// to apply the softmax-scale + softmax separately (same contract as the
+/// F32 path).
+pub fn gqa_decode_gemv_qk_q8(
+    q: &Tensor,
+    cache: &QKvCache,
+    l_k: usize,
+) -> Result<Tensor> {
+    let dims = q.dims();
+    if dims.len() != 4 || dims[2] != 1 {
+        crate::bail!("gqa_decode_gemv_qk_q8: q must be (B, H_q, 1, D), got {dims:?}");
+    }
+    let (b, h_q, _, d) = (dims[0], dims[1], dims[2], dims[3]);
+    let (cb, h_kv, t_max, cd) = cache.dims();
+    if cb != b {
+        crate::bail!(
+            "gqa_decode_gemv_qk_q8: batch mismatch (q B={b} vs cache B={cb})"
+        );
+    }
+    if cd != d {
+        crate::bail!(
+            "gqa_decode_gemv_qk_q8: head-dim mismatch (q D={d} vs cache D={cd})"
+        );
+    }
+    if h_q % h_kv != 0 {
+        crate::bail!(
+            "gqa_decode_gemv_qk_q8: H_q ({h_q}) must be a multiple of H_kv ({h_kv})"
+        );
+    }
+    if l_k > cache.current_seq_len() {
+        crate::bail!(
+            "gqa_decode_gemv_qk_q8: L_k={l_k} > cache.current_seq_len={}",
+            cache.current_seq_len()
+        );
+    }
+    let n_rep = h_q / h_kv;
+
+    if !matches!(d, 128 | 256 | 512) {
+        crate::bail!("gqa_decode_gemv_qk_q8: unsupported D={d} (need 128, 256, or 512)");
+    }
+    if q.dtype() != DType::F32 {
+        crate::bail!("gqa_decode_gemv_qk_q8: q dtype must be F32");
+    }
+
+    let q_contig = q.contiguous()?;
+    let (q_st, q_l) = q_contig.storage_and_layout();
+    let q_hip = match &*q_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gqa_decode_gemv_qk_q8: q must be on HIP"),
+    };
+    let q_slice = q_hip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+    let (lo, hi) = q_l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("q not contiguous".into()))?;
+    let q_view = q_slice.slice(lo..hi);
+
+    // Scores buffer: (B, H_q, 1, L_k). Only the first l_k entries are
+    // written by the kernel; downstream masking/softmax handles the rest.
+    let out_len = b * h_q * l_k;
+    // SAFETY: kernel writes every (b, h_q, t<l_k) triple exactly once.
+    let out = unsafe { cache.dev.alloc::<f32>(out_len)? };
+
+    let kn = match d {
+        128 => "gqa_decode_gemv_qk_q8_d128_f32",
+        256 => "gqa_decode_gemv_qk_q8_d256_f32",
+        512 => "gqa_decode_gemv_qk_q8_d512_f32",
+        _ => unreachable!(),
+    };
+    let func = cache.dev.get_or_load_func(kn, &kernels::ATTN_Q8_KV)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (l_k as u32, h_q as u32, b as u32),
+        block_dim: (BLOCK_SIZE_QK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let l_k_i = l_k as i32;
+    let t_max_i = t_max as i32;
+    let h_q_i = h_q as i32;
+    let h_kv_i = h_kv as i32;
+    let n_rep_i = n_rep as i32;
+
+    let mut builder = func.builder();
+    builder.arg(&q_view);
+    builder.arg(cache.k_slab());
+    builder.arg(&out);
+    builder.arg(&l_k_i);
+    builder.arg(&t_max_i);
+    builder.arg(&h_q_i);
+    builder.arg(&h_kv_i);
+    builder.arg(&n_rep_i);
+    // SAFETY: shapes validated; kernel fully writes each score slot.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(q_st);
+
+    let storage = HipStorage::wrap_hip_slice(out, cache.dev.clone());
+    Ok(Tensor::from_storage(
+        Storage::Hip(storage),
+        Shape::from((b, h_q, 1, l_k)),
         crate::op::BackpropOp::none(),
         /* is_variable */ false,
     ))
