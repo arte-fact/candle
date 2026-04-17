@@ -913,14 +913,12 @@ impl StandardAttention {
         let _q8_bytes = b_size * _ncols_padded
             * GgmlDType::Q8_1.type_size() / GgmlDType::Q8_1.block_size();
 
-        // CANDLE_KV_F16: downcast K and V to F16 at the fused kernel
-        // boundary so the KvCache receives F16 tensors directly (no
-        // per-token cast launch). Q stays F32 — the attention kernel
-        // consumes Q as f32. Defaulting to F32 everywhere preserves
-        // the pre-flag behavior.
+        // F16 KV cache is now the default (2× smaller than F32 at rest,
+        // no perceptible quality loss on gfx906 workloads). Set
+        // `CANDLE_KV_F16=0` to force the legacy F32 path.
         #[cfg(feature = "hip")]
         let kv_out_dtype = if std::env::var("CANDLE_KV_F16")
-            .ok().as_deref().map(|s| s != "0").unwrap_or(false)
+            .ok().as_deref().map(|s| s != "0").unwrap_or(true)
         {
             candle::DType::F16
         } else {

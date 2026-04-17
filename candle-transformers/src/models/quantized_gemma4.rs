@@ -1300,7 +1300,7 @@ impl ModelWeights {
                     // prefill call and keeps the whole cache at one
                     // consistent dtype.
                     #[cfg(feature = "hip")]
-                    let (k_new, v_new) = if std::env::var("CANDLE_KV_F16").ok().as_deref().map(|s| s != "0").unwrap_or(false) {
+                    let (k_new, v_new) = if std::env::var("CANDLE_KV_F16").ok().as_deref().map(|s| s != "0").unwrap_or(true) {
                         let k_new = if k_new.dtype() == candle::DType::F16 { k_new } else { k_new.to_dtype(candle::DType::F16)? };
                         let v_new = if v_new.dtype() == candle::DType::F16 { v_new } else { v_new.to_dtype(candle::DType::F16)? };
                         (k_new, v_new)
