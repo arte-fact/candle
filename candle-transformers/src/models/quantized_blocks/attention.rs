@@ -334,10 +334,14 @@ pub(crate) fn gqa_attention_k_transposed(
             // stores K canonical T-major natively via
             // `new_k_canonical_stable`.
             //
-            // Opt-in: `CANDLE_DECODE_MV_ON=1`.
+            // Opt-in: `CANDLE_DECODE_MV_ON=1` for the fused path;
+            //         `CANDLE_DECODE_MV_DECOMP=1` for the decomposed
+            //         3-kernel path (measured +70 % at D=128 on
+            //         Llama-shape micro-bench).
             if seq_len == 1
                 && matches!(head_dim, 64 | 128 | 256 | 512)
-                && std::env::var("CANDLE_DECODE_MV_ON").is_ok()
+                && (std::env::var("CANDLE_DECODE_MV_ON").is_ok()
+                    || std::env::var("CANDLE_DECODE_MV_DECOMP").is_ok())
             {
                 // Transpose K from (B, H_kv, D, T) back to (B, H_kv, T, D)
                 // row-major. Today this is a full copy per layer per token
@@ -346,6 +350,16 @@ pub(crate) fn gqa_attention_k_transposed(
                 // V may be non-contiguous via narrow+transpose; make it
                 // canonical (T, D) row-major if needed.
                 let v_canon = if v.is_contiguous() { v.clone() } else { v.contiguous()? };
+
+                let use_decomp = std::env::var("CANDLE_DECODE_MV_DECOMP").is_ok()
+                    && matches!(head_dim, 128 | 256 | 512);
+                if use_decomp {
+                    if let Ok(o) = candle::hip_backend::gqa_attention_decode_mv_decomposed(
+                        &q_c, &k_canon, &v_canon, mask_c.as_ref(), attn_scale, t_k,
+                    ) {
+                        return Ok(o);
+                    }
+                }
                 if let Ok(o) = candle::hip_backend::gqa_attention_decode_mv(
                     &q_c, &k_canon, &v_canon, mask_c.as_ref(), attn_scale, t_k,
                 ) {

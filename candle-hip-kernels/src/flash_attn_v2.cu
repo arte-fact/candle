@@ -1706,6 +1706,15 @@ static __device__ __forceinline__ void gqa_decode_gemv_qk_b128_impl(
 }
 
 extern "C" __global__ void __launch_bounds__(128, 1)
+gqa_decode_gemv_qk_d128_f32_b128(
+    const float * __restrict__ q, const float * __restrict__ k,
+    float * __restrict__ scores,
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    gqa_decode_gemv_qk_b128_impl<128>(q, k, scores, L_k, H_q, H_kv, n_rep);
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1)
 gqa_decode_gemv_qk_d256_f32_b128(
     const float * __restrict__ q, const float * __restrict__ k,
     float * __restrict__ scores,
@@ -1791,6 +1800,15 @@ static __device__ __forceinline__ void gqa_decode_gemv_v_b128_impl(
     }
 
     *out_ptr = acc;
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1)
+gqa_decode_gemv_v_d128_f32_b128(
+    const float * __restrict__ attn, const float * __restrict__ v,
+    float * __restrict__ out,
+    int L_k, int H_q, int H_kv, int n_rep)
+{
+    gqa_decode_gemv_v_b128_impl<128>(attn, v, out, L_k, H_q, H_kv, n_rep);
 }
 
 extern "C" __global__ void __launch_bounds__(128, 1)

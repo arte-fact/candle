@@ -1811,9 +1811,9 @@ pub fn gqa_attention_decode_mv_decomposed(
             "gqa_attention_decode_mv_decomposed: requires L_q=1, got {l_q}"
         );
     }
-    if !matches!(d, 256 | 512) {
+    if !matches!(d, 128 | 256 | 512) {
         crate::bail!(
-            "gqa_attention_decode_mv_decomposed: only D ∈ {{256, 512}}, got {d}"
+            "gqa_attention_decode_mv_decomposed: only D ∈ {{128, 256, 512}}, got {d}"
         );
     }
     if q.dtype() != DType::F32 || !q.is_contiguous() {
@@ -1839,6 +1839,7 @@ pub fn gqa_attention_decode_mv_decomposed(
     let scores = unsafe { dev.alloc::<f32>(b * n_head * l_k_alloc)? };
 
     let qk_name = match d {
+        128 => "gqa_decode_gemv_qk_d128_f32_b128",
         256 => "gqa_decode_gemv_qk_d256_f32_b128",
         512 => "gqa_decode_gemv_qk_d512_f32_b128",
         _ => unreachable!(),
@@ -1904,6 +1905,7 @@ pub fn gqa_attention_decode_mv_decomposed(
     // Kernel C: attn_weights · V → out.
     // ------------------------------------------------------------------
     let v_name = match d {
+        128 => "gqa_decode_gemv_v_d128_f32_b128",
         256 => "gqa_decode_gemv_v_d256_f32_b128",
         512 => "gqa_decode_gemv_v_d512_f32_b128",
         _ => unreachable!(),
