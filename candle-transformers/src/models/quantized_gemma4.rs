@@ -184,6 +184,11 @@ pub struct ModelWeights {
     /// `CANDLE_KV_Q8=1`: use block_q8_0 packed KV instead of F32. Matches
     /// llama.cpp-turbo's per-context VRAM exactly (1.88× smaller than F16).
     use_q8_kv: bool,
+    /// `CANDLE_KV_TQ={2,3,4}`: TurboQuant variant (2.5/4/4.25 bits/val).
+    /// Takes precedence over use_q8_kv when set. None = don't use.
+    /// NB: quality requires phase TQ3 (WHT + rotation) — without those
+    /// centroids don't match the K/V distribution and output will drift.
+    tq_variant: Option<u8>,
     /// G2/G3 decode replay state (opt-in via `CANDLE_G2_REPLAY=1`).
     #[cfg(feature = "hip")]
     decode_state: candle::hip_backend::decode_cache::DecodeState,
@@ -686,6 +691,10 @@ impl ModelWeights {
         #[cfg(feature = "hip")]
         let n_devices = devices.len();
         let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1");
+        let tq_variant: Option<u8> = std::env::var("CANDLE_KV_TQ")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .filter(|n| matches!(n, 2 | 3 | 4));
         Ok(Self {
             tok_embeddings: Embedding::new_unused(),
             embedding_length,
@@ -696,6 +705,7 @@ impl ModelWeights {
             per_layer_embeddings,
             kv_caches,
             use_q8_kv,
+            tq_variant,
             #[cfg(feature = "hip")]
             decode_state: candle::hip_backend::decode_cache::DecodeState::Init,
             #[cfg(feature = "hip")]
@@ -1218,11 +1228,28 @@ impl ModelWeights {
                     }
                     // Lazy allocation of this layer's cache. Use AnyKvCache
                     // so the gate swaps the underlying storage between F32
-                    // KvCache and block_q8_0 QKvCache.
+                    // KvCache, block_q8_0 QKvCache, or one of the TurboQuant
+                    // variants (TQ2/TQ3/TQ4 — ~6.4×/4×/3.76× smaller than F16).
                     if self.kv_caches[il].is_none() {
                         use crate::models::quantized_blocks::any_kv_cache::AnyKvCache;
                         #[cfg(feature = "hip")]
-                        let new_cache = if self.use_q8_kv {
+                        let new_cache = if let Some(tq) = self.tq_variant {
+                            let (b0, h_kv0, _, d0) = k_new.dims4()?;
+                            let hip_dev = match k_new.device() {
+                                candle::Device::Hip(d) => d.clone(),
+                                _ => candle::bail!("CANDLE_KV_TQ: k_new must be on HIP"),
+                            };
+                            use candle::hip_backend::turbo_kv_cache::{QTurboKvCache, TbVariant};
+                            let variant = match tq {
+                                2 => TbVariant::Tq2_0,
+                                3 => TbVariant::Tq3_0,
+                                4 => TbVariant::Tq4_0,
+                                _ => candle::bail!("CANDLE_KV_TQ={tq}: only 2/3/4 supported"),
+                            };
+                            AnyKvCache::Tb(QTurboKvCache::new(
+                                &hip_dev, variant, b0, h_kv0, 4096, d0,
+                            )?)
+                        } else if self.use_q8_kv {
                             let (b0, h_kv0, _, d0) = k_new.dims4()?;
                             let hip_dev = match k_new.device() {
                                 candle::Device::Hip(d) => d.clone(),
@@ -1301,11 +1328,12 @@ impl ModelWeights {
                     .expect("KV cache must exist for has_kv source layer");
                 let t_cur = any_cache.current_seq_len();
                 let max_t = any_cache.max_seq_len();
-                // Q8 path skips the padded-slab narrow (no F32 all_data
-                // to share — dequantising the whole buffer each step
-                // would defeat the VRAM win). Padding is a G2-replay
-                // feature; G2 is no-gain on gfx906 anyway.
-                let use_padding = !any_cache.is_q8() && pad_t > 1;
+                // Compressed caches (Q8 / TurboQuant) skip the
+                // padded-slab narrow (no F32 all_data to share —
+                // dequantising the whole buffer each step would defeat
+                // the VRAM win). Padding is a G2-replay feature; G2 is
+                // no-gain on gfx906 anyway.
+                let use_padding = !any_cache.is_compressed() && pad_t > 1;
                 let l_k_padded = if use_padding {
                     (((t_cur + pad_t - 1) / pad_t) * pad_t).min(max_t)
                 } else {
@@ -1333,15 +1361,14 @@ impl ModelWeights {
                         (k, v, None)
                     }
                 } else {
-                    // Q8 arm: dequantise the Q8 slab into fresh F32
-                    // tensors in canonical (B, H_kv, t_cur, D) layout.
-                    // This temporarily allocates t_cur * H_kv * D * 4 B
-                    // per layer; it's a transient cost on top of the
-                    // Q8-at-rest VRAM win.
+                    // Compressed arm (Q8 or TurboQuant): dequantise the
+                    // slab into fresh F32 tensors in canonical
+                    // (B, H_kv, t_cur, D) layout. Transient on top of
+                    // the at-rest VRAM win.
                     let k = any_cache.canonical_k_f32()?
-                        .ok_or_else(|| candle::Error::Msg("gemma4 q8 k cache empty".into()))?;
+                        .ok_or_else(|| candle::Error::Msg("gemma4 compressed k cache empty".into()))?;
                     let v = any_cache.canonical_v_f32()?
-                        .ok_or_else(|| candle::Error::Msg("gemma4 q8 v cache empty".into()))?;
+                        .ok_or_else(|| candle::Error::Msg("gemma4 compressed v cache empty".into()))?;
                     (k, v, None)
                 };
                 let k = if device_eq(k.device(), &layer_device) { k } else { k.to_device(&layer_device)? };

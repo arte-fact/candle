@@ -11,12 +11,16 @@ use candle_nn::kv_cache::KvCache;
 
 #[cfg(feature = "hip")]
 use candle::hip_backend::q8_kv_cache::QKvCache;
+#[cfg(feature = "hip")]
+use candle::hip_backend::turbo_kv_cache::{QTurboKvCache, TbVariant};
 
 #[derive(Debug)]
 pub enum AnyKvCache {
     F32(KvCache),
     #[cfg(feature = "hip")]
     Q8(QKvCache),
+    #[cfg(feature = "hip")]
+    Tb(QTurboKvCache),
 }
 
 impl AnyKvCache {
@@ -31,11 +35,46 @@ impl AnyKvCache {
         }
     }
 
+    pub fn is_tb(&self) -> bool {
+        #[cfg(feature = "hip")]
+        {
+            matches!(self, AnyKvCache::Tb(_))
+        }
+        #[cfg(not(feature = "hip"))]
+        {
+            false
+        }
+    }
+
+    /// True when the cache stores compressed (Q8 or Tb) KV — i.e. the
+    /// padded-slab fast path that expects raw F32/F16 can't run.
+    pub fn is_compressed(&self) -> bool {
+        self.is_q8() || self.is_tb()
+    }
+
+    #[cfg(feature = "hip")]
+    pub fn as_tb(&self) -> Option<&QTurboKvCache> {
+        match self {
+            AnyKvCache::Tb(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "hip")]
+    pub fn as_tb_mut(&mut self) -> Option<&mut QTurboKvCache> {
+        match self {
+            AnyKvCache::Tb(c) => Some(c),
+            _ => None,
+        }
+    }
+
     pub fn as_f32(&self) -> Option<&KvCache> {
         match self {
             AnyKvCache::F32(c) => Some(c),
             #[cfg(feature = "hip")]
             AnyKvCache::Q8(_) => None,
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(_) => None,
         }
     }
 
@@ -44,6 +83,8 @@ impl AnyKvCache {
             AnyKvCache::F32(c) => Some(c),
             #[cfg(feature = "hip")]
             AnyKvCache::Q8(_) => None,
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(_) => None,
         }
     }
 
@@ -51,7 +92,7 @@ impl AnyKvCache {
     pub fn as_q8(&self) -> Option<&QKvCache> {
         match self {
             AnyKvCache::Q8(c) => Some(c),
-            AnyKvCache::F32(_) => None,
+            _ => None,
         }
     }
 
@@ -59,7 +100,7 @@ impl AnyKvCache {
     pub fn as_q8_mut(&mut self) -> Option<&mut QKvCache> {
         match self {
             AnyKvCache::Q8(c) => Some(c),
-            AnyKvCache::F32(_) => None,
+            _ => None,
         }
     }
 
@@ -71,6 +112,8 @@ impl AnyKvCache {
             }
             #[cfg(feature = "hip")]
             AnyKvCache::Q8(c) => c.reset(),
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(c) => c.reset(),
         }
     }
 
@@ -79,6 +122,8 @@ impl AnyKvCache {
             AnyKvCache::F32(c) => c.k_cache().current_seq_len(),
             #[cfg(feature = "hip")]
             AnyKvCache::Q8(c) => c.current_seq_len(),
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(c) => c.current_seq_len(),
         }
     }
 
@@ -87,12 +132,11 @@ impl AnyKvCache {
             AnyKvCache::F32(c) => c.k_cache().max_seq_len(),
             #[cfg(feature = "hip")]
             AnyKvCache::Q8(c) => c.dims().2,
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(c) => c.dims().2,
         }
     }
 
-    /// Append a fresh `(B, H_kv, T_new, D)` F32 slice. Q8 arm quantises
-    /// on the fly; F32 arm routes through `KvCache::append` (which also
-    /// handles the `k_is_transposed` layout if configured).
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         match self {
             AnyKvCache::F32(c) => {
@@ -101,6 +145,8 @@ impl AnyKvCache {
             }
             #[cfg(feature = "hip")]
             AnyKvCache::Q8(c) => c.append(k, v),
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(c) => c.append(k, v),
         }
     }
 
@@ -127,6 +173,14 @@ impl AnyKvCache {
                     Ok(Some(c.dequantize_k()?))
                 }
             }
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(c) => {
+                if c.current_seq_len() == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(c.dequantize_k()?))
+                }
+            }
         }
     }
 
@@ -135,6 +189,14 @@ impl AnyKvCache {
             AnyKvCache::F32(c) => c.v(),
             #[cfg(feature = "hip")]
             AnyKvCache::Q8(c) => {
+                if c.current_seq_len() == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(c.dequantize_v()?))
+                }
+            }
+            #[cfg(feature = "hip")]
+            AnyKvCache::Tb(c) => {
                 if c.current_seq_len() == 0 {
                     Ok(None)
                 } else {
