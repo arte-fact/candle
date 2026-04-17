@@ -435,15 +435,20 @@ impl MoeExperts {
         })
     }
 
-    /// EP-aware load. Currently identical to `load` — every rank holds
-    /// the full expert set — but attaches an `EpPartition` so the
-    /// forward pass can route through `forward_ep`. Real memory
-    /// savings land when X3.4 (QTensor::narrow_experts) slices the
-    /// expert axis at load.
+    /// EP-aware load: narrows each expert tensor to the local expert
+    /// range `[local_start, local_start + local_count)` so this rank
+    /// holds only its partition of the MoE weights.
     ///
     /// Partition policy v1: contiguous block. Rank r owns experts
     /// `[r * block, min((r+1) * block, num_experts))` where
     /// `block = ceil(num_experts / world_size)`.
+    ///
+    /// NB: the implementation loads the FULL tensor and then slices
+    /// (peak VRAM during load = 2× steady-state for that layer).
+    /// That's fine for gemma4-26B-class models where one layer's
+    /// experts are ~1.6 GB. For larger MoE models that don't fit
+    /// one-layer-at-a-time on a single GPU, X5 will add a GGUF-side
+    /// range reader so the full tensor never materialises.
     #[cfg(feature = "hip")]
     pub fn load_ep(
         gg: &Gguf,
@@ -453,26 +458,35 @@ impl MoeExperts {
         rank: usize,
     ) -> Result<Self> {
         let mut me = Self::load(gg, prefix, cfg)?;
-        let num_experts = gg
-            .ct
-            .tensor_infos
-            .get(&format!("{prefix}.ffn_down_exps.weight"))
-            .map(|ti| ti.shape.dims()[0])
-            .ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "load_ep: cannot determine num_experts from {prefix}.ffn_down_exps.weight"
-                ))
-            })?;
+        let num_experts = me.down_exps.shape().dims()[0];
         let world = cluster.world_size();
         let block = (num_experts + world - 1) / world;
         let local_start = rank * block;
         let local_count = (num_experts - local_start).min(block);
+        if local_count == 0 {
+            // Rank is past the end (W > num_experts). Leave weights alone
+            // but mark an empty partition; forward_ep returns zero.
+            me.ep_partition = Some(EpPartition {
+                cluster, rank, local_start, local_count, num_experts,
+            });
+            return Ok(me);
+        }
+
+        // Actually narrow each expert tensor to the local range.
+        // Drops the full tensor once the narrow Arc replaces it.
+        me.down_exps = std::sync::Arc::new(me.down_exps.narrow_experts(local_start, local_count)?);
+        if let Some(ref gu) = me.gate_up_exps.clone() {
+            me.gate_up_exps = Some(std::sync::Arc::new(gu.narrow_experts(local_start, local_count)?));
+        }
+        if let Some(ref g) = me.gate_exps.clone() {
+            me.gate_exps = Some(std::sync::Arc::new(g.narrow_experts(local_start, local_count)?));
+        }
+        if let Some(ref u) = me.up_exps.clone() {
+            me.up_exps = Some(std::sync::Arc::new(u.narrow_experts(local_start, local_count)?));
+        }
+
         me.ep_partition = Some(EpPartition {
-            cluster,
-            rank,
-            local_start,
-            local_count,
-            num_experts,
+            cluster, rank, local_start, local_count, num_experts,
         });
         Ok(me)
     }
@@ -681,31 +695,196 @@ impl MoeExperts {
         self.forward_inner(x)
     }
 
-    /// Expert-parallel forward. Currently a stub that delegates to
-    /// `forward_inner` on every rank (i.e., the non-EP path on the
-    /// full expert set). That gives us correct output while the
-    /// X3.4 (QTensor expert-axis slice) and X3.5 (real dispatch)
-    /// pieces land. Once those are done:
+    /// Expert-parallel forward. Returns THIS RANK's partial MoE output:
+    /// `sum_k(topk_weight_k * local_expert_k(x))` where the sum is
+    /// restricted to expert IDs inside `[local_start, local_start + local_count)`.
+    /// Out-of-range experts contribute zero by construction (their
+    /// topk_weight is zeroed before the weighted sum).
     ///
-    /// 1. Broadcast `x` via `partition.cluster.broadcast_via_host`.
-    /// 2. On each rank: filter `topk_ids` to only the experts in
-    ///    `[local_start, local_start + local_count)`. Out-of-range
-    ///    (topk_id, topk_weight) pairs zeroed so the kernel skips.
-    /// 3. Local `indexed_moe_forward_preq8` on the narrowed gate/up/
-    ///    down tensors with remapped topk_ids (global → local index).
-    /// 4. Sum partial outputs across ranks (all-reduce via a cluster
-    ///    helper — implementable as a broadcast+add since we only
-    ///    need a per-device copy of the full sum at the caller layer).
+    /// The caller is responsible for summing partial outputs across
+    /// ranks (all-reduce / broadcast+add) to recover the full MoE
+    /// output. Shared expert + shared_gate are applied on rank 0
+    /// only — adding them to the partial sum gives the correct final
+    /// output when all ranks' partials are summed.
     ///
-    /// Until that lands, EP reduces VRAM (when X3.4 is on) but not
-    /// compute — every rank still runs the full expert set.
+    /// Implementation notes:
+    /// - Every rank computes the router + topk independently (router
+    ///   weights are replicated across ranks). This is cheap and
+    ///   avoids a synchronisation point.
+    /// - topk_ids are remapped to local indices: global_id - local_start
+    ///   if in range, else 0 (safe dummy; corresponding weight = 0).
+    /// - Uses the same Q8_1 shared-input fast path as `forward_shared_q8_decode`.
     #[cfg(feature = "hip")]
     pub fn forward_ep(&self, x: &Tensor) -> Result<Tensor> {
-        // Fast path unchanged until X3.5.
-        if let Some(out) = self.forward_shared_q8_decode(x)? {
-            return Ok(out);
+        use candle::quantized::hip::{pad, quantize_q8_1, MATRIX_ROW_PADDING};
+        use candle::quantized::GgmlDType;
+        use candle::D;
+
+        let partition = self
+            .ep_partition
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("forward_ep called without ep_partition".into()))?;
+        if partition.local_count == 0 {
+            // Rank holds no experts (world > num_experts). Contribute zero.
+            return Tensor::zeros(x.shape(), x.dtype(), x.device());
         }
-        self.forward_inner(x)
+
+        let (b_sz, seq_len, hidden) = x.dims3()?;
+        let b_size = b_sz * seq_len;
+
+        // Fallback: if the input isn't in the decode-fast-path shape,
+        // drop to the slow forward on the narrowed weights. The
+        // narrowed weights hold only local experts, so
+        // `indexed_moe_forward` with topk_ids containing global IDs
+        // would go out-of-range — slow path needs the same remap.
+        // For now, return an error when fast path doesn't apply.
+        if b_size > 8
+            || !matches!(x.device(), candle::Device::Hip(_))
+            || x.dtype() != candle::DType::F32
+            || !x.is_contiguous()
+        {
+            candle::bail!(
+                "forward_ep: only decode-path (b*m <= 8, HIP, F32, contiguous) is supported in v1"
+            );
+        }
+
+        let dev = match x.device() {
+            candle::Device::Hip(d) => d.clone(),
+            _ => candle::bail!("forward_ep: expected HIP device"),
+        };
+
+        // Shared Q8_1 input (same as forward_shared_q8_decode).
+        let x_flat = x.reshape((b_size, hidden))?;
+        let (x_st, x_l) = x_flat.storage_and_layout();
+        let x_hip = match &*x_st {
+            candle::Storage::Hip(s) => s,
+            _ => candle::bail!("forward_ep: x must be HipStorage"),
+        };
+        let x_slice = x_hip.as_hip_slice::<f32>()?;
+        let x_view = match x_l.contiguous_offsets() {
+            Some((lo, hi)) => x_slice.slice(lo..hi),
+            None => candle::bail!("forward_ep: x layout not contiguous"),
+        };
+        let ncols_padded = pad(hidden, MATRIX_ROW_PADDING);
+        let q8_bytes = b_size * ncols_padded * GgmlDType::Q8_1.type_size()
+            / GgmlDType::Q8_1.block_size();
+        let mut y_q8_1 = unsafe { dev.alloc::<u8>(q8_bytes)? };
+        quantize_q8_1(&x_view, &mut y_q8_1, hidden, b_size, &dev)?;
+        let q8_view = y_q8_1.slice(0..y_q8_1.len());
+        let rhs_shape = x_flat.dims().to_vec();
+        drop(x_st);
+
+        // Router + topk (global ids).
+        let router_logits = if self.router.is_qtensor() {
+            self.router.forward_preq8(&q8_view, b_size, &rhs_shape)?
+        } else {
+            self.router.forward(&x_flat)?
+        };
+        let (topk_weights, topk_ids_global) = if let Some((w, ids)) =
+            try_topk_fused(&router_logits, self.num_experts_per_tok)
+        {
+            (w, ids)
+        } else {
+            let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+            let cpu = candle::Device::Cpu;
+            let rw_cpu = routing_weights.to_device(&cpu)?;
+            let topk_ids_cpu_tensor = rw_cpu
+                .arg_sort_last_dim(false)?
+                .narrow(D::Minus1, 0, self.num_experts_per_tok)?
+                .contiguous()?;
+            let hip_dev = candle::Device::Hip(dev.clone());
+            let topk_ids = topk_ids_cpu_tensor.to_device(&hip_dev)?;
+            let topk_weights = routing_weights.gather(&topk_ids, D::Minus1)?;
+            let topk_weights = (&topk_weights
+                / topk_weights.sum_keepdim(D::Minus1)?.broadcast_as(topk_weights.shape())?)?;
+            (topk_weights, topk_ids)
+        };
+
+        // EP remap: for each topk slot, if the global id is in our
+        // local range, map to local index; else map to 0 and zero its
+        // weight. Done on CPU since topk_ids is tiny (b_size * k).
+        let ids_cpu: Vec<u32> = topk_ids_global
+            .to_device(&candle::Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let local_start = partition.local_start as u32;
+        let local_count = partition.local_count as u32;
+        let mut local_ids_cpu = Vec::with_capacity(ids_cpu.len());
+        let mut weight_mask_cpu = Vec::with_capacity(ids_cpu.len());
+        for id in &ids_cpu {
+            if *id >= local_start && *id < local_start + local_count {
+                local_ids_cpu.push(*id - local_start);
+                weight_mask_cpu.push(1.0f32);
+            } else {
+                local_ids_cpu.push(0);
+                weight_mask_cpu.push(0.0f32);
+            }
+        }
+        let hip_dev = candle::Device::Hip(dev.clone());
+        let topk_ids_local = Tensor::from_vec(local_ids_cpu, topk_ids_global.shape().dims(), &hip_dev)?;
+        let weight_mask = Tensor::from_vec(
+            weight_mask_cpu,
+            topk_weights.shape().dims(),
+            &hip_dev,
+        )?;
+        // Zero out-of-range weights element-wise.
+        let topk_weights_masked = topk_weights.mul(&weight_mask)?;
+
+        // Run indexed_moe_forward on narrowed expert tensors with local ids.
+        let in_shape = candle::Shape::from((b_size, 1usize, hidden));
+        let moe_out = if let Some(ref gate_exps) = self.gate_exps {
+            let up_exps = self.up_exps.as_ref().unwrap();
+            let gate_out =
+                gate_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids_local)?;
+            let up_out =
+                up_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids_local)?;
+            let activated = candle_nn::ops::silu_mul(&gate_out, &up_out)?;
+            self.down_exps
+                .indexed_moe_forward(&activated.contiguous()?, &topk_ids_local)?
+        } else if let Some(ref gate_up_exps) = self.gate_up_exps {
+            let gate_up =
+                gate_up_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids_local)?;
+            let gate = gate_up
+                .narrow(D::Minus1, 0, self.intermediate_size)?
+                .contiguous()?;
+            let up = gate_up
+                .narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?
+                .contiguous()?;
+            let activated = candle_nn::ops::silu_mul(&gate, &up)?;
+            self.down_exps
+                .indexed_moe_forward(&activated.contiguous()?, &topk_ids_local)?
+        } else {
+            candle::bail!("forward_ep: MoE has no expert weights");
+        };
+
+        // Weighted sum with masked weights — out-of-range slots
+        // contribute zero.
+        let topk_weights_masked = topk_weights_masked.unsqueeze(D::Minus1)?;
+        let weighted = moe_out.broadcast_mul(&topk_weights_masked)?;
+        let mut result = weighted.sum(1)?;
+
+        // Shared expert: added on rank 0 ONLY. When all ranks' partial
+        // outputs are summed, the shared expert appears exactly once.
+        if partition.rank == 0 {
+            if let Some(ref shared_mlp) = self.shared {
+                let shared_out = shared_mlp.forward(&x_flat)?;
+                let shared_out = if let Some(ref sg_weight) = self.shared_gate_weight {
+                    let sg = if device_eq(sg_weight.device(), x_flat.device()) {
+                        sg_weight.clone()
+                    } else {
+                        sg_weight.to_device(x_flat.device())?
+                    };
+                    let gate_logits = x_flat.broadcast_mul(&sg)?.sum_keepdim(D::Minus1)?;
+                    let gate = candle_nn::ops::sigmoid(&gate_logits)?;
+                    shared_out.broadcast_mul(&gate)?
+                } else {
+                    shared_out
+                };
+                result = (result + shared_out)?;
+            }
+        }
+
+        Ok(result.reshape((b_sz, seq_len, hidden))?)
     }
 
     fn forward_inner(&self, x: &Tensor) -> Result<Tensor> {
