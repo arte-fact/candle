@@ -301,6 +301,33 @@ pub struct MoeExperts {
     /// a SCALAR per token via dot product, then sigmoid. Used by qwen35moe to
     /// gate the shared expert output.
     shared_gate_weight: Option<Tensor>,
+    /// Expert-parallel partition (present when EP is active). Contains
+    /// the rank mapping + local expert range on this rank. Forward
+    /// passes with `ep_partition.is_some()` should go through
+    /// `forward_ep` instead of the default path.
+    ///
+    /// State in this session: the field + load-time partition metadata
+    /// are wired, but `forward_ep` is still a fallback to the full
+    /// (replicated) forward — turning on EP reduces NOTHING yet. Filling
+    /// in the real gather/scatter is the next phase (X3 core).
+    #[cfg(feature = "hip")]
+    pub(crate) ep_partition: Option<EpPartition>,
+}
+
+/// Expert-parallel partition state for one rank.
+#[cfg(feature = "hip")]
+#[derive(Debug, Clone)]
+pub struct EpPartition {
+    /// Cluster this rank participates in.
+    pub cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+    /// This rank's index within the cluster.
+    pub rank: usize,
+    /// Contiguous range of experts owned by this rank:
+    /// `[local_start, local_start + local_count)`.
+    pub local_start: usize,
+    pub local_count: usize,
+    /// Total experts across the cluster.
+    pub num_experts: usize,
 }
 
 impl MoeExperts {
@@ -403,7 +430,51 @@ impl MoeExperts {
             intermediate_size,
             shared,
             shared_gate_weight,
+            #[cfg(feature = "hip")]
+            ep_partition: None,
         })
+    }
+
+    /// EP-aware load. Currently identical to `load` — every rank holds
+    /// the full expert set — but attaches an `EpPartition` so the
+    /// forward pass can route through `forward_ep`. Real memory
+    /// savings land when X3.4 (QTensor::narrow_experts) slices the
+    /// expert axis at load.
+    ///
+    /// Partition policy v1: contiguous block. Rank r owns experts
+    /// `[r * block, min((r+1) * block, num_experts))` where
+    /// `block = ceil(num_experts / world_size)`.
+    #[cfg(feature = "hip")]
+    pub fn load_ep(
+        gg: &Gguf,
+        prefix: &str,
+        cfg: &GgufConfig,
+        cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+        rank: usize,
+    ) -> Result<Self> {
+        let mut me = Self::load(gg, prefix, cfg)?;
+        let num_experts = gg
+            .ct
+            .tensor_infos
+            .get(&format!("{prefix}.ffn_down_exps.weight"))
+            .map(|ti| ti.shape.dims()[0])
+            .ok_or_else(|| {
+                candle::Error::Msg(format!(
+                    "load_ep: cannot determine num_experts from {prefix}.ffn_down_exps.weight"
+                ))
+            })?;
+        let world = cluster.world_size();
+        let block = (num_experts + world - 1) / world;
+        let local_start = rank * block;
+        let local_count = (num_experts - local_start).min(block);
+        me.ep_partition = Some(EpPartition {
+            cluster,
+            rank,
+            local_start,
+            local_count,
+            num_experts,
+        });
+        Ok(me)
     }
 
     /// Phase O1 fast path: pre-quantise x to Q8_1 once and feed BOTH the
@@ -586,6 +657,15 @@ impl MoeExperts {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // EP entry-point: when a partition is attached, forward_ep owns
+        // the compute (broadcast → local experts → all-reduce).
+        // v1 stub: delegate to the normal forward so output is correct
+        // while the real gather/scatter wiring lands in X3.5.
+        #[cfg(feature = "hip")]
+        if self.ep_partition.is_some() {
+            return self.forward_ep(x);
+        }
+
         // Phase O1 — decode-path fast path.  Pre-quantises x once into
         // Q8_1 and reuses it for the router AND the gate/up MoE matmuls.
         // (Down still has its own quantise since its input is
@@ -597,6 +677,33 @@ impl MoeExperts {
             if let Some(out) = self.forward_shared_q8_decode(x)? {
                 return Ok(out);
             }
+        }
+        self.forward_inner(x)
+    }
+
+    /// Expert-parallel forward. Currently a stub that delegates to
+    /// `forward_inner` on every rank (i.e., the non-EP path on the
+    /// full expert set). That gives us correct output while the
+    /// X3.4 (QTensor expert-axis slice) and X3.5 (real dispatch)
+    /// pieces land. Once those are done:
+    ///
+    /// 1. Broadcast `x` via `partition.cluster.broadcast_via_host`.
+    /// 2. On each rank: filter `topk_ids` to only the experts in
+    ///    `[local_start, local_start + local_count)`. Out-of-range
+    ///    (topk_id, topk_weight) pairs zeroed so the kernel skips.
+    /// 3. Local `indexed_moe_forward_preq8` on the narrowed gate/up/
+    ///    down tensors with remapped topk_ids (global → local index).
+    /// 4. Sum partial outputs across ranks (all-reduce via a cluster
+    ///    helper — implementable as a broadcast+add since we only
+    ///    need a per-device copy of the full sum at the caller layer).
+    ///
+    /// Until that lands, EP reduces VRAM (when X3.4 is on) but not
+    /// compute — every rank still runs the full expert set.
+    #[cfg(feature = "hip")]
+    pub fn forward_ep(&self, x: &Tensor) -> Result<Tensor> {
+        // Fast path unchanged until X3.5.
+        if let Some(out) = self.forward_shared_q8_decode(x)? {
+            return Ok(out);
         }
         self.forward_inner(x)
     }
