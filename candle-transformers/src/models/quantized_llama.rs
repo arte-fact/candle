@@ -634,7 +634,8 @@ impl LayerWeights {
             _ => candle::bail!("forward_attn_q8: q must be on HIP"),
         };
         // Max context — matches the F32 path's new_k_transposed(2, 4096).
-        const Q8_T_MAX: usize = 4096;
+        let q8_t_max: usize = std::env::var("CANDLE_KV_MAX_T")
+            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
 
         // Reset-on-prompt semantic identical to F32 path.
         if index_pos == 0 {
@@ -645,7 +646,7 @@ impl LayerWeights {
         let cache = match self.q8_cache.as_mut() {
             Some(c) => c,
             None => {
-                let c = QKvCache::new(&hip_dev, b_sz, self.n_kv_head, Q8_T_MAX, self.head_dim)?;
+                let c = QKvCache::new(&hip_dev, b_sz, self.n_kv_head, q8_t_max, self.head_dim)?;
                 self.q8_cache = Some(c);
                 self.q8_cache.as_mut().unwrap()
             }

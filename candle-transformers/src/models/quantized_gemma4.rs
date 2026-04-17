@@ -1246,8 +1246,10 @@ impl ModelWeights {
                                 4 => TbVariant::Tq4_0,
                                 _ => candle::bail!("CANDLE_KV_TQ={tq}: only 2/3/4 supported"),
                             };
+                            let t_max = std::env::var("CANDLE_KV_MAX_T")
+                                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
                             AnyKvCache::Tb(QTurboKvCache::new(
-                                &hip_dev, variant, b0, h_kv0, 4096, d0,
+                                &hip_dev, variant, b0, h_kv0, t_max, d0,
                             )?)
                         } else if self.use_q8_kv {
                             let (b0, h_kv0, _, d0) = k_new.dims4()?;
@@ -1255,9 +1257,11 @@ impl ModelWeights {
                                 candle::Device::Hip(d) => d.clone(),
                                 _ => candle::bail!("CANDLE_KV_Q8: k_new must be on HIP"),
                             };
+                            let t_max = std::env::var("CANDLE_KV_MAX_T")
+                                .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
                             AnyKvCache::Q8(
                                 candle::hip_backend::q8_kv_cache::QKvCache::new(
-                                    &hip_dev, b0, h_kv0, 4096, d0,
+                                    &hip_dev, b0, h_kv0, t_max, d0,
                                 )?,
                             )
                         } else if k_is_canonical {

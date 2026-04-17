@@ -23,6 +23,20 @@ use std::sync::Arc;
 /// bucket exactly once).
 const KV_CACHE_INITIAL: usize = 4096;
 
+/// Maximum KV-cache sequence length for the Q8 / TurboQuant paths.
+/// F32 `KvCache` grows dynamically, but the compressed caches
+/// pre-allocate a packed slab to avoid fragmenting VRAM on long
+/// prefills. Defaults to 4096 to match KV_CACHE_INITIAL; override
+/// with `CANDLE_KV_MAX_T` for longer contexts (e.g. 262144 for the
+/// 256K window on qwen3-coder-next).
+#[cfg(feature = "hip")]
+fn kv_max_seq_len() -> usize {
+    std::env::var("CANDLE_KV_MAX_T")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(KV_CACHE_INITIAL)
+}
+
 // G2 replay dynamic-L_k override. When a caller sets this before entering
 // `gqa_attention_k_transposed`, the dispatcher uses the kernel variant
 // that iterates up to `l_k_iter` instead of the full `k_t.dim(3)`. The
@@ -1368,9 +1382,10 @@ impl GatedAttention {
                 _ => candle::bail!("CANDLE_KV_TQ={tq}: only 2/3/4 supported"),
             };
             if self.tq_cache.is_none() {
+                let t_max = kv_max_seq_len();
                 self.tq_cache = Some(QTurboKvCache::new(
                     &hip_dev, variant, b_sz_q, self.n_kv_head,
-                    KV_CACHE_INITIAL, self.head_dim,
+                    t_max, self.head_dim,
                 )?);
             }
             if offset == 0 { self.tq_cache.as_mut().unwrap().reset(); }
@@ -1399,11 +1414,12 @@ impl GatedAttention {
                 _ => candle::bail!("CANDLE_KV_Q8: k must be on HIP"),
             };
             if self.q8_cache.is_none() {
+                let t_max = kv_max_seq_len();
                 self.q8_cache = Some(QKvCache::new(
                     &hip_dev,
                     b_sz_q,
                     self.n_kv_head,
-                    KV_CACHE_INITIAL,
+                    t_max,
                     self.head_dim,
                 )?);
             }
