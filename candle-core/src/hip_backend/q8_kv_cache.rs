@@ -216,17 +216,42 @@ impl QKvCache {
 
     /// Dequantise the first `current_seq_len` tokens of the K slab into
     /// a fresh `(B, H_kv, current_seq_len, D)` F32 tensor. Used by the
-    /// prefill fallback path.
+    /// prefill fallback path (phase 4): the model reconstructs F32 K/V
+    /// from the Q8 cache for the existing flash-attn-v2 path, runs
+    /// attention, then drops the F32 tensors. Peak extra VRAM =
+    /// current_seq_len × D × H_kv × 4 B per layer — transient.
     pub fn dequantize_k(&self) -> Result<Tensor> {
-        self.dequantize_inner(&self.k)
+        self.dequantize_inner(&self.k, 0, self.current_seq_len)
     }
 
     pub fn dequantize_v(&self) -> Result<Tensor> {
-        self.dequantize_inner(&self.v)
+        self.dequantize_inner(&self.v, 0, self.current_seq_len)
     }
 
-    fn dequantize_inner(&self, slab: &HipSlice<u8>) -> Result<Tensor> {
-        let t_sel = self.current_seq_len;
+    /// Dequantise `[t_start, t_start + t_len)` of K into a fresh F32
+    /// tensor of shape `(B, H_kv, t_len, D)`. Needed if a model wants
+    /// to only reconstruct the NEW portion of the cache each step
+    /// (rare for prefill — typically the whole thing is re-read).
+    pub fn dequantize_k_range(&self, t_start: usize, t_len: usize) -> Result<Tensor> {
+        self.dequantize_inner(&self.k, t_start, t_len)
+    }
+
+    pub fn dequantize_v_range(&self, t_start: usize, t_len: usize) -> Result<Tensor> {
+        self.dequantize_inner(&self.v, t_start, t_len)
+    }
+
+    fn dequantize_inner(
+        &self,
+        slab: &HipSlice<u8>,
+        t_start: usize,
+        t_sel: usize,
+    ) -> Result<Tensor> {
+        if t_start + t_sel > self.current_seq_len {
+            crate::bail!(
+                "QKvCache::dequantize_range: [{t_start}, {t_start}+{t_sel}) > current_seq_len={}",
+                self.current_seq_len
+            );
+        }
         if t_sel == 0 {
             // Empty cache: return a 0-length tensor with the right shape
             // signature.
@@ -258,7 +283,7 @@ impl QKvCache {
         let t_sel_i = t_sel as i32;
         let d_i = self.d as i32;
         let t_max_i = self.t_max as i32;
-        let t_offset_i: i32 = 0; // dequantise from the start
+        let t_offset_i: i32 = t_start as i32;
 
         let mut builder = func.builder();
         builder.arg(slab);
