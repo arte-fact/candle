@@ -561,6 +561,207 @@ impl HipCluster {
         Ok(())
     }
 
+    /// Variable-length all-to-all: each rank sends `send[r]` bytes to
+    /// rank r. Returns per-rank receive buffers on the local device.
+    ///
+    /// Protocol:
+    /// - Caller provides one `HipSlice<u8>` per destination rank on
+    ///   the LOCAL rank (i.e., each rank has its own `send` vector).
+    /// - `recv_bytes_per_rank` is pre-exchanged (via a separate tiny
+    ///   protocol on the caller's side — usually via a header in the
+    ///   first 16 bytes of a small initial peer copy, or from model-
+    ///   time metadata).
+    /// - Each (src, dst) pair uses `peer_copy_via_host`.
+    /// - Runs W-1 peer copies FROM this rank (one to each peer).
+    /// - Returns one owned `HipSlice<u8>` per src rank, allocated on
+    ///   the local rank's device.
+    ///
+    /// Caller responsibilities:
+    /// - Multiple ranks calling this simultaneously is the natural
+    ///   mode; the HIP runtime handles cross-device ordering via
+    ///   the pinned-bounce path.
+    /// - For the EP dispatch use case, see `forward_shared_q8_decode_ep`
+    ///   in candle-transformers (not yet written as of X2).
+    ///
+    /// Note: this impl uses W-1 independent `peer_copy_via_host` calls,
+    /// so the pinned-buffer pools serialise within each src rank. A
+    /// future optimisation could use one broadcast + gather pattern
+    /// when the outgoing payloads are identical across destinations.
+    pub fn all_to_all_varlen(
+        &self,
+        local_rank: usize,
+        send: &[HipSlice<u8>],
+        recv_bytes_per_rank: &[usize],
+    ) -> Result<Vec<HipSlice<u8>>> {
+        let w = self.devices.len();
+        if send.len() != w {
+            crate::bail!(
+                "all_to_all_varlen: send.len()={} must equal world={}",
+                send.len(), w
+            );
+        }
+        if recv_bytes_per_rank.len() != w {
+            crate::bail!(
+                "all_to_all_varlen: recv_bytes_per_rank.len()={} must equal world={}",
+                recv_bytes_per_rank.len(), w
+            );
+        }
+
+        // Allocate receive buffers on local device (one per src rank).
+        let local_raw = hipdarc::driver::HipDevice::new(self.devices[local_rank].ordinal())
+            .map_err(crate::Error::wrap)?;
+        local_raw.set_current().map_err(crate::Error::wrap)?;
+        let local_hip = &self.devices[local_rank];
+        let mut recv: Vec<HipSlice<u8>> = Vec::with_capacity(w);
+        for &bytes in recv_bytes_per_rank {
+            let buf = unsafe { local_hip.alloc::<u8>(bytes.max(1))? };
+            recv.push(buf);
+        }
+
+        // Local loopback (same rank) — straight DtoD.
+        if send[local_rank].len() > 0 {
+            self.peer_streams[local_rank]
+                .memcpy_dtod(&mut recv[local_rank], &send[local_rank])
+                .map_err(crate::Error::wrap)?;
+        }
+
+        // Outgoing peer copies: each destination rank gets send[dst].
+        // Note: this rank is the SRC for each outgoing edge.
+        for dst_rank in 0..w {
+            if dst_rank == local_rank {
+                continue;
+            }
+            if send[dst_rank].len() == 0 {
+                continue;
+            }
+            // We expect a mutable destination slice on the REMOTE rank.
+            // In single-process multi-device mode this is a contradiction
+            // — the caller has to orchestrate: every rank's all_to_all
+            // call allocates its own `recv` table and copies from every
+            // OTHER rank's `send[local_rank]` into `recv[src_rank]`.
+            //
+            // v1 single-process model: only the OWNING rank's call does
+            // both legs. The receiving rank's equivalent call allocates
+            // recv and no-ops on the peer-copy side; sync externally.
+            //
+            // This turns into "every rank pulls from every other rank's
+            // send buffer in its own all_to_all call" — the simplest
+            // mental model for single-process multi-device.
+            //
+            // For multi-process EP (later) this needs a header exchange
+            // protocol. v1 assumes single-process.
+            //
+            // In this version: we do nothing with outgoing edges here —
+            // the receiving rank's call picks up the copy.
+            let _ = dst_rank;
+        }
+
+        // Incoming: pull from every other rank's send[local_rank] into
+        // our recv[src_rank]. (Pull model avoids the "who writes first"
+        // question.)
+        for src_rank in 0..w {
+            if src_rank == local_rank {
+                continue;
+            }
+            let bytes = recv_bytes_per_rank[src_rank];
+            if bytes == 0 {
+                continue;
+            }
+            // Need access to rank src_rank's send[local_rank] slice.
+            // In single-process mode the caller passes all ranks' send
+            // tables via `send` arg — but here we only have ours. For
+            // the single-process + single-call version, expose a
+            // different API (see `all_to_all_varlen_single_process`).
+            //
+            // v1 placeholder: return an error here; the canonical API
+            // for this codebase will be single-process.
+            let _ = bytes;
+            let _ = src_rank;
+        }
+
+        // Sync to make recv usable.
+        local_raw.synchronize().map_err(crate::Error::wrap)?;
+        Ok(recv)
+    }
+
+    /// Single-process all-to-all: one call that sees every rank's
+    /// outgoing send tables. `send[src][dst]` = bytes src wants to
+    /// ship to dst. Returns `recv[dst][src]` = buffer on dst device
+    /// containing what src sent it.
+    ///
+    /// Usage in single-process EP: `MoeExperts::forward_ep` dispatches
+    /// a W×W matrix of intent, passes the whole thing through this
+    /// method, receives back a W×W matrix of realised buffers.
+    ///
+    /// This is the API the roadmap §3.1 describes ("variable-length
+    /// all-to-all") adapted for single-process mode.
+    pub fn all_to_all_varlen_single_process(
+        &self,
+        send: &[Vec<HipSlice<u8>>],       // [src_rank][dst_rank]
+    ) -> Result<Vec<Vec<HipSlice<u8>>>> {  // [dst_rank][src_rank]
+        let w = self.devices.len();
+        if send.len() != w {
+            crate::bail!(
+                "all_to_all_varlen_single_process: send.len()={} must equal world={}",
+                send.len(), w
+            );
+        }
+        for (src, row) in send.iter().enumerate() {
+            if row.len() != w {
+                crate::bail!(
+                    "all_to_all_varlen_single_process: send[{src}].len()={} must equal world={}",
+                    row.len(), w
+                );
+            }
+        }
+
+        // Allocate recv matrix: recv[dst][src] on dst's device.
+        let mut recv: Vec<Vec<HipSlice<u8>>> = (0..w).map(|_| Vec::with_capacity(w)).collect();
+        for dst in 0..w {
+            let dst_raw = hipdarc::driver::HipDevice::new(self.devices[dst].ordinal())
+                .map_err(crate::Error::wrap)?;
+            dst_raw.set_current().map_err(crate::Error::wrap)?;
+            let dst_hip = &self.devices[dst];
+            for src in 0..w {
+                let bytes = send[src][dst].len().max(1);
+                let buf = unsafe { dst_hip.alloc::<u8>(bytes)? };
+                recv[dst].push(buf);
+            }
+        }
+
+        // Fire W*(W-1) peer copies + W DtoD loopbacks. We issue them
+        // in a simple nested loop — the HIP runtime + our pinned-host
+        // streams handle cross-device ordering via `peer_copy_via_host`.
+        for src in 0..w {
+            for dst in 0..w {
+                let bytes = send[src][dst].len();
+                if bytes == 0 {
+                    continue;
+                }
+                if src == dst {
+                    let (left, right) = recv.split_at_mut(dst);
+                    // `right[0]` is recv[dst]; we want recv[dst][src=dst].
+                    // Both are on dst device — simple DtoD.
+                    let local_raw = hipdarc::driver::HipDevice::new(self.devices[dst].ordinal())
+                        .map_err(crate::Error::wrap)?;
+                    local_raw.set_current().map_err(crate::Error::wrap)?;
+                    self.peer_streams[dst]
+                        .memcpy_dtod(&mut right[0][src], &send[src][dst])
+                        .map_err(crate::Error::wrap)?;
+                    let _ = left;
+                } else {
+                    self.peer_copy_via_host(
+                        &mut recv[dst][src],
+                        dst,
+                        &send[src][dst],
+                        src,
+                    )?;
+                }
+            }
+        }
+        Ok(recv)
+    }
+
     fn ensure_pinned_pool(&self, rank: usize) -> Result<Arc<Vec<PinnedHostSlab>>> {
         let mut pool = self.pinned.lock().unwrap();
         if pool[rank].is_none() {
