@@ -36,6 +36,7 @@ pub fn q8_slab_bytes(b: usize, h: usize, t: usize, d: usize) -> usize {
     b * h * t * (d / QK8_0) * BLOCK_Q8_0_BYTES
 }
 
+#[derive(Debug)]
 pub struct QKvCache {
     /// Packed Q8_0 K slab of shape `(B, H_kv, T_max, D/32)`.
     k: HipSlice<u8>,
@@ -345,8 +346,8 @@ pub fn gqa_decode_gemv_v_q8(
     }
     let n_rep = h_q / h_kv;
 
-    if !matches!(d, 128 | 256 | 512) {
-        crate::bail!("gqa_decode_gemv_v_q8: unsupported D={d} (need 128, 256, or 512)");
+    if !matches!(d, 64 | 128 | 256 | 512) {
+        crate::bail!("gqa_decode_gemv_v_q8: unsupported D={d} (need 64, 128, 256, or 512)");
     }
     if attn.dtype() != DType::F32 {
         crate::bail!("gqa_decode_gemv_v_q8: attn dtype must be F32");
@@ -371,6 +372,7 @@ pub fn gqa_decode_gemv_v_q8(
     let out = unsafe { cache.dev.alloc::<f32>(out_len)? };
 
     let kn = match d {
+        64 => "gqa_decode_gemv_v_q8_d64_f32",
         128 => "gqa_decode_gemv_v_q8_d128_f32",
         256 => "gqa_decode_gemv_v_q8_d256_f32",
         512 => "gqa_decode_gemv_v_q8_d512_f32",
@@ -382,9 +384,16 @@ pub fn gqa_decode_gemv_v_q8(
 
     // Dynamic LDS sized for the L_k attention row.
     let shared_bytes = (l_k * 4) as u32;
+    // D=64 uses a smaller 64-thread block (one per d); everything ≥128
+    // uses 128-thread blocks with D/128 chunks along D.
+    let (grid_x, block_x) = if d == 64 {
+        (1u32, 64u32)
+    } else {
+        ((d as u32) / BLOCK_SIZE_V, BLOCK_SIZE_V)
+    };
     let cfg = LaunchConfig {
-        grid_dim: ((d as u32) / BLOCK_SIZE_V, h_q as u32, b as u32),
-        block_dim: (BLOCK_SIZE_V, 1, 1),
+        grid_dim: (grid_x, h_q as u32, b as u32),
+        block_dim: (block_x, 1, 1),
         shared_mem_bytes: shared_bytes,
     };
     let l_k_i = l_k as i32;
@@ -458,8 +467,8 @@ pub fn gqa_decode_gemv_qk_q8(
     }
     let n_rep = h_q / h_kv;
 
-    if !matches!(d, 128 | 256 | 512) {
-        crate::bail!("gqa_decode_gemv_qk_q8: unsupported D={d} (need 128, 256, or 512)");
+    if !matches!(d, 64 | 128 | 256 | 512) {
+        crate::bail!("gqa_decode_gemv_qk_q8: unsupported D={d} (need 64, 128, 256, or 512)");
     }
     if q.dtype() != DType::F32 {
         crate::bail!("gqa_decode_gemv_qk_q8: q dtype must be F32");
@@ -484,6 +493,7 @@ pub fn gqa_decode_gemv_qk_q8(
     let out = unsafe { cache.dev.alloc::<f32>(out_len)? };
 
     let kn = match d {
+        64 => "gqa_decode_gemv_qk_q8_d64_f32",
         128 => "gqa_decode_gemv_qk_q8_d128_f32",
         256 => "gqa_decode_gemv_qk_q8_d256_f32",
         512 => "gqa_decode_gemv_qk_q8_d512_f32",
@@ -491,9 +501,11 @@ pub fn gqa_decode_gemv_qk_q8(
     };
     let func = cache.dev.get_or_load_func(kn, &kernels::ATTN_Q8_KV)?;
 
+    // D=64 uses a 64-thread block (single wave); everything else uses 128.
+    let block_x = if d == 64 { 64u32 } else { BLOCK_SIZE_QK };
     let cfg = LaunchConfig {
         grid_dim: (l_k as u32, h_q as u32, b as u32),
-        block_dim: (BLOCK_SIZE_QK, 1, 1),
+        block_dim: (block_x, 1, 1),
         shared_mem_bytes: 0,
     };
     let l_k_i = l_k as i32;
@@ -523,4 +535,33 @@ pub fn gqa_decode_gemv_qk_q8(
         crate::op::BackpropOp::none(),
         /* is_variable */ false,
     ))
+}
+
+/// Decode attention chain backed by a Q8 KV cache: Q·K → scale + mask →
+/// softmax → V·attn. Drop-in replacement for `gqa_attention_k_transposed`
+/// on the decode path (L_q=1). Prefill still needs dequant → F32 flash-attn
+/// since this wrapper is strictly decode-only.
+///
+/// - `q`: (B, H_q, 1, D) F32, contiguous.
+/// - `mask`: optional additive F32 (1, 1, 1, L_k), already shifted so
+///   legal positions are 0 and illegal ones -inf. Broadcast-add along K.
+/// - `scale`: softmax scale (typically 1/sqrt(D)).
+pub fn gqa_attention_decode_q8(
+    q: &Tensor,
+    cache: &QKvCache,
+    l_k: usize,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor> {
+    let scores = gqa_decode_gemv_qk_q8(q, cache, l_k)?;
+    let scaled = scores.affine(scale, 0.0)?;
+    let masked = match mask {
+        Some(m) => scaled.broadcast_add(m)?,
+        None => scaled,
+    };
+    let max = masked.max_keepdim(crate::D::Minus1)?;
+    let e = masked.broadcast_sub(&max)?.exp()?;
+    let sum = e.sum_keepdim(crate::D::Minus1)?;
+    let p = e.broadcast_div(&sum)?;
+    gqa_decode_gemv_v_q8(&p, cache, l_k)
 }

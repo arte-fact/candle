@@ -81,6 +81,55 @@ static __device__ __forceinline__ void gqa_decode_gemv_v_q8_impl(
     *out_ptr = acc;
 }
 
+// ---------------------------------------------------------------------------
+// D=64 V·attn variant. Uses a 64-thread block (one per output d) since
+// D=64 < 128. Each block owns ALL 64 output d positions for one (h_q, b).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void __launch_bounds__(64, 2)
+gqa_decode_gemv_v_q8_d64_f32(
+    const float * __restrict__ attn, const void * __restrict__ v_cache,
+    float * __restrict__ out,
+    int L_k, int T_max, int H_q, int H_kv, int n_rep)
+{
+    constexpr int D = 64;
+    constexpr int BLOCK_SIZE = 64;
+    constexpr int BLOCKS_PER_ROW = D / QK8_0;    // = 2
+
+    const int h_q = blockIdx.y;
+    const int b   = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const int h_kv        = (n_rep > 1) ? (h_q / n_rep) : h_q;
+    const int d           = tid;                 // one thread per d
+    const int block_id_d  = d >> 5;              // 0 or 1
+    const int lane_in_blk = d & 31;
+
+    const int64_t attn_off = ((int64_t)(b * H_q) + h_q) * L_k;
+    const int64_t out_off  = ((int64_t)(b * H_q) + h_q) * D + (int64_t)d;
+    const float * attn_ptr = attn + attn_off;
+    float       * out_ptr  = out + out_off;
+
+    const block_q8_0_kv * v_row_base =
+        (const block_q8_0_kv *) v_cache
+        + (int64_t)(b * H_kv + h_kv) * T_max * BLOCKS_PER_ROW
+        + block_id_d;
+
+    extern __shared__ float attn_lds[];
+    for (int t = tid; t < L_k; t += BLOCK_SIZE) {
+        attn_lds[t] = attn_ptr[t];
+    }
+    __syncthreads();
+
+    float acc = 0.0f;
+    for (int t = 0; t < L_k; ++t) {
+        const block_q8_0_kv * blk = v_row_base + (int64_t)t * BLOCKS_PER_ROW;
+        const float scale = __half2float(blk->d);
+        const float v_val = scale * (float)blk->qs[lane_in_blk];
+        acc += attn_lds[t] * v_val;
+    }
+    *out_ptr = acc;
+}
+
 extern "C" __global__ void __launch_bounds__(128, 1)
 gqa_decode_gemv_v_q8_d128_f32(
     const float * __restrict__ attn, const void * __restrict__ v_cache,
@@ -174,6 +223,46 @@ static __device__ __forceinline__ void gqa_decode_gemv_qk_q8_impl(
     if (tid == 0) {
         const float final_sum = smem[0] + smem[1];
         scores[((int64_t)(b * H_q) + h_q) * L_k + t] = final_sum;
+    }
+}
+
+// D=64 Q·K variant. BLOCK_SIZE=64 (single wave, one thread per d).
+// Uses only a wave-local DPP reduce — no cross-wave LDS combine needed
+// since the whole block fits in one wave.
+extern "C" __global__ void __launch_bounds__(64, 2)
+gqa_decode_gemv_qk_q8_d64_f32(
+    const float * __restrict__ q, const void * __restrict__ k_cache,
+    float * __restrict__ scores,
+    int L_k, int T_max, int H_q, int H_kv, int n_rep)
+{
+    constexpr int D = 64;
+    constexpr int BLOCK_SIZE = 64;
+    constexpr int BLOCKS_PER_ROW = D / QK8_0;    // = 2
+
+    const int t   = blockIdx.x;
+    const int h_q = blockIdx.y;
+    const int b   = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const int h_kv = (n_rep > 1) ? (h_q / n_rep) : h_q;
+
+    const float * q_ptr = q + ((int64_t)(b * H_q) + h_q) * D;
+    const block_q8_0_kv * k_row_t = (const block_q8_0_kv *) k_cache
+        + (int64_t)(b * H_kv + h_kv) * T_max * BLOCKS_PER_ROW
+        + (int64_t)t * BLOCKS_PER_ROW;
+
+    const int d           = tid;
+    const int blk_d       = d >> 5;
+    const int lane_in_blk = d & 31;
+    const block_q8_0_kv * kblk = k_row_t + blk_d;
+    const float k_scale = __half2float(kblk->d);
+    const float k_val   = k_scale * (float)kblk->qs[lane_in_blk];
+    float partial = q_ptr[d] * k_val;
+
+    // 64-lane wave-local reduction (whole block fits in one wave).
+    partial = q8_warp_reduce_sum(partial);
+    if (tid == 0) {
+        scores[((int64_t)(b * H_q) + h_q) * L_k + t] = partial;
     }
 }
 

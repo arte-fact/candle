@@ -347,7 +347,7 @@ impl KvCacheDirect {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct LayerWeights {
     attention_wq: QMatMul,
     attention_wk: QMatMul,
@@ -366,6 +366,12 @@ struct LayerWeights {
     /// V stored as (B,H,T,D) with dim=2 (natural). V access during decode
     /// attention is coalesced across D (stride[3]=1, stride[2]=D).
     kv_cache: Option<candle_nn::kv_cache::KvCache>,
+    /// Q8_0 KV cache used when `CANDLE_KV_Q8=1`. Matches llama.cpp-turbo's
+    /// fattn-q8 layout (34 B per 32 elems); shared-pointer append from the
+    /// freshly-RoPE'd F32 K/V.
+    #[cfg(feature = "hip")]
+    q8_cache: Option<candle::hip_backend::q8_kv_cache::QKvCache>,
+    use_q8_kv: bool,
     device: Device,
     span_attn: tracing::Span,
     span_rot: tracing::Span,
@@ -417,6 +423,21 @@ impl LayerWeights {
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
         let k = self.apply_rotary_emb(&k, index_pos)?;
+
+        // --- Q8 KV path -------------------------------------------------
+        // When `CANDLE_KV_Q8=1`, store K/V in a packed block_q8_0 cache
+        // matching llama.cpp-turbo's fattn-q8 layout. Decode dispatches to
+        // the Q8-aware gemvs for Q·K and V·attn; prefill reuses the F32
+        // flash-attn path on a dequantised view of the cache.
+        //
+        // Under the Q8 path the F32 `kv_cache` is never allocated, so VRAM
+        // per context is 1.88× smaller than F16 / 3.76× smaller than F32.
+        #[cfg(feature = "hip")]
+        if self.use_q8_kv {
+            // Drop the tracing span borrow so forward_attn_q8 can take &mut self.
+            drop(_enter);
+            return self.forward_attn_q8(&q, &k, &v, mask, index_pos, b_sz, seq_len);
+        }
 
         // G1: KvCache with K pre-transposed. V kept in natural (B,H,T,D)
         // layout (dim_v=2), giving coalesced decode access across D.
@@ -591,6 +612,102 @@ impl LayerWeights {
         let y = self.attention_wo.forward(&y)?;
         Ok(y)
     }
+
+    /// Q8 KV attention path — called from `forward_attn` when
+    /// `CANDLE_KV_Q8=1`. Input q/k/v are F32 `(B, H, seq_len, D)`
+    /// already RoPE'd. Returns `(B, seq_len, n_head * head_dim)` post-wo.
+    #[cfg(feature = "hip")]
+    fn forward_attn_q8(
+        &mut self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        b_sz: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        use candle::hip_backend::q8_kv_cache::{gqa_attention_decode_q8, QKvCache};
+
+        let hip_dev = match q.device() {
+            Device::Hip(d) => d.clone(),
+            _ => candle::bail!("forward_attn_q8: q must be on HIP"),
+        };
+        // Max context — matches the F32 path's new_k_transposed(2, 4096).
+        const Q8_T_MAX: usize = 4096;
+
+        // Reset-on-prompt semantic identical to F32 path.
+        if index_pos == 0 {
+            if let Some(c) = self.q8_cache.as_mut() {
+                c.reset();
+            }
+        }
+        let cache = match self.q8_cache.as_mut() {
+            Some(c) => c,
+            None => {
+                let c = QKvCache::new(&hip_dev, b_sz, self.n_kv_head, Q8_T_MAX, self.head_dim)?;
+                self.q8_cache = Some(c);
+                self.q8_cache.as_mut().unwrap()
+            }
+        };
+
+        // Append the freshly-produced RoPE'd K/V. Both are (B, H_kv, seq_len, D)
+        // and were made contiguous in forward_attn before RoPE.
+        let k_contig = k.contiguous()?;
+        let v_contig = v.contiguous()?;
+        cache.append(&k_contig, &v_contig)?;
+        let t_cur = cache.current_seq_len();
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+
+        let y = if seq_len == 1 {
+            // Decode fast path: Q8 gemv chain.
+            let mask_additive: Option<Tensor> = match mask {
+                None => None,
+                Some(m) => {
+                    // Convert u8 causal mask → additive F32.
+                    let mdims = m.dims();
+                    let (a, b) = (mdims[0], mdims[1]);
+                    let zero = Tensor::zeros(mdims, DType::F32, q.device())?;
+                    let neg = self.neg_inf.broadcast_as(mdims)?;
+                    let add = m.where_cond(&neg, &zero)?;
+                    Some(add.reshape((1, 1, a, b))?.contiguous()?)
+                }
+            };
+            gqa_attention_decode_q8(q, cache, t_cur, mask_additive.as_ref(), scale)?
+        } else {
+            // Prefill path: dequantize cache to F32, use existing
+            // flash-attn-v2 path (k-transposed layout).
+            let k_nat = cache.dequantize_k()?; // (B, H_kv, T, D)
+            let v_nat = cache.dequantize_v()?; // (B, H_kv, T, D)
+            let k_t = k_nat.transpose(2, 3)?.contiguous()?; // (B, H_kv, D, T)
+
+            let mask_additive: Option<Tensor> = match mask {
+                None => None,
+                Some(m) => {
+                    let mdims = m.dims();
+                    let (a, b) = (mdims[0], mdims[1]);
+                    let zero = Tensor::zeros(mdims, DType::F32, q.device())?;
+                    let neg = self.neg_inf.broadcast_as(mdims)?;
+                    let add = m.where_cond(&neg, &zero)?;
+                    Some(add.reshape((1, 1, a, b))?.contiguous()?)
+                }
+            };
+            crate::models::quantized_blocks::attention::gqa_attention_k_transposed(
+                q,
+                &k_t,
+                &v_nat,
+                mask_additive.as_ref(),
+                scale,
+            )?
+        };
+
+        // Reshape (B, H_q, seq_len, D) → (B, seq_len, H_q * D) and project.
+        let y = y.transpose(1, 2)?
+            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        let y = self.attention_wo.forward(&y)?;
+        Ok(y)
+    }
 }
 
 #[derive(Debug)]
@@ -675,6 +792,9 @@ impl ModelWeights {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 kv_cache: None,
+                #[cfg(feature = "hip")]
+                q8_cache: None,
+                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1"),
                 device: Device::Cpu,
                 span_attn,
                 span_rot,
@@ -811,6 +931,9 @@ impl ModelWeights {
                 sin: sin.clone(),
                 neg_inf: neg_inf.clone(),
                 kv_cache: None,
+                #[cfg(feature = "hip")]
+                q8_cache: None,
+                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1"),
                 device: device.clone(),
                 span_attn,
                 span_rot,
@@ -987,6 +1110,9 @@ impl ModelWeights {
                 sin: layer_sin,
                 neg_inf: layer_neg_inf,
                 kv_cache: None,
+                #[cfg(feature = "hip")]
+                q8_cache: None,
+                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1"),
                 device: layer_device.clone(),
                 span_attn,
                 span_rot,
