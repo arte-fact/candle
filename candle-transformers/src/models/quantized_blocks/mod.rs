@@ -29,6 +29,7 @@ pub mod attention;
 pub mod ffn;
 pub mod delta_net;
 pub mod eplb;
+pub mod any_kv_cache;
 
 pub use gguf_config::*;
 pub use gguf_loader::Gguf;

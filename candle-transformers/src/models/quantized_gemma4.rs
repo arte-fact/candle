@@ -180,7 +180,10 @@ pub struct ModelWeights {
     /// cache contents into it — O(N²) memory traffic on long contexts
     /// and the dominant decode cost on gemma4 (which slowed 31% on
     /// candle vs 3% on turbo at long-cache decode before this fix).
-    kv_caches: Vec<Option<candle_nn::kv_cache::KvCache>>,
+    kv_caches: Vec<Option<crate::models::quantized_blocks::any_kv_cache::AnyKvCache>>,
+    /// `CANDLE_KV_Q8=1`: use block_q8_0 packed KV instead of F32. Matches
+    /// llama.cpp-turbo's per-context VRAM exactly (1.88× smaller than F16).
+    use_q8_kv: bool,
     /// G2/G3 decode replay state (opt-in via `CANDLE_G2_REPLAY=1`).
     #[cfg(feature = "hip")]
     decode_state: candle::hip_backend::decode_cache::DecodeState,
@@ -677,11 +680,12 @@ impl ModelWeights {
         // Pre-allocated KV cache slot per layer. Slot is `None` for
         // shared-KV layers (which borrow from another layer's slot).
         // Initialized lazily on first append in the forward.
-        let kv_caches: Vec<Option<candle_nn::kv_cache::KvCache>> =
+        let kv_caches: Vec<Option<crate::models::quantized_blocks::any_kv_cache::AnyKvCache>> =
             (0..block_count).map(|_| None).collect();
 
         #[cfg(feature = "hip")]
         let n_devices = devices.len();
+        let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1");
         Ok(Self {
             tok_embeddings: Embedding::new_unused(),
             embedding_length,
@@ -691,6 +695,7 @@ impl ModelWeights {
             final_logit_softcap,
             per_layer_embeddings,
             kv_caches,
+            use_q8_kv,
             #[cfg(feature = "hip")]
             decode_state: candle::hip_backend::decode_cache::DecodeState::Init,
             #[cfg(feature = "hip")]
@@ -1211,20 +1216,45 @@ impl ModelWeights {
                             c.reset();
                         }
                     }
-                    let cache = self.kv_caches[il]
-                        .get_or_insert_with(|| {
-                            // Phase P: K canonical (B, H_kv, T, D) with D
-                            // contiguous — enables mat-vec decode attention
-                            // (+3.9% on default path). Gated by
-                            // `k_is_canonical` hoisted at forward() entry:
-                            // on when G2 replay is NOT requested (explicit
-                            // `CANDLE_KV_TMAJOR=0|1` always wins).
-                            if k_is_canonical {
-                                candle_nn::kv_cache::KvCache::new_k_canonical_stable(2, 4096)
-                            } else {
-                                candle_nn::kv_cache::KvCache::new_k_transposed(2, 4096)
-                            }
-                        });
+                    // Lazy allocation of this layer's cache. Use AnyKvCache
+                    // so the gate swaps the underlying storage between F32
+                    // KvCache and block_q8_0 QKvCache.
+                    if self.kv_caches[il].is_none() {
+                        use crate::models::quantized_blocks::any_kv_cache::AnyKvCache;
+                        #[cfg(feature = "hip")]
+                        let new_cache = if self.use_q8_kv {
+                            let (b0, h_kv0, _, d0) = k_new.dims4()?;
+                            let hip_dev = match k_new.device() {
+                                candle::Device::Hip(d) => d.clone(),
+                                _ => candle::bail!("CANDLE_KV_Q8: k_new must be on HIP"),
+                            };
+                            AnyKvCache::Q8(
+                                candle::hip_backend::q8_kv_cache::QKvCache::new(
+                                    &hip_dev, b0, h_kv0, 4096, d0,
+                                )?,
+                            )
+                        } else if k_is_canonical {
+                            AnyKvCache::F32(
+                                candle_nn::kv_cache::KvCache::new_k_canonical_stable(2, 4096),
+                            )
+                        } else {
+                            AnyKvCache::F32(
+                                candle_nn::kv_cache::KvCache::new_k_transposed(2, 4096),
+                            )
+                        };
+                        #[cfg(not(feature = "hip"))]
+                        let new_cache = if k_is_canonical {
+                            AnyKvCache::F32(
+                                candle_nn::kv_cache::KvCache::new_k_canonical_stable(2, 4096),
+                            )
+                        } else {
+                            AnyKvCache::F32(
+                                candle_nn::kv_cache::KvCache::new_k_transposed(2, 4096),
+                            )
+                        };
+                        self.kv_caches[il] = Some(new_cache);
+                    }
+                    let cache = self.kv_caches[il].as_mut().unwrap();
                     // KvCache::append needs contiguous sources.
                     let k_new = if k_new.is_contiguous() { k_new } else { k_new.contiguous()? };
                     let v_new = if v_new.is_contiguous() { v_new } else { v_new.contiguous()? };
@@ -1266,37 +1296,52 @@ impl ModelWeights {
             let (_b_sz_q, _, seq_len_q, _) = q_precomputed_shape_or_none(&shared_qkv, &x_norm)?;
             let (k_use, v_use, pad_info) = {
                 let src = if has_kv { il } else { kv_source_idx };
-                let cache = self.kv_caches[src]
+                let any_cache = self.kv_caches[src]
                     .as_ref()
                     .expect("KV cache must exist for has_kv source layer");
-                let k_cache = cache.k_cache();
-                let v_cache = cache.v_cache();
-                let t_cur = k_cache.current_seq_len();
-                let max_t = k_cache.max_seq_len();
-                let l_k_padded = if pad_t > 1 {
+                let t_cur = any_cache.current_seq_len();
+                let max_t = any_cache.max_seq_len();
+                // Q8 path skips the padded-slab narrow (no F32 all_data
+                // to share — dequantising the whole buffer each step
+                // would defeat the VRAM win). Padding is a G2-replay
+                // feature; G2 is no-gain on gfx906 anyway.
+                let use_padding = !any_cache.is_q8() && pad_t > 1;
+                let l_k_padded = if use_padding {
                     (((t_cur + pad_t - 1) / pad_t) * pad_t).min(max_t)
                 } else {
                     t_cur
                 };
-                let (k, v, padded) = if l_k_padded > t_cur && seq_len_q == 1 {
-                    let k_full = k_cache.all_data().as_ref()
-                        .ok_or_else(|| candle::Error::Msg("gemma4 k cache empty".into()))?;
-                    let v_full = v_cache.all_data().as_ref()
-                        .ok_or_else(|| candle::Error::Msg("gemma4 v cache empty".into()))?;
-                    // Phase P canonical layout uses dim 2 (T axis);
-                    // legacy D-major uses dim 3. Flag hoisted at
-                    // forward() entry as `k_is_canonical`.
-                    let k = if k_is_canonical {
-                        k_full.narrow(2, 0, l_k_padded)?
+
+                let (k, v, padded) = if let Some(f32_cache) = any_cache.as_f32() {
+                    let k_cache = f32_cache.k_cache();
+                    let v_cache = f32_cache.v_cache();
+                    if l_k_padded > t_cur && seq_len_q == 1 {
+                        let k_full = k_cache.all_data().as_ref()
+                            .ok_or_else(|| candle::Error::Msg("gemma4 k cache empty".into()))?;
+                        let v_full = v_cache.all_data().as_ref()
+                            .ok_or_else(|| candle::Error::Msg("gemma4 v cache empty".into()))?;
+                        let k = if k_is_canonical {
+                            k_full.narrow(2, 0, l_k_padded)?
+                        } else {
+                            k_full.narrow(3, 0, l_k_padded)?
+                        };
+                        let v = v_full.narrow(2, 0, l_k_padded)?;
+                        (k, v, Some((t_cur, l_k_padded)))
                     } else {
-                        k_full.narrow(3, 0, l_k_padded)?
-                    };
-                    // V stored (B, H_kv, maxT, D) → narrow dim 2 to l_k_padded.
-                    let v = v_full.narrow(2, 0, l_k_padded)?;
-                    (k, v, Some((t_cur, l_k_padded)))
+                        let k = f32_cache.k()?.ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
+                        let v = f32_cache.v()?.ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
+                        (k, v, None)
+                    }
                 } else {
-                    let k = cache.k()?.ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
-                    let v = cache.v()?.ok_or_else(|| candle::Error::Msg("kv cache empty".into()))?;
+                    // Q8 arm: dequantise the Q8 slab into fresh F32
+                    // tensors in canonical (B, H_kv, t_cur, D) layout.
+                    // This temporarily allocates t_cur * H_kv * D * 4 B
+                    // per layer; it's a transient cost on top of the
+                    // Q8-at-rest VRAM win.
+                    let k = any_cache.canonical_k_f32()?
+                        .ok_or_else(|| candle::Error::Msg("gemma4 q8 k cache empty".into()))?;
+                    let v = any_cache.canonical_v_f32()?
+                        .ok_or_else(|| candle::Error::Msg("gemma4 q8 v cache empty".into()))?;
                     (k, v, None)
                 };
                 let k = if device_eq(k.device(), &layer_device) { k } else { k.to_device(&layer_device)? };
