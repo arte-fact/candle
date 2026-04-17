@@ -65,6 +65,47 @@ impl HipDevice {
         &self,
         len: usize,
     ) -> Result<hipdarc::driver::HipSlice<T>> {
+        // Diagnostic: when CANDLE_TRACE_ALLOCS=1, dump large uninitialized
+        // allocations with truncated backtrace. Useful to find VRAM hogs
+        // like weight-slab / activation-buffer outliers.
+        if std::env::var_os("CANDLE_TRACE_ALLOCS").is_some() {
+            static COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let minb = std::env::var("CANDLE_TRACE_ALLOCS_MINB")
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(16 * 1024 * 1024usize);   // default: ≥16 MB
+            let bytes = len * std::mem::size_of::<T>();
+            if bytes >= minb {
+                let bt = std::backtrace::Backtrace::force_capture();
+                let bt_str = format!("{bt}");
+                let mut frames = Vec::<String>::new();
+                for line in bt_str.lines() {
+                    if frames.len() >= 6 { break; }
+                    let l = line.trim();
+                    if l.contains("candle_transformers::")
+                        || l.contains("candle_core::hip_backend")
+                        || l.contains("candle_core::kv_cache")
+                        || l.contains("candle_nn::kv_cache")
+                        || l.contains("quantized_blocks")
+                        || l.contains("quantized_gemma4")
+                        || l.contains("quantized_qwen")
+                        || l.contains("quantized_llama")
+                        || (l.starts_with("at ") && (l.contains(".rs:") || l.contains("/candle-")))
+                    {
+                        frames.push(l.to_string());
+                    }
+                }
+                eprintln!(
+                    "[alloc_uninit #{n}] gpu={} bytes={} ({:.1} MB) len={}\n  {}",
+                    self.ordinal,
+                    bytes,
+                    bytes as f64 / (1024.0 * 1024.0),
+                    len,
+                    frames.join("\n  ")
+                );
+            }
+        }
         self.stream.alloc::<T>(len).w()
     }
 
