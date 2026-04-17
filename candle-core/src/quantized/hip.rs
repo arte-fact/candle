@@ -2021,6 +2021,73 @@ impl QHipStorage {
         self.data.len
     }
 
+    /// Create a new `QHipStorage` holding a byte-aligned slice of this
+    /// one. `start_bytes` and `count_bytes` must be multiples of the
+    /// dtype's block type_size so that the resulting storage is
+    /// block-aligned. Allocates a fresh padded buffer (same tail-pad
+    /// logic as `load_quantized`) and copies the requested range
+    /// device-to-device.
+    ///
+    /// Used by `QTensor::narrow_experts` for expert-parallel loading.
+    pub fn slice_bytes(&self, start_bytes: usize, count_bytes: usize) -> Result<QHipStorage> {
+        if start_bytes + count_bytes > self.data.len {
+            crate::bail!(
+                "QHipStorage::slice_bytes: [{start_bytes}, +{count_bytes}) > storage len {}",
+                self.data.len
+            );
+        }
+        let type_size = self.dtype.type_size();
+        let block_size = self.dtype.block_size();
+        // Block-alignment sanity: bytes per block = type_size for a
+        // single-block row. Slicing the first axis of a `[E, H, I]`
+        // tensor gives a byte range that is an integer number of
+        // (H*I/block_size) blocks per expert, so always aligned when
+        // H*I is a multiple of block_size (caller's responsibility).
+        if start_bytes % type_size != 0 || count_bytes % type_size != 0 {
+            crate::bail!(
+                "QHipStorage::slice_bytes: unaligned ({start_bytes}, {count_bytes}) for type_size={type_size}, block_size={block_size}"
+            );
+        }
+
+        let tail_len = MATRIX_ROW_PADDING * type_size / block_size;
+        let padded_len = count_bytes + tail_len;
+        // SAFETY: we immediately write [0, count_bytes) via hipMemcpy
+        // and zero [count_bytes, padded_len) via hipMemsetAsync.
+        let mut inner = unsafe { self.device.alloc::<u8>(padded_len)? };
+        // DtoD copy: src[start_bytes..start_bytes+count_bytes] → inner[0..count_bytes].
+        unsafe {
+            let src_ptr = (self.data.inner.device_ptr() as *const u8).add(start_bytes);
+            let dst_ptr = inner.device_ptr() as *mut u8;
+            let rc = hipdarc::sys::hipMemcpyAsync(
+                dst_ptr as *mut std::ffi::c_void,
+                src_ptr as *const std::ffi::c_void,
+                count_bytes,
+                hipdarc::sys::hipMemcpyKind::hipMemcpyDeviceToDevice,
+                self.device.stream().raw(),
+            );
+            if rc != hipdarc::sys::hipError_t::hipSuccess {
+                crate::bail!("slice_bytes dtod memcpy failed: {rc:?}");
+            }
+            if tail_len > 0 {
+                let tail_ptr = dst_ptr.add(count_bytes);
+                let rc = hipdarc::sys::hipMemsetAsync(
+                    tail_ptr as *mut std::ffi::c_void,
+                    0,
+                    tail_len,
+                    self.device.stream().raw(),
+                );
+                if rc != hipdarc::sys::hipError_t::hipSuccess {
+                    crate::bail!("slice_bytes tail memset failed: {rc:?}");
+                }
+            }
+        }
+        Ok(QHipStorage {
+            data: PaddedHipSlice { inner, len: count_bytes },
+            dtype: self.dtype,
+            device: self.device.clone(),
+        })
+    }
+
     pub fn fwd(
         &self,
         self_shape: &crate::Shape,

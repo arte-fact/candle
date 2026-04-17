@@ -195,6 +195,29 @@ impl QStorage {
         }
     }
 
+    /// Return a new QStorage holding the byte range
+    /// `[start_bytes, start_bytes + count_bytes)` from this storage.
+    /// `start_bytes` and `count_bytes` must be block-aligned for the
+    /// underlying dtype (caller's responsibility — true for first-axis
+    /// slices of `[E, H, I]` tensors when `H * I` is a multiple of the
+    /// block size, which holds for every MoE expert tensor we've seen).
+    ///
+    /// Only the HIP backend supports this today (X3.4). CPU / Metal /
+    /// CUDA return an error — can be filled in later if needed for the
+    /// non-HIP EP paths.
+    pub fn slice_bytes(&self, start_bytes: usize, count_bytes: usize) -> Result<Self> {
+        match self {
+            QStorage::Hip(storage) => {
+                let sliced = storage.slice_bytes(start_bytes, count_bytes)?;
+                Ok(QStorage::Hip(sliced))
+            }
+            _ => crate::bail!(
+                "QStorage::slice_bytes: only HIP backend is implemented (got {:?})",
+                self.device()
+            ),
+        }
+    }
+
     fn quantize(&mut self, src: &Storage) -> Result<()> {
         match (self, src) {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
@@ -554,6 +577,61 @@ impl QTensor {
         let shape = shape.into();
         check_shape(&shape, storage.block_size())?;
         Ok(Self { storage, shape })
+    }
+
+    /// Slice the first axis of a `[num_experts, ...]` QTensor, returning
+    /// a new QTensor holding only experts `[start, start + count)`.
+    /// Used for expert-parallel load: each rank narrows the full expert
+    /// weight tensor to its local partition BEFORE the full tensor is
+    /// needed on-device, so VRAM per rank drops proportionally.
+    ///
+    /// Requirements:
+    /// - `self.shape().rank() >= 2` (first axis = experts).
+    /// - The element count of the non-expert axes (`H * I * ...`) must
+    ///   be a multiple of the dtype's block size. True for every MoE
+    ///   expert tensor (H * inter is always a multiple of 32 for Q8_0
+    ///   and similar quants).
+    ///
+    /// Implementation: byte-slices the underlying storage using
+    /// `QStorage::slice_bytes`. The new storage is block-aligned; the
+    /// new shape is `[count, ...rest]`.
+    pub fn narrow_experts(&self, start: usize, count: usize) -> Result<Self> {
+        let dims = self.shape.dims();
+        if dims.len() < 2 {
+            crate::bail!(
+                "QTensor::narrow_experts: shape {:?} must have rank >= 2",
+                dims
+            );
+        }
+        let num_experts = dims[0];
+        if start + count > num_experts {
+            crate::bail!(
+                "QTensor::narrow_experts: [{start}, +{count}) > num_experts {}",
+                num_experts
+            );
+        }
+        let per_expert_elems: usize = dims[1..].iter().product();
+        let block_size = self.storage.block_size();
+        if per_expert_elems % block_size != 0 {
+            crate::bail!(
+                "QTensor::narrow_experts: per-expert elem count {} not divisible by block size {}",
+                per_expert_elems,
+                block_size
+            );
+        }
+        let type_size = self.storage.dtype().type_size();
+        let bytes_per_expert = (per_expert_elems / block_size) * type_size;
+        let start_bytes = start * bytes_per_expert;
+        let count_bytes = count * bytes_per_expert;
+
+        let sliced_storage = self.storage.slice_bytes(start_bytes, count_bytes)?;
+        let mut new_dims = Vec::with_capacity(dims.len());
+        new_dims.push(count);
+        new_dims.extend_from_slice(&dims[1..]);
+        Ok(Self {
+            storage: sliced_storage,
+            shape: Shape::from(new_dims),
+        })
     }
 
     pub fn quantize(src: &Tensor, dtype: GgmlDType) -> Result<Self> {
