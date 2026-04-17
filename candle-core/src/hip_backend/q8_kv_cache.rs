@@ -23,6 +23,8 @@ use crate::hip_backend::{kernels, HipDevice, HipError, HipStorage, WrapErr};
 use crate::{DType, Result, Shape, Storage, Tensor};
 use hipdarc::driver::{HipSlice, LaunchConfig};
 
+const BLOCK_SIZE_V: u32 = 128;
+
 const QK8_0: usize = 32;
 const BLOCK_Q8_0_BYTES: usize = 34; // sizeof(half) + 32 int8
 
@@ -277,4 +279,113 @@ impl QKvCache {
             /* is_variable */ false,
         ))
     }
+}
+
+/// V·attn gemv with a Q8_0 V cache — Q8 variant of
+/// `gqa_decode_gemv_v_d{N}_f32_b128` in flash_attn_v2.cu.
+///
+/// `attn`: (B, H_q, 1, L_k) F32 post-softmax.
+/// `v_cache`: (B, H_kv, T_max, D/32) Q8_0 blocks (from `QKvCache::v_slab()`).
+/// Returns: (B, H_q, 1, D) F32.
+pub fn gqa_decode_gemv_v_q8(
+    attn: &Tensor,
+    cache: &QKvCache,
+    l_k: usize,
+) -> Result<Tensor> {
+    let dims = attn.dims();
+    if dims.len() != 4 || dims[2] != 1 {
+        crate::bail!("gqa_decode_gemv_v_q8: attn must be (B, H_q, 1, L_k), got {dims:?}");
+    }
+    let (b, h_q, _, l_k_attn) = (dims[0], dims[1], dims[2], dims[3]);
+    if l_k_attn < l_k {
+        crate::bail!(
+            "gqa_decode_gemv_v_q8: attn L_k dim {l_k_attn} < requested L_k {l_k}"
+        );
+    }
+    let (cb, h_kv, t_max, d) = cache.dims();
+    if cb != b {
+        crate::bail!(
+            "gqa_decode_gemv_v_q8: batch mismatch (attn B={b} vs cache B={cb})"
+        );
+    }
+    if h_q % h_kv != 0 {
+        crate::bail!("gqa_decode_gemv_v_q8: H_q ({h_q}) must be a multiple of H_kv ({h_kv})");
+    }
+    if l_k > cache.current_seq_len() {
+        crate::bail!(
+            "gqa_decode_gemv_v_q8: L_k={l_k} > cache.current_seq_len={}",
+            cache.current_seq_len()
+        );
+    }
+    let n_rep = h_q / h_kv;
+
+    if !matches!(d, 128 | 256 | 512) {
+        crate::bail!("gqa_decode_gemv_v_q8: unsupported D={d} (need 128, 256, or 512)");
+    }
+    if attn.dtype() != DType::F32 {
+        crate::bail!("gqa_decode_gemv_v_q8: attn dtype must be F32");
+    }
+
+    let attn_contig = attn.contiguous()?;
+    let (attn_st, attn_l) = attn_contig.storage_and_layout();
+    let attn_hip = match &*attn_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gqa_decode_gemv_v_q8: attn must be on HIP"),
+    };
+    let attn_slice = attn_hip
+        .as_hip_slice::<f32>()
+        .map_err(crate::Error::wrap)?;
+    let (lo, hi) = attn_l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("attn not contiguous".into()))?;
+    let attn_view = attn_slice.slice(lo..hi);
+
+    let out_len = b * h_q * d;
+    // SAFETY: kernel writes every element of `out`.
+    let out = unsafe { cache.dev.alloc::<f32>(out_len)? };
+
+    let kn = match d {
+        128 => "gqa_decode_gemv_v_q8_d128_f32",
+        256 => "gqa_decode_gemv_v_q8_d256_f32",
+        512 => "gqa_decode_gemv_v_q8_d512_f32",
+        _ => unreachable!(),
+    };
+    let func = cache
+        .dev
+        .get_or_load_func(kn, &kernels::ATTN_Q8_KV)?;
+
+    // Dynamic LDS sized for the L_k attention row.
+    let shared_bytes = (l_k * 4) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((d as u32) / BLOCK_SIZE_V, h_q as u32, b as u32),
+        block_dim: (BLOCK_SIZE_V, 1, 1),
+        shared_mem_bytes: shared_bytes,
+    };
+    let l_k_i = l_k as i32;
+    let t_max_i = t_max as i32;
+    let h_q_i = h_q as i32;
+    let h_kv_i = h_kv as i32;
+    let n_rep_i = n_rep as i32;
+
+    let mut builder = func.builder();
+    builder.arg(&attn_view);
+    builder.arg(cache.v_slab());
+    builder.arg(&out);
+    builder.arg(&l_k_i);
+    builder.arg(&t_max_i);
+    builder.arg(&h_q_i);
+    builder.arg(&h_kv_i);
+    builder.arg(&n_rep_i);
+    // SAFETY: shapes validated; kernel fully writes `out`.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(attn_st);
+
+    let storage = HipStorage::wrap_hip_slice(out, cache.dev.clone());
+    Ok(Tensor::from_storage(
+        Storage::Hip(storage),
+        Shape::from((b, h_q, 1, d)),
+        crate::op::BackpropOp::none(),
+        /* is_variable */ false,
+    ))
 }

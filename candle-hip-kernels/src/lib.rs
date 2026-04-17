@@ -12,6 +12,7 @@ mod hsaco {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Id {
     Affine,
+    AttnQ8Kv,
     Binary,
     Cast,
     Conv,
@@ -31,8 +32,9 @@ pub enum Id {
     Unary,
 }
 
-pub const ALL_IDS: [Id; 18] = [
+pub const ALL_IDS: [Id; 19] = [
     Id::Affine,
+    Id::AttnQ8Kv,
     Id::Binary,
     Id::Cast,
     Id::Conv,
@@ -80,23 +82,24 @@ macro_rules! mdl {
 }
 
 mdl!(0, AFFINE);
-mdl!(1, BINARY);
-mdl!(2, CAST);
-mdl!(3, CONV);
-mdl!(4, FILL);
-mdl!(5, FLASH_ATTN);
-mdl!(6, FLASH_ATTN_V2);
-mdl!(7, FUSED_FFN_DECODE);
-mdl!(8, GATED_DELTA_NET);
-mdl!(9, INDEXING);
-mdl!(10, MMQ_TURBO);
-mdl!(11, QUANTIZED);
-mdl!(12, QUANTIZE_KV_Q8);
-mdl!(13, REDUCE);
-mdl!(14, SORT);
-mdl!(15, TERNARY);
-mdl!(16, TOPK_MOE);
-mdl!(17, UNARY);
+mdl!(1, ATTN_Q8_KV);
+mdl!(2, BINARY);
+mdl!(3, CAST);
+mdl!(4, CONV);
+mdl!(5, FILL);
+mdl!(6, FLASH_ATTN);
+mdl!(7, FLASH_ATTN_V2);
+mdl!(8, FUSED_FFN_DECODE);
+mdl!(9, GATED_DELTA_NET);
+mdl!(10, INDEXING);
+mdl!(11, MMQ_TURBO);
+mdl!(12, QUANTIZED);
+mdl!(13, QUANTIZE_KV_Q8);
+mdl!(14, REDUCE);
+mdl!(15, SORT);
+mdl!(16, TERNARY);
+mdl!(17, TOPK_MOE);
+mdl!(18, UNARY);
 
 /// Produce a kernel function name with dtype suffix, e.g. `"add_f32"`.
 pub fn kernel_name<T: crate::DTypeName>(root: &str) -> String {
