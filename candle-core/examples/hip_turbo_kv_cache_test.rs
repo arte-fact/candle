@@ -21,8 +21,8 @@ fn main() -> Result<()> {
     };
 
     // TQ2/TQ3 use 32-elem blocks; TQ4 uses 128-elem blocks.
-    // Use D=128 so all three variants fit.
-    const D: usize = 128;
+    // D=256 exercises the WHT-256 preconditioning path (qwen-next arch).
+    const D: usize = 256;
     const T_NEW: usize = 4;
 
     // Gaussian-ish synthetic data, normalised per 32-elem group so each

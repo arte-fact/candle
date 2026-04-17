@@ -45,13 +45,17 @@ fn apply_wht_128(
         crate::bail!("apply_wht_128: expected 4D, got {dims:?}");
     }
     let d = dims[3];
-    if d % 128 != 0 {
-        // WHT block size is 128; head_dims that aren't a multiple of
-        // 128 bypass preconditioning (e.g. head_dim=64 TinyLlama).
+    // Head_dim support:
+    //   128 → single WHT-128 per vector
+    //   256 → WHT-256 variant (one 256-elem group per vector) — better
+    //         mixing than two independent WHT-128s
+    //   other (64, 512, …) → bypass preconditioning
+    if !matches!(d, 128 | 256) {
         return Ok(t.clone());
     }
     let n_elem: usize = dims.iter().product();
-    let n_groups = n_elem / 128;
+    let (group_size, block_dim_x) = if d == 256 { (256, 128u32) } else { (128, 64u32) };
+    let n_groups = n_elem / group_size;
 
     let t_contig = t.contiguous()?;
     let (st, l) = t_contig.storage_and_layout();
@@ -66,17 +70,26 @@ fn apply_wht_128(
     let src_view = src_slice.slice(lo..hi);
 
     let out = unsafe { dev.alloc::<f32>(n_elem)? };
-    let kn = match (kind_is_v, inverse) {
-        (false, false) => "turbo_wht_k_forward",
-        (false, true)  => "turbo_wht_k_inverse",
-        (true,  false) => "turbo_wht_v_forward",
-        (true,  true)  => "turbo_wht_v_inverse",
+    let kn = if d == 256 {
+        match (kind_is_v, inverse) {
+            (false, false) => "turbo_wht_k_forward_256",
+            (false, true)  => "turbo_wht_k_inverse_256",
+            (true,  false) => "turbo_wht_v_forward_256",
+            (true,  true)  => "turbo_wht_v_inverse_256",
+        }
+    } else {
+        match (kind_is_v, inverse) {
+            (false, false) => "turbo_wht_k_forward",
+            (false, true)  => "turbo_wht_k_inverse",
+            (true,  false) => "turbo_wht_v_forward",
+            (true,  true)  => "turbo_wht_v_inverse",
+        }
     };
     let func = dev.get_or_load_func(kn, &kernels::TURBO_WHT)?;
 
     let cfg = LaunchConfig {
         grid_dim: (n_groups as u32, 1, 1),
-        block_dim: (64, 1, 1),
+        block_dim: (block_dim_x, 1, 1),
         shared_mem_bytes: 0,
     };
     let n_groups_i = n_groups as i64;
@@ -302,7 +315,7 @@ impl QTurboKvCache {
 
     pub fn dequantize_k(&self) -> Result<Tensor> {
         let raw = self.dequantize_inner(&self.k, 0, self.current_seq_len)?;
-        if wht_enabled() && self.d % 128 == 0 && self.current_seq_len > 0 {
+        if wht_enabled() && matches!(self.d, 128 | 256) && self.current_seq_len > 0 {
             apply_wht_128(&raw, &self.dev, /*kind_is_v=*/ false, /*inverse=*/ true)
         } else {
             Ok(raw)
@@ -311,7 +324,7 @@ impl QTurboKvCache {
 
     pub fn dequantize_v(&self) -> Result<Tensor> {
         let raw = self.dequantize_inner(&self.v, 0, self.current_seq_len)?;
-        if wht_enabled() && self.d % 128 == 0 && self.current_seq_len > 0 {
+        if wht_enabled() && matches!(self.d, 128 | 256) && self.current_seq_len > 0 {
             apply_wht_128(&raw, &self.dev, /*kind_is_v=*/ true, /*inverse=*/ true)
         } else {
             Ok(raw)

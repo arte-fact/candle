@@ -127,3 +127,79 @@ extern "C" __global__ void __launch_bounds__(64, 1) turbo_wht_v_inverse(
 ) {
     turbo_wht_impl<WHT_S2_V, WHT_S1_V>(src, dst, n_groups);
 }
+
+// ============================================================================
+// WHT-256 variant for head_dim=256 archs (qwen3-coder-next, gemma4-E4B).
+// ============================================================================
+//
+// Sign tables are the 128-element ones repeated with a sign flip on the
+// second half — a cheap way to get an orthogonal 256-elem preconditioning
+// without hand-tuning new sign arrays. The 8-stage butterfly (1 more than
+// WHT-128) handles the 2× size. One block per 256-elem group, 128 threads.
+
+template <const float * S1_128, const float * S2_128>
+static __device__ __forceinline__ void turbo_wht_256_impl(
+    const float * __restrict__ src,
+    float       * __restrict__ dst,
+    const int64_t n_groups
+) {
+    __shared__ float x[256];
+    const int64_t group_idx = blockIdx.x;
+    if (group_idx >= n_groups) return;
+
+    const int tid = threadIdx.x;                 // 0..127
+    const float * in  = src + group_idx * 256;
+    float       * out = dst + group_idx * 256;
+
+    // Build effective 256-elem sign arrays from 128-elem bases: first
+    // half uses the base; second half uses the base with a lane-wise
+    // XOR sign (flips signs on even-indexed lanes). The resulting 256-
+    // element pattern is guaranteed distinct from either base.
+    const float s1_lo = S1_128[tid];
+    const float s1_hi = (tid & 1) ? S1_128[tid] : -S1_128[tid];
+    const float s2_lo = S2_128[tid];
+    const float s2_hi = (tid & 1) ? -S2_128[tid] : S2_128[tid];
+
+    x[tid]       = in[tid]       * s1_lo;
+    x[tid + 128] = in[tid + 128] * s1_hi;
+    __syncthreads();
+
+    // 8 butterfly stages (h = 1,2,4,...,128).
+    for (int h = 1; h < 256; h *= 2) {
+        const int pair_idx = tid;                // 0..127 butterflies/stage
+        const int block_size = h * 2;
+        const int block_idx = pair_idx / h;
+        const int within = pair_idx % h;
+        const int j = block_idx * block_size + within;
+        if (j + h < 256) {
+            float a = x[j], b = x[j + h];
+            x[j] = a + b; x[j + h] = a - b;
+        }
+        __syncthreads();
+    }
+
+    // Normalise by 1 / sqrt(256) = 0.0625
+    const float inv = 0.0625f;
+    out[tid]       = x[tid]       * inv * s2_lo;
+    out[tid + 128] = x[tid + 128] * inv * s2_hi;
+}
+
+extern "C" __global__ void __launch_bounds__(128, 1) turbo_wht_k_forward_256(
+    const float * __restrict__ src, float * __restrict__ dst,
+    const int64_t n_groups
+) { turbo_wht_256_impl<WHT_S1_K, WHT_S2_K>(src, dst, n_groups); }
+
+extern "C" __global__ void __launch_bounds__(128, 1) turbo_wht_k_inverse_256(
+    const float * __restrict__ src, float * __restrict__ dst,
+    const int64_t n_groups
+) { turbo_wht_256_impl<WHT_S2_K, WHT_S1_K>(src, dst, n_groups); }
+
+extern "C" __global__ void __launch_bounds__(128, 1) turbo_wht_v_forward_256(
+    const float * __restrict__ src, float * __restrict__ dst,
+    const int64_t n_groups
+) { turbo_wht_256_impl<WHT_S1_V, WHT_S2_V>(src, dst, n_groups); }
+
+extern "C" __global__ void __launch_bounds__(128, 1) turbo_wht_v_inverse_256(
+    const float * __restrict__ src, float * __restrict__ dst,
+    const int64_t n_groups
+) { turbo_wht_256_impl<WHT_S2_V, WHT_S1_V>(src, dst, n_groups); }
