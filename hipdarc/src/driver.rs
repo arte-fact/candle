@@ -64,6 +64,41 @@ pub struct HipDevice {
     ordinal: i32,
 }
 
+/// Page-locked host memory allocated via `hipHostMalloc`. Freed via
+/// `hipHostFree` on `Drop`. Accessible from any device on the system
+/// and suitable for overlapped HtoD / DtoH transfers.
+pub struct PinnedHostSlab {
+    ptr: *mut u8,
+    bytes: usize,
+}
+
+// SAFETY: pinned host memory is thread-safe for memcpy operations;
+// the host pointer itself is Send+Sync.
+unsafe impl Send for PinnedHostSlab {}
+unsafe impl Sync for PinnedHostSlab {}
+
+impl PinnedHostSlab {
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for PinnedHostSlab {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = sys::hipHostFree(self.ptr as *mut c_void);
+            }
+        }
+    }
+}
+
 impl HipDevice {
     /// Create a handle to the GPU with the given ordinal.
     pub fn new(ordinal: usize) -> Result<Self, DriverError> {
@@ -105,6 +140,18 @@ impl HipDevice {
     pub fn synchronize(&self) -> Result<(), DriverError> {
         self.set_current()?;
         unsafe { check_hip(sys::hipDeviceSynchronize()) }
+    }
+
+    /// Allocate a page-locked (pinned) host memory region for fast
+    /// DMA-backed HtoD / DtoH transfers. Pinned memory can be 2-5×
+    /// faster than pageable for PCIe transfers and is required for
+    /// overlapping copies with compute on a stream.
+    pub fn alloc_pinned_host(bytes: usize) -> Result<PinnedHostSlab, DriverError> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        unsafe {
+            check_hip(sys::hipHostMalloc(&mut ptr, bytes, 0))?;
+        }
+        Ok(PinnedHostSlab { ptr: ptr as *mut u8, bytes })
     }
 
     /// Check whether this device can directly access `peer`'s memory.

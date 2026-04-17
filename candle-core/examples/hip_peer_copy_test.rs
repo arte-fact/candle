@@ -62,18 +62,18 @@ fn main() -> Result<()> {
     for src_rank in 0..world {
         for dst_rank in 0..world {
             if src_rank == dst_rank { continue; }
-            // Use blocking peer copy for correctness test — simpler,
-            // no stream ordering to worry about.
-            cluster.peer_copy_blocking(
+            // Direct P2P is disabled at the kernel level on this host
+            // (KFD topology shows no GPU↔GPU io_links). Use the host-
+            // bounce path — works regardless of CONFIG_HSA_AMD_P2P.
+            cluster.peer_copy_via_host(
                 &mut dst_bufs[dst_rank],
                 dst_rank,
                 &src_bufs[src_rank],
                 src_rank,
             )?;
-            // Set current device to dst_rank and fully sync before read.
             hipdarc::driver::HipDevice::new(devs[dst_rank].ordinal())
                 .unwrap()
-                .synchronize()
+                .set_current()
                 .unwrap();
             let got = devs[dst_rank].stream().clone_dtoh(&dst_bufs[dst_rank]).unwrap();
             let tag = got[0];
@@ -113,21 +113,59 @@ fn main() -> Result<()> {
         .map(|d| unsafe { d.alloc::<u8>(BENCH_BYTES).unwrap() })
         .collect();
 
-    // Warm up the streams once.
+    // Warm up the streams + pinned pool once.
     for (j, dst) in dst_bigs.iter_mut().enumerate() {
         let dst_rank = j + 1;
-        cluster.peer_copy_async(dst, dst_rank, &src_big, 0)?;
+        cluster.peer_copy_via_host(dst, dst_rank, &src_big, 0)?;
     }
-    cluster.sync_all()?;
 
+    // 1:1 bench — rank 0 → rank 1, isolate single-peer pipeline bw.
+    {
+        let mut times11 = Vec::new();
+        for _ in 0..BENCH_ITERS {
+            let t0 = std::time::Instant::now();
+            cluster.peer_copy_via_host(&mut dst_bigs[0], 1, &src_big, 0)?;
+            times11.push(t0.elapsed().as_secs_f64());
+        }
+        times11.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med11 = times11[BENCH_ITERS / 2];
+        let gbps11 = (BENCH_BYTES as f64 / med11) / 1e9;
+        println!(
+            "  1:1 rank0→rank1 median {:.2} ms, {:.2} GB/s (pipelined chunks)",
+            med11 * 1e3, gbps11
+        );
+    }
+
+    // Broadcast (one DtoH, fan-out HtoDs in parallel).
+    {
+        let mut times_bc = Vec::new();
+        for _ in 0..BENCH_ITERS {
+            let mut dsts: Vec<(usize, &mut _)> = dst_bigs
+                .iter_mut()
+                .enumerate()
+                .map(|(j, d)| (j + 1, d))
+                .collect();
+            let t0 = std::time::Instant::now();
+            cluster.broadcast_via_host(&src_big, 0, &mut dsts)?;
+            times_bc.push(t0.elapsed().as_secs_f64());
+        }
+        times_bc.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med_bc = times_bc[BENCH_ITERS / 2];
+        let agg_bc = (BENCH_BYTES as f64 / med_bc) * (world - 1) as f64 / 1e9;
+        println!(
+            "  broadcast rank0→(1,2,3) median {:.2} ms, aggregate {:.2} GB/s",
+            med_bc * 1e3, agg_bc
+        );
+    }
+
+    // Serial fan-out baseline (for comparison).
     let mut times = Vec::new();
     for _ in 0..BENCH_ITERS {
         let t0 = std::time::Instant::now();
         for (j, dst) in dst_bigs.iter_mut().enumerate() {
             let dst_rank = j + 1;
-            cluster.peer_copy_async(dst, dst_rank, &src_big, 0)?;
+            cluster.peer_copy_via_host(dst, dst_rank, &src_big, 0)?;
         }
-        cluster.sync_all()?;
         times.push(t0.elapsed().as_secs_f64());
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());

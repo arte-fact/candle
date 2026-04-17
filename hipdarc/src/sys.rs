@@ -183,6 +183,19 @@ extern "C" {
         stream: hipStream_t,
     ) -> hipError_t;
 
+    // Pinned host memory (page-locked, DMA-accessible).
+    // flags: 0 = portable default.
+    pub fn hipHostMalloc(ptr: *mut *mut c_void, size: size_t, flags: c_uint) -> hipError_t;
+    pub fn hipHostFree(ptr: *mut c_void) -> hipError_t;
+
+    // Events
+    pub fn hipEventCreate(event: *mut hipEvent_t) -> hipError_t;
+    pub fn hipEventCreateWithFlags(event: *mut hipEvent_t, flags: c_uint) -> hipError_t;
+    pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
+    pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
+    pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
+    pub fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: c_uint) -> hipError_t;
+
     // Streams
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
