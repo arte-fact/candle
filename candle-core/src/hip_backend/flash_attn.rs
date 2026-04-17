@@ -1915,12 +1915,13 @@ pub fn gqa_attention_decode_mv_decomposed(
     let (aw_st, aw_l) = attn_weights.storage_and_layout();
     let aw_view = hv!(aw_st, aw_l);
 
-    // Dynamic LDS for attn_weights broadcast — sized exactly to L_k_alloc.
-    // Grid splits D across blocks to avoid CU starvation: (D/128, H_q, B)
-    // → 16 blocks for D=256 on E4B SWA (up from 8 with the original
-    // "one block per (b, h_q)" layout — profile showed that version ran
-    // 201 µs/call vs the 26 µs baseline because only 8 × 2 = 16 waves
-    // were active on a 240-wave-slot GPU).
+    // Grid = (D/128, H_q, B). Each block emits 128 d-positions of the
+    // output, one per thread. Threads loop sequentially over L_k and
+    // accumulate into per-thread scalars — no cross-thread reduction.
+    // LDS preloads attn row (sized l_k_alloc × sizeof(f32)) to avoid
+    // refetching from HBM per T iteration. Tried one-block-per-output-d
+    // (grid=(D, H_q, B)) to mirror llama.cpp's mul_mat_vec_f; regressed
+    // because per-block work was too fine-grained.
     const D_CHUNK: usize = 128;
     let n_d_chunks = d / D_CHUNK;
     let v_cfg = LaunchConfig {

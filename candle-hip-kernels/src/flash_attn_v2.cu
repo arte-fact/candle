@@ -1737,18 +1737,17 @@ gqa_decode_gemv_qk_d512_f32_b128(
 //
 // `attn` has layout (B, H_q, 1, L_k). We preload the whole row into LDS
 // once per block so the T-loop re-reads LDS instead of HBM.
-// Grid is (D/D_CHUNK, H_q, B). Each block computes a D_CHUNK slice of
-// the output for (b, h_q). Thread-per-d within the D_CHUNK; loops over
-// L_k and accumulates per-d. With D_CHUNK=BLOCK_SIZE, each thread owns
-// exactly one output d. Writes out[b, h_q, d_base + tid].
+// Grid is (D/128, H_q, B). Each block computes 128 output d positions,
+// with one thread per d. Threads loop over L_k sequentially, accumulating
+// into a per-thread scalar. No cross-thread reduction needed — disjoint
+// output slots. Attention-row broadcast via dynamic LDS to avoid re-reading
+// from HBM per T iteration.
 //
-// Why grid.x = D/BLOCK_SIZE instead of 1: the original 1-block-per-
-// (b,h_q) version launched only H_q=8 blocks on gfx906 (60 CUs), leaving
-// 50+ CUs idle and pushing this kernel to 201 µs/call (vs the 26 µs of
-// the existing split-chunk fused baseline). Splitting D across blocks
-// brings block count to (D/BLOCK_SIZE) * H_q * B = 2 * 8 * 1 = 16 on
-// D=256, and 4 * 8 * 1 = 32 on D=512. Still modest, but eliminates the
-// CU-starvation ceiling.
+// Tried "one block per output d" llama.cpp-style layout (grid=(D, H_q, B),
+// 2048 blocks): regressed to 36 µs/call vs this layout's 17 µs. Reason:
+// per-block work becomes too short (each thread does L_k/128 ≈ 2 iters
+// for L_k=256) — block launch overhead dominates. The current layout
+// keeps each thread busy for all L_k iterations, amortising launch cost.
 template <int D>
 static __device__ __forceinline__ void gqa_decode_gemv_v_b128_impl(
     const float * __restrict__ attn,    // (B, H_q, 1, L_k) post-softmax
@@ -1757,7 +1756,7 @@ static __device__ __forceinline__ void gqa_decode_gemv_v_b128_impl(
     int L_k, int H_q, int H_kv, int n_rep)
 {
     constexpr int BLOCK_SIZE = 128;
-    constexpr int D_CHUNK = BLOCK_SIZE;  // one thread per d within chunk.
+    constexpr int D_CHUNK = BLOCK_SIZE;
     static_assert(D % D_CHUNK == 0, "D must be a multiple of D_CHUNK");
 
     const int d_chunk_idx = blockIdx.x;
@@ -1776,8 +1775,9 @@ static __device__ __forceinline__ void gqa_decode_gemv_v_b128_impl(
     const float * v_ptr    = v + v_off;
     float       * out_ptr  = out + out_off;
 
-    // Broadcast attn row to all threads via dynamic LDS so the T-loop
-    // re-reads LDS instead of HBM.
+    // Preload attn row into LDS — each T iter re-reads attn_lds[t] once
+    // per thread. Without this, all 128 threads would refetch attn[t]
+    // from HBM every T iter (128× bandwidth amplification).
     extern __shared__ float attn_lds[];
     for (int t = tid; t < L_k; t += BLOCK_SIZE) {
         attn_lds[t] = attn_ptr[t];
@@ -1786,10 +1786,6 @@ static __device__ __forceinline__ void gqa_decode_gemv_v_b128_impl(
 
     // Single accumulator — each thread owns exactly ONE d position.
     float acc = 0.0f;
-
-    // V[b, h_kv, t, d] where d = d_chunk_idx * 128 + tid.
-    // Stride between consecutive T rows = D, so V access is
-    // v_ptr[t * D] for our owned d.
     for (int t = 0; t < L_k; ++t) {
         acc += attn_lds[t] * v_ptr[(int64_t)t * D];
     }
