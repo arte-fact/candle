@@ -1222,6 +1222,13 @@ pub struct GatedAttention {
     /// Replaces `ConcatKvCache` which allocated a new growing-size
     /// buffer every step.
     kv_cache: KvCache,
+    /// `CANDLE_KV_Q8=1`: packed block_q8_0 KV cache (1.88× smaller
+    /// than F16 at rest, matches llama.cpp-turbo's fattn-q8 layout).
+    /// Allocated lazily on first decode step; unused when the gate is
+    /// off.
+    #[cfg(feature = "hip")]
+    q8_cache: Option<candle::hip_backend::q8_kv_cache::QKvCache>,
+    use_q8_kv: bool,
 }
 
 impl GatedAttention {
@@ -1259,6 +1266,7 @@ impl GatedAttention {
         // in the canonical `(B, n_kv_head, T, head_dim)` layout (dim=2).
         let kv_cache = KvCache::new_k_transposed(2, KV_CACHE_INITIAL);
 
+        let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1");
         Ok(Self {
             wqkv,
             qg_out,
@@ -1272,6 +1280,9 @@ impl GatedAttention {
             attn_scale: cfg.default_attention_scale(),
             rotary,
             kv_cache,
+            #[cfg(feature = "hip")]
+            q8_cache: None,
+            use_q8_kv,
         })
     }
 
@@ -1328,7 +1339,48 @@ impl GatedAttention {
         // straight into `gqa_attention_k_transposed`.
         let k = k.contiguous()?;
         let v = v.contiguous()?;
-        let (k_t, v) = self.kv_cache.append(&k, &v)?;
+
+        // Q8 KV path: append to the packed Q8_0 cache and dequantise the
+        // in-use range for attention. K is re-transposed to D-major so
+        // the existing `gqa_attention_k_transposed` dispatcher still
+        // applies. Transient F32 dequant is dropped right after the call.
+        #[cfg(feature = "hip")]
+        let q8_route = if self.use_q8_kv {
+            use candle::hip_backend::q8_kv_cache::QKvCache;
+            let (b_sz_q, _h_kv, _t_new, _d) = k.dims4()?;
+            let hip_dev = match k.device() {
+                candle::Device::Hip(d) => d.clone(),
+                _ => candle::bail!("CANDLE_KV_Q8: k must be on HIP"),
+            };
+            if self.q8_cache.is_none() {
+                self.q8_cache = Some(QKvCache::new(
+                    &hip_dev,
+                    b_sz_q,
+                    self.n_kv_head,
+                    KV_CACHE_INITIAL,
+                    self.head_dim,
+                )?);
+            }
+            if offset == 0 {
+                self.q8_cache.as_mut().unwrap().reset();
+            }
+            let cache = self.q8_cache.as_mut().unwrap();
+            cache.append(&k, &v)?;
+            let k_canonical = cache.dequantize_k()?;
+            let v_canonical = cache.dequantize_v()?;
+            let k_t = k_canonical.transpose(2, 3)?.contiguous()?;
+            Some((k_t, v_canonical))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "hip"))]
+        let q8_route: Option<(Tensor, Tensor)> = None;
+
+        let (k_t, v) = if let Some(pair) = q8_route {
+            pair
+        } else {
+            self.kv_cache.append(&k, &v)?
+        };
         let attn_output = gqa_attention_k_transposed(&q, &k_t, &v, mask, self.attn_scale)?;
 
         // Gate: attn_output * sigmoid(gate). Both are `(B, n_head, L, D)`.
@@ -1346,6 +1398,10 @@ impl GatedAttention {
 
     pub fn clear_kv_cache(&mut self) {
         self.kv_cache.reset();
+        #[cfg(feature = "hip")]
+        if let Some(c) = self.q8_cache.as_mut() {
+            c.reset();
+        }
     }
 }
 
