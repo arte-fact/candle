@@ -1229,6 +1229,11 @@ pub struct GatedAttention {
     #[cfg(feature = "hip")]
     q8_cache: Option<candle::hip_backend::q8_kv_cache::QKvCache>,
     use_q8_kv: bool,
+    /// `CANDLE_KV_TQ={2,3,4}`: TurboQuant variant (2.5/4/4.25 bits/val).
+    /// Overrides `use_q8_kv` when set.
+    #[cfg(feature = "hip")]
+    tq_cache: Option<candle::hip_backend::turbo_kv_cache::QTurboKvCache>,
+    tq_variant: Option<u8>,
 }
 
 impl GatedAttention {
@@ -1267,6 +1272,10 @@ impl GatedAttention {
         let kv_cache = KvCache::new_k_transposed(2, KV_CACHE_INITIAL);
 
         let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1");
+        let tq_variant: Option<u8> = std::env::var("CANDLE_KV_TQ")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .filter(|n| matches!(n, 2 | 3 | 4));
         Ok(Self {
             wqkv,
             qg_out,
@@ -1283,6 +1292,9 @@ impl GatedAttention {
             #[cfg(feature = "hip")]
             q8_cache: None,
             use_q8_kv,
+            #[cfg(feature = "hip")]
+            tq_cache: None,
+            tq_variant,
         })
     }
 
@@ -1340,12 +1352,46 @@ impl GatedAttention {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
 
+        // TurboQuant path (CANDLE_KV_TQ={2,3,4}) — wins over Q8 when set.
+        #[cfg(feature = "hip")]
+        let tq_route = if let Some(tq) = self.tq_variant {
+            use candle::hip_backend::turbo_kv_cache::{QTurboKvCache, TbVariant};
+            let (b_sz_q, _h_kv, _t_new, _d) = k.dims4()?;
+            let hip_dev = match k.device() {
+                candle::Device::Hip(d) => d.clone(),
+                _ => candle::bail!("CANDLE_KV_TQ: k must be on HIP"),
+            };
+            let variant = match tq {
+                2 => TbVariant::Tq2_0,
+                3 => TbVariant::Tq3_0,
+                4 => TbVariant::Tq4_0,
+                _ => candle::bail!("CANDLE_KV_TQ={tq}: only 2/3/4 supported"),
+            };
+            if self.tq_cache.is_none() {
+                self.tq_cache = Some(QTurboKvCache::new(
+                    &hip_dev, variant, b_sz_q, self.n_kv_head,
+                    KV_CACHE_INITIAL, self.head_dim,
+                )?);
+            }
+            if offset == 0 { self.tq_cache.as_mut().unwrap().reset(); }
+            let cache = self.tq_cache.as_mut().unwrap();
+            cache.append(&k, &v)?;
+            let k_canonical = cache.dequantize_k()?;
+            let v_canonical = cache.dequantize_v()?;
+            let k_t = k_canonical.transpose(2, 3)?.contiguous()?;
+            Some((k_t, v_canonical))
+        } else {
+            None
+        };
+        #[cfg(not(feature = "hip"))]
+        let tq_route: Option<(Tensor, Tensor)> = None;
+
         // Q8 KV path: append to the packed Q8_0 cache and dequantise the
         // in-use range for attention. K is re-transposed to D-major so
         // the existing `gqa_attention_k_transposed` dispatcher still
         // applies. Transient F32 dequant is dropped right after the call.
         #[cfg(feature = "hip")]
-        let q8_route = if self.use_q8_kv {
+        let q8_route = if tq_route.is_none() && self.use_q8_kv {
             use candle::hip_backend::q8_kv_cache::QKvCache;
             let (b_sz_q, _h_kv, _t_new, _d) = k.dims4()?;
             let hip_dev = match k.device() {
@@ -1376,7 +1422,9 @@ impl GatedAttention {
         #[cfg(not(feature = "hip"))]
         let q8_route: Option<(Tensor, Tensor)> = None;
 
-        let (k_t, v) = if let Some(pair) = q8_route {
+        let (k_t, v) = if let Some(pair) = tq_route {
+            pair
+        } else if let Some(pair) = q8_route {
             pair
         } else {
             self.kv_cache.append(&k, &v)?
@@ -1400,6 +1448,10 @@ impl GatedAttention {
         self.kv_cache.reset();
         #[cfg(feature = "hip")]
         if let Some(c) = self.q8_cache.as_mut() {
+            c.reset();
+        }
+        #[cfg(feature = "hip")]
+        if let Some(c) = self.tq_cache.as_mut() {
             c.reset();
         }
     }
