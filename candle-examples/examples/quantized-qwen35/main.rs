@@ -47,6 +47,10 @@ struct Args {
     #[arg(long)]
     prompt: Option<String>,
 
+    /// Read the prompt from a file (overrides `--prompt` when set).
+    #[arg(long)]
+    prompt_file: Option<String>,
+
     /// Max tokens to generate
     #[arg(short = 'n', long, default_value_t = 200)]
     sample_len: usize,
@@ -216,7 +220,12 @@ fn main() -> anyhow::Result<()> {
     println!("model built in {:.2}s", start.elapsed().as_secs_f32());
     let mut tos = TokenOutputStream::new(tokenizer);
 
-    let prompt_str = args.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string());
+    let prompt_str = if let Some(path) = args.prompt_file.as_ref() {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read prompt_file {path}: {e}"))?
+    } else {
+        args.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string())
+    };
     let prompt_str = format!("<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n");
     print!("prompt: {prompt_str}");
 
