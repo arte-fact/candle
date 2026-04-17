@@ -20,6 +20,83 @@ use crate::hip_backend::{kernels, HipDevice, HipError, HipStorage, WrapErr};
 use crate::{DType, Result, Shape, Storage, Tensor};
 use hipdarc::driver::{HipSlice, LaunchConfig};
 
+/// When this is set, `QTurboKvCache::append` applies the WHT + sign
+/// preconditioning from turbo (`turbo_wht.cu`) to K and V before
+/// quantising, and `dequantize_{k,v}` applies the inverse WHT after
+/// dequantising. Matches turbo's fattn-q3 scheme — the Lloyd-Max
+/// codebooks expect unit-Gaussian distributions, which the signed
+/// FWHT produces from most K/V distributions.
+fn wht_enabled() -> bool {
+    std::env::var("CANDLE_KV_TQ_NO_WHT").ok().as_deref() != Some("1")
+}
+
+/// Apply the signed 128-element FWHT to a `(B, H_kv, T, D)` F32 tensor
+/// in place of an out-of-place copy. `kind` selects K vs V sign tables;
+/// `inverse=true` uses the sign-reversed kernel variant that undoes
+/// the forward transform.
+fn apply_wht_128(
+    t: &Tensor,
+    dev: &HipDevice,
+    kind_is_v: bool,
+    inverse: bool,
+) -> Result<Tensor> {
+    let dims = t.dims();
+    if dims.len() != 4 {
+        crate::bail!("apply_wht_128: expected 4D, got {dims:?}");
+    }
+    let d = dims[3];
+    if d % 128 != 0 {
+        // WHT block size is 128; head_dims that aren't a multiple of
+        // 128 bypass preconditioning (e.g. head_dim=64 TinyLlama).
+        return Ok(t.clone());
+    }
+    let n_elem: usize = dims.iter().product();
+    let n_groups = n_elem / 128;
+
+    let t_contig = t.contiguous()?;
+    let (st, l) = t_contig.storage_and_layout();
+    let hip_st = match &*st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("apply_wht_128: tensor must be on HIP"),
+    };
+    let src_slice = hip_st.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+    let (lo, hi) = l.contiguous_offsets().ok_or_else(|| {
+        crate::Error::Msg("apply_wht_128: tensor not contiguous".into())
+    })?;
+    let src_view = src_slice.slice(lo..hi);
+
+    let out = unsafe { dev.alloc::<f32>(n_elem)? };
+    let kn = match (kind_is_v, inverse) {
+        (false, false) => "turbo_wht_k_forward",
+        (false, true)  => "turbo_wht_k_inverse",
+        (true,  false) => "turbo_wht_v_forward",
+        (true,  true)  => "turbo_wht_v_inverse",
+    };
+    let func = dev.get_or_load_func(kn, &kernels::TURBO_WHT)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_groups as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_groups_i = n_groups as i64;
+    let mut builder = func.builder();
+    builder.arg(&src_view);
+    builder.arg(&out);
+    builder.arg(&n_groups_i);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(st);
+
+    let storage = HipStorage::wrap_hip_slice(out, dev.clone());
+    Ok(Tensor::from_storage(
+        Storage::Hip(storage),
+        Shape::from(dims),
+        crate::op::BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TbVariant {
     Tq2_0,
@@ -130,8 +207,20 @@ impl QTurboKvCache {
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
-        let t_new = self.append_inner(k, /*is_v=*/ false)?;
-        let t_new_v = self.append_inner(v, /*is_v=*/ true)?;
+        // WHT preconditioning (if enabled + head_dim%128==0): maps K/V
+        // to a near-Gaussian distribution the Lloyd-Max centroids expect.
+        // Independent sign tables for K vs V avoid coupling their error
+        // distributions.
+        let (k_pre, v_pre) = if wht_enabled() {
+            let kk = apply_wht_128(k, &self.dev, /*kind_is_v=*/ false, /*inverse=*/ false)?;
+            let vv = apply_wht_128(v, &self.dev, /*kind_is_v=*/ true,  /*inverse=*/ false)?;
+            (kk, vv)
+        } else {
+            (k.clone(), v.clone())
+        };
+
+        let t_new = self.append_inner(&k_pre, /*is_v=*/ false)?;
+        let t_new_v = self.append_inner(&v_pre, /*is_v=*/ true)?;
         if t_new != t_new_v {
             crate::bail!("QTurboKvCache::append: K/V T_new disagree ({t_new} vs {t_new_v})");
         }
@@ -212,11 +301,21 @@ impl QTurboKvCache {
     }
 
     pub fn dequantize_k(&self) -> Result<Tensor> {
-        self.dequantize_inner(&self.k, 0, self.current_seq_len)
+        let raw = self.dequantize_inner(&self.k, 0, self.current_seq_len)?;
+        if wht_enabled() && self.d % 128 == 0 && self.current_seq_len > 0 {
+            apply_wht_128(&raw, &self.dev, /*kind_is_v=*/ false, /*inverse=*/ true)
+        } else {
+            Ok(raw)
+        }
     }
 
     pub fn dequantize_v(&self) -> Result<Tensor> {
-        self.dequantize_inner(&self.v, 0, self.current_seq_len)
+        let raw = self.dequantize_inner(&self.v, 0, self.current_seq_len)?;
+        if wht_enabled() && self.d % 128 == 0 && self.current_seq_len > 0 {
+            apply_wht_128(&raw, &self.dev, /*kind_is_v=*/ true, /*inverse=*/ true)
+        } else {
+            Ok(raw)
+        }
     }
 
     fn dequantize_inner(

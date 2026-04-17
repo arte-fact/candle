@@ -30,10 +30,11 @@ pub enum Id {
     Ternary,
     TopkMoe,
     TurboKv,
+    TurboWht,
     Unary,
 }
 
-pub const ALL_IDS: [Id; 20] = [
+pub const ALL_IDS: [Id; 21] = [
     Id::Affine,
     Id::AttnQ8Kv,
     Id::Binary,
@@ -53,6 +54,7 @@ pub const ALL_IDS: [Id; 20] = [
     Id::Ternary,
     Id::TopkMoe,
     Id::TurboKv,
+    Id::TurboWht,
     Id::Unary,
 ];
 
@@ -102,7 +104,8 @@ mdl!(15, SORT);
 mdl!(16, TERNARY);
 mdl!(17, TOPK_MOE);
 mdl!(18, TURBO_KV);
-mdl!(19, UNARY);
+mdl!(19, TURBO_WHT);
+mdl!(20, UNARY);
 
 /// Produce a kernel function name with dtype suffix, e.g. `"add_f32"`.
 pub fn kernel_name<T: crate::DTypeName>(root: &str) -> String {
