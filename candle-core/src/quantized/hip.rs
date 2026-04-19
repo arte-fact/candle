@@ -1468,12 +1468,20 @@ fn indexed_moe_forward_turbo_moe(
     // ---- MMQ MoE launch ----
     let need_check = n % mmq_y_rows != 0;
     let suffix = if need_check { "checked" } else { "unchecked" };
-    // C3-redo: Q4_K can optionally go through the 4-warp template path via
-    // CANDLE_MMQ_Q4K_TEMPLATE=1 (default OFF — B2 single-warp kernel stays
-    // primary until the template passes a full-model soak). Q5_K and Q6_K
-    // stay on their dedicated single-warp kernels (no template port yet).
-    let q4k_template = is_q4k
-        && std::env::var("CANDLE_MMQ_Q4K_TEMPLATE").map(|v| v == "1").unwrap_or(false);
+    // C3-redo: Q4_K through the 4-warp template path when mmq_x >= 16.
+    // Measured on Qwen3.6 pp512 (rocprofv3, per-call): template gate/up 2314us
+    // vs B2 3590us (+55% faster); down 8018us vs 7021us (+14% slower);
+    // total Q4_K GPU time 964ms vs 1094ms (+14% net). Template VGPR=64 vs
+    // B2 VGPR=140 -> better occupancy headroom. At mmq_x=8 (pp<256) the
+    // 4-warp tile starves on work so B2 wins; keep B2 there.
+    // CANDLE_MMQ_Q4K_TEMPLATE=0 forces B2; =1 forces template; unset picks
+    // by mmq_x.
+    let q4k_template_env = std::env::var("CANDLE_MMQ_Q4K_TEMPLATE").ok();
+    let q4k_template = is_q4k && match q4k_template_env.as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => mmq_x >= 16,
+    };
     let use_single_warp = is_single_warp_kquant && !q4k_template;
     let kernel_dtype_tag = if q4k_template { "q4_K_tpl" } else { dtype_tag };
     let kernel_name = format!("mul_mat_{kernel_dtype_tag}_turbo_moe_x{mmq_x}_{suffix}");
