@@ -1439,6 +1439,13 @@ static __device__ void mul_mat_q_turbo_moe_impl(
 // extern "C" entry points: one per (dtype × mmq_x × need_check).
 // ================================================================
 
+// Occupancy: Q4_0/Q4_1 compile to ~124/127 VGPR at mmq_x=64 -> 2 blocks/CU is
+// already the cap (256 VGPR / 128 = 2 waves/SIMD = 2 blocks/CU). Q8_0 compiles
+// to 64 VGPR at min_blocks=3 -> theoretical 3-4 blocks/CU. Measured: bumping
+// the Q8_0 hint from 2 to 3 dropped VGPR 68->64 but produced NO measurable
+// per-call change across all observed shapes on Qwen3.6 pp512 — the kernel is
+// not occupancy-bound (likely LDS pattern / instruction mix). Left at 2 so we
+// don't force extra register pressure.
 #define MMQ_TURBO_EXPORT(MMQ_X, CHECK, SUFFIX)                           \
     extern "C" __global__                                                \
     __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                         \
