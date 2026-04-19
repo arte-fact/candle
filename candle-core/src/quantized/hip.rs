@@ -1468,19 +1468,21 @@ fn indexed_moe_forward_turbo_moe(
     // ---- MMQ MoE launch ----
     let need_check = n % mmq_y_rows != 0;
     let suffix = if need_check { "checked" } else { "unchecked" };
-    // C3-redo: Q4_K through the 4-warp template path when mmq_x >= 16.
-    // Measured on Qwen3.6 pp512 (rocprofv3, per-call): template gate/up 2314us
-    // vs B2 3590us (+55% faster); down 8018us vs 7021us (+14% slower);
-    // total Q4_K GPU time 964ms vs 1094ms (+14% net). Template VGPR=64 vs
-    // B2 VGPR=140 -> better occupancy headroom. At mmq_x=8 (pp<256) the
-    // 4-warp tile starves on work so B2 wins; keep B2 there.
-    // CANDLE_MMQ_Q4K_TEMPLATE=0 forces B2; =1 forces template; unset picks
-    // by mmq_x.
+    // C3-redo: Q4_K through the 4-warp template path when mmq_x >= 16 AND
+    // n <= 1024.
+    // Per-shape measurements on Qwen3.6 pp512 (rocprofv3, mmq_x=16):
+    //   gate/up (n=512, k=2048): template 2314us vs B2 3590us  -> template +55%
+    //   down    (n=2048, k=512): template 8018us vs B2 7021us  -> B2 +14%
+    // Row-heavy shapes (n large, k small) favour B2's single-warp per-row
+    // tile; col-heavy shapes (n small, k large) favour the 4-warp template.
+    // VGPR: template 64, B2 140 — template has occupancy headroom for
+    // future tuning. At mmq_x=8 (pp<256) the 4-warp tile starves on work
+    // so B2 wins everywhere. CANDLE_MMQ_Q4K_TEMPLATE={0,1} overrides.
     let q4k_template_env = std::env::var("CANDLE_MMQ_Q4K_TEMPLATE").ok();
     let q4k_template = is_q4k && match q4k_template_env.as_deref() {
         Some("1") => true,
         Some("0") => false,
-        _ => mmq_x >= 16,
+        _ => mmq_x >= 16 && n <= 1024,
     };
     let use_single_warp = is_single_warp_kquant && !q4k_template;
     let kernel_dtype_tag = if q4k_template { "q4_K_tpl" } else { dtype_tag };
