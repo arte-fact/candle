@@ -13,7 +13,7 @@ use candle::{quantized::gguf_file, DType};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_qwen3_moe::GGUFQWenMoE as Qwen3_MoE;
+use candle_transformers::models::quantized_qwen3moe_blocks::ModelWeights as Qwen3_MoE;
 
 const DEFAULT_PROMPT: &str = "Write a Rust function to calculate the factorial of a given number.";
 
@@ -85,6 +85,11 @@ struct Args {
     /// Run on CPU rather than GPU even if a GPU is available.
     #[arg(long)]
     cpu: bool,
+
+    /// Number of GPUs to split the model across (pipeline-parallel layer split).
+    /// 1 = single GPU (default). When > 1, uses Hip(0)..Hip(N-1).
+    #[arg(long, default_value_t = 1)]
+    n_gpus: usize,
 
     /// Penalty to be applied for repeating tokens, 1. means no penalty.
     #[arg(long, default_value_t = 1.1)]
@@ -213,36 +218,48 @@ fn main() -> anyhow::Result<()> {
         args.temperature, args.repeat_penalty, args.repeat_last_n
     );
 
-    let dtype = match args.dtype.as_str() {
-        "bf16" => DType::BF16,
-        "f16" => DType::F16, // Used for V100
-        _ => {
-            panic!("Not supported dtype!")
-        }
-    };
+    let _ = args.dtype; // dtype arg retained for CLI compat; new blocks loader infers from GGUF.
 
     let model_path = args.model()?;
-    let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
-    let device = candle_examples::device(args.cpu)?;
 
-    let mut model = {
-        let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
-        let mut total_size_in_bytes = 0;
-        for (_, tensor) in model.tensor_infos.iter() {
-            let elem_count = tensor.shape.elem_count();
-            total_size_in_bytes +=
-                elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
-        }
-        println!(
-            "loaded {:?} tensors ({}) in {:.2}s",
-            model.tensor_infos.len(),
-            &format_size(total_size_in_bytes),
-            start.elapsed().as_secs_f32(),
-        );
-        Qwen3_MoE::from_gguf(model, &mut file, &device, dtype)?
+    // Build the device list. Pipeline-parallel layer split when n_gpus > 1.
+    let devices: Vec<candle::Device> = if args.cpu {
+        vec![candle::Device::Cpu]
+    } else if args.n_gpus > 1 {
+        (0..args.n_gpus)
+            .map(candle::Device::new_hip)
+            .collect::<candle::Result<Vec<_>>>()?
+    } else {
+        vec![candle_examples::device(false)?]
     };
-    println!("model built");
+    let device = devices[0].clone();
+    println!(
+        "devices: {:?}",
+        devices.iter().map(|d| d.location()).collect::<Vec<_>>()
+    );
+
+    // mmap-backed loader: parallel per-layer weight load via shared blob.
+    let (ct, blob) = gguf_file::Content::read_mmap(&model_path)
+        .map_err(|e| e.with_path(&model_path))?;
+    let mut total_size_in_bytes = 0;
+    for (_, tensor) in ct.tensor_infos.iter() {
+        let elem_count = tensor.shape.elem_count();
+        total_size_in_bytes +=
+            elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
+    }
+    println!(
+        "loaded {:?} tensors ({}) in {:.2}s",
+        ct.tensor_infos.len(),
+        &format_size(total_size_in_bytes),
+        start.elapsed().as_secs_f32(),
+    );
+    let mut model = if devices.len() > 1 {
+        Qwen3_MoE::from_gguf_multi_device(ct, blob, &devices)?
+    } else {
+        Qwen3_MoE::from_gguf(ct, blob, &device)?
+    };
+    println!("model built in {:.2}s", start.elapsed().as_secs_f32());
 
     let tokenizer = args.tokenizer()?;
     let mut tos = TokenOutputStream::new(tokenizer);
@@ -345,12 +362,12 @@ fn main() -> anyhow::Result<()> {
     std::io::stdout().flush()?;
     let dt = start_post_prompt.elapsed();
     println!(
-        "\n\n{:4} prompt tokens processed: {:.2} token/s",
+        "\n\n{:4} prompt tokens: {:.2} t/s",
         tokens.len(),
         tokens.len() as f64 / prompt_dt.as_secs_f64(),
     );
     println!(
-        "{sampled:4} tokens generated: {:.2} token/s",
+        "{sampled:4} tokens generated: {:.2} t/s",
         sampled as f64 / dt.as_secs_f64(),
     );
     Ok(())
