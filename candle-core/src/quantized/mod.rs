@@ -1038,6 +1038,16 @@ thread_local! {
 }
 
 impl QMatMul {
+    /// Storage byte size for introspection (diagnostic / VRAM parity tests).
+    /// Returns `Some(bytes)` when the weight is a quantized `QTensor`;
+    /// `None` for a dequantized `Tensor` / `TensorF16` (no packed storage).
+    pub fn storage_size_in_bytes(&self) -> Option<usize> {
+        match self {
+            Self::QTensor(q) => Some(q.storage_size_in_bytes()),
+            _ => None,
+        }
+    }
+
     pub fn from_arc(qtensor: std::sync::Arc<QTensor>) -> Result<Self> {
         let device = qtensor.device();
         // NOTE: a BF16 fast path exists via `QTensor::as_bf16_tensor` but is
@@ -1252,6 +1262,22 @@ impl crate::CustomOp1 for QTensor {
 
 impl crate::Module for QMatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        // Probe: route Q8_0 dense matmul through dequant-to-F16 + rocBLAS
+        // when CANDLE_Q8_ROCBLAS=1. Diagnostic only — rocprofv3 showed our
+        // mul_mat_q8_0_turbo kernel is 8x slower per-call than turbo's
+        // rocBLAS Cijk_*. This env flag lets us measure the dequant+rocBLAS
+        // path end-to-end without plumbing the decision deeper. Dequant
+        // allocates a fresh F16 weight every call (wasteful for repeated
+        // forwards); if the measurement shows it's faster, the next step
+        // is caching the F16 weight at load.
+        #[cfg(feature = "hip")]
+        if let Self::QTensor(t) = self {
+            if t.dtype() == GgmlDType::Q8_0
+                && std::env::var("CANDLE_Q8_ROCBLAS").map(|v| v == "1").unwrap_or(false)
+            {
+                return self.forward_via_f16(xs);
+            }
+        }
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(t.as_ref()),
             Self::Tensor(w) => {
