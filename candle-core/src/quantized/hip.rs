@@ -897,6 +897,18 @@ fn mul_mat_q_v2_with_tile_n(
                 _ => ("mul_mat_q8_0_gfx906_v2f_tile32", 32),
             }
         }
+        // Q3.6.P2: Q4_K MMQ. Qwen3.6 / gemma4-E4B Q4_K_M / any Q4_K_S
+        // model hit this path at prefill. Same v2f fast-path structure as
+        // Q5_K (single-warp, TILE_N col-tile, no per-col bounds check).
+        // Kernels: `mul_mat_q4_K_gfx906_v2f_tile{8,16,32}` in
+        // candle-hip-kernels/src/quantized.cu.
+        GgmlDType::Q4K => {
+            match tile_n_hint {
+                8 => ("mul_mat_q4_K_gfx906_v2f_tile8", 8),
+                16 => ("mul_mat_q4_K_gfx906_v2f_tile16", 16),
+                _ => ("mul_mat_q4_K_gfx906_v2f_tile32", 32),
+            }
+        }
         // P5: K-quant MMQ. Q5_K is the qwen35-9B output head tensor and
         // sits at ~35% of total GPU time in the chunked-vector fallback.
         // Each super-block is 256 K-elements with 8 sub-blocks — the
@@ -1291,13 +1303,20 @@ fn indexed_moe_forward_turbo_moe(
     const BIG_BLOCK_ELEMS: usize = 128;
 
     // Per-dtype MMQ tile row count (see mmq_turbo.cu moe_dtype_traits).
-    // Q8_0 uses 64-row tile (U1 LDS fit); Q4_0/Q4_1 keep llama.cpp's 128.
+    // Q8_0 + Q4_K use 64-row tile; Q4_0/Q4_1 use llama.cpp's 128.
     let (dtype_tag, mmq_y_rows): (&str, usize) = match w_dtype {
         GgmlDType::Q4_0 => ("q4_0", 128),
         GgmlDType::Q4_1 => ("q4_1", 128),
         GgmlDType::Q8_0 => ("q8_0", 64),
+        GgmlDType::Q4K  => ("q4_K", 64),
+        GgmlDType::Q5K  => ("q5_K", 64),
+        GgmlDType::Q6K  => ("q6_K", 64),
         _ => return Ok(None),
     };
+    let is_q4k = matches!(w_dtype, GgmlDType::Q4K);
+    let is_q5k = matches!(w_dtype, GgmlDType::Q5K);
+    let is_q6k = matches!(w_dtype, GgmlDType::Q6K);
+    let is_single_warp_kquant = is_q4k || is_q5k || is_q6k;
 
     // Gate: CANDLE_MMQ_TURBO_PORT=1 enables M2/M3/M6/M7; CANDLE_MMQ_TURBO_MOE=0
     // can disable just the MoE path without disabling the regular MMQ port.
@@ -1449,54 +1468,98 @@ fn indexed_moe_forward_turbo_moe(
     // ---- MMQ MoE launch ----
     let need_check = n % mmq_y_rows != 0;
     let suffix = if need_check { "checked" } else { "unchecked" };
-    let kernel_name = format!("mul_mat_{dtype_tag}_turbo_moe_x{mmq_x}_{suffix}");
+    // C3-redo: Q4_K can optionally go through the 4-warp template path via
+    // CANDLE_MMQ_Q4K_TEMPLATE=1 (default OFF — B2 single-warp kernel stays
+    // primary until the template passes a full-model soak). Q5_K and Q6_K
+    // stay on their dedicated single-warp kernels (no template port yet).
+    let q4k_template = is_q4k
+        && std::env::var("CANDLE_MMQ_Q4K_TEMPLATE").map(|v| v == "1").unwrap_or(false);
+    let use_single_warp = is_single_warp_kquant && !q4k_template;
+    let kernel_dtype_tag = if q4k_template { "q4_K_tpl" } else { dtype_tag };
+    let kernel_name = format!("mul_mat_{kernel_dtype_tag}_turbo_moe_x{mmq_x}_{suffix}");
 
-    let tile_y_ints = {
-        let raw = mmq_x * MMQ_TILE_Y_K;
-        let pad_u = MMQ_NWARPS as usize * WARP_SIZE;
-        raw.div_ceil(pad_u) * pad_u
-    };
-    // Q8_0 doubles x_qs per row (8 ints/block, not 4 after nibble pack);
-    // Q4_0 and Q4_1 use the compact layout.  See moe_dtype_traits in
-    // mmq_turbo.cu.
-    let x_qs_ints = if matches!(w_dtype, GgmlDType::Q8_0) {
-        mmq_y_rows * (2 * MMQ_TILE_NE_K + 1)
+    if use_single_warp {
+        let blocks_per_row_x = k / 256;
+        let stride_expert_blocks = n * blocks_per_row_x;
+        let grid_y = ceil_div(total_pos, mmq_x) as u32;
+        let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (
+                ceil_div(n, WARP_SIZE) as u32,
+                grid_y,
+                n_experts as u32,
+            ),
+            block_dim: (WARP_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = func.builder();
+        builder.arg(weight);
+        builder.arg(&y_mmq);
+        builder.arg(&ids_dst);
+        builder.arg(&expert_bounds);
+        builder.arg(&out);
+        barg!(
+            builder,
+            k as i32,
+            n as i32,
+            total_pos as i32,
+            blocks_per_row_x as i32,
+            stride_expert_blocks as i32,
+            n as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
     } else {
-        mmq_y_rows * (MMQ_TILE_NE_K + 1)
-    };
-    let x_df_flts = mmq_y_rows * 8 + mmq_y_rows / 4;
-    let shared_mem_bytes = (tile_y_ints + x_qs_ints) * 4 + x_df_flts * 4;
-
-    let blocks_per_row_x = k / 32;
-    let stride_expert_blocks = n * blocks_per_row_x;
-    let grid_y = ceil_div(total_pos, mmq_x) as u32;
-
-    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
-    let cfg = hipdarc::driver::LaunchConfig {
-        grid_dim: (
-            ceil_div(n, mmq_y_rows) as u32,
-            grid_y,
-            n_experts as u32,
-        ),
-        block_dim: (WARP_SIZE as u32, MMQ_NWARPS, 1),
-        shared_mem_bytes: shared_mem_bytes as u32,
-    };
-    let mut builder = func.builder();
-    builder.arg(weight);
-    builder.arg(&y_mmq);
-    builder.arg(&ids_dst);
-    builder.arg(&expert_bounds);
-    builder.arg(&out);
-    barg!(
-        builder,
-        k as i32,
-        n as i32,
-        total_pos as i32,           // stride_col_y (big-block stride in Y = total bucket count)
-        blocks_per_row_x as i32,
-        stride_expert_blocks as i32,
-        n as i32
-    );
-    unsafe { builder.launch(cfg) }.w()?;
+        let tile_y_ints = {
+            let raw = mmq_x * MMQ_TILE_Y_K;
+            let pad_u = MMQ_NWARPS as usize * WARP_SIZE;
+            raw.div_ceil(pad_u) * pad_u
+        };
+        let x_qs_ints = if matches!(w_dtype, GgmlDType::Q8_0) {
+            mmq_y_rows * (2 * MMQ_TILE_NE_K + 1)
+        } else {
+            mmq_y_rows * (MMQ_TILE_NE_K + 1)
+        };
+        let x_df_flts = mmq_y_rows * 8 + mmq_y_rows / 4;
+        // Q4_K template variant: x_sc tile follows the x_dm/x_df reserve.
+        let x_sc_ints = if q4k_template {
+            mmq_y_rows * (MMQ_TILE_NE_K / 8) + mmq_y_rows / 8
+        } else {
+            0
+        };
+        let shared_mem_bytes =
+            (tile_y_ints + x_qs_ints) * 4 + x_df_flts * 4 + x_sc_ints * 4;
+        // Q4_K native block = 256-elem superblock (blocks_per_row = k/256).
+        // Other dtypes: 32-elem mini-block.
+        let blocks_per_row_x = if q4k_template { k / 256 } else { k / 32 };
+        let stride_expert_blocks = n * blocks_per_row_x;
+        let grid_y = ceil_div(total_pos, mmq_x) as u32;
+        let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (
+                ceil_div(n, mmq_y_rows) as u32,
+                grid_y,
+                n_experts as u32,
+            ),
+            block_dim: (WARP_SIZE as u32, MMQ_NWARPS, 1),
+            shared_mem_bytes: shared_mem_bytes as u32,
+        };
+        let mut builder = func.builder();
+        builder.arg(weight);
+        builder.arg(&y_mmq);
+        builder.arg(&ids_dst);
+        builder.arg(&expert_bounds);
+        builder.arg(&out);
+        barg!(
+            builder,
+            k as i32,
+            n as i32,
+            total_pos as i32,
+            blocks_per_row_x as i32,
+            stride_expert_blocks as i32,
+            n as i32
+        );
+        unsafe { builder.launch(cfg) }.w()?;
+    }
 
     let mut out_shape = in_shape.dims().to_vec();
     out_shape.pop();
@@ -1688,10 +1751,11 @@ fn indexed_moe_forward_fused_q8_1_input(
     let topk = idx_shape.dims()[1];
     assert!(batch == idx_shape.dims()[0], "batch dim not match!");
 
-    // M6/M7: Q4_0 / Q4_1 / Q8_0 MoE MMQ fast path (turbo-tile gather-by-expert).
+    // M6/M7: Q4_0 / Q4_1 / Q8_0 / Q4_K MoE MMQ fast path (turbo-tile gather-by-expert).
     // Bypasses the MMVQ per-token kernels for prefill-shaped MoE calls.  Returns
     // None when the path is disabled or the shape doesn't qualify — fall through.
-    if matches!(w_dtype, GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0) {
+    // Q4_K (B2) uses a dedicated single-warp per-row kernel (see mmq_turbo.cu).
+    if matches!(w_dtype, GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0 | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K) {
         if let Some(out) = indexed_moe_forward_turbo_moe(
             weight, w_shape, w_dtype, input, in_shape, ids, idx_shape, dev,
         )? {

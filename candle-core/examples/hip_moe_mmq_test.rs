@@ -136,6 +136,41 @@ fn main() -> Result<()> {
         ("Q4_0 qwen-coder-30B down",        GgmlDType::Q4_0, 512, 8, 128, 5120, 768),
         // Q4_1 stress (non-aligned K).
         ("Q4_1 stress m128 k2560 n1024",    GgmlDType::Q4_1, 128, 4, 32,  1024, 2560),
+
+        // Q4_K — B2 kernel (single-warp, per-row). Shapes that mirror the
+        // Qwen3.6-35B-A3B MoE experts (n_experts=256, topk=8, gate/up:
+        // n=512 k=2048, down: n=2048 k=512) plus smaller sanity shapes.
+        ("Q4_K tiny (tok=32 n=64 k=256)",      GgmlDType::Q4K, 32,  4,  8,  64,  256),
+        ("Q4_K tiny (tok=64 n=128 k=512)",     GgmlDType::Q4K, 64,  4,  16, 128, 512),
+        ("Q4_K stress tok=128 k=1024",         GgmlDType::Q4K, 128, 8,  32, 256, 1024),
+        ("Q4_K Qwen3.6 gate/up pp128",         GgmlDType::Q4K, 128, 8,  256, 512, 2048),
+        ("Q4_K Qwen3.6 down pp128",            GgmlDType::Q4K, 128, 8,  256, 2048, 512),
+        ("Q4_K Qwen3.6 gate/up pp512",         GgmlDType::Q4K, 512, 8,  256, 512, 2048),
+        ("Q4_K Qwen3.6 down pp512",            GgmlDType::Q4K, 512, 8,  256, 2048, 512),
+        // Shapes that triggered the C3 crash (for regression coverage on B2).
+        ("Q4_K Qwen3.6 840-tok shape",         GgmlDType::Q4K, 840, 8,  256, 512, 2048),
+        ("Q4_K Qwen3.6 1129-tok shape",        GgmlDType::Q4K, 1129,8,  256, 512, 2048),
+
+        // Q6_K — B3 kernel (single-warp, per-row, same pattern as B2). Shapes
+        // mirror Qwen3.6 down-expert layers (3 Q6_K layers: 34/38/39 have
+        // n_experts=256, topk=8, down: n=2048 k=512). Tiny shapes first for
+        // fast iteration, then production shapes. Q6_K block = 210 bytes
+        // (no bias correction, signed 6-bit quants).
+        ("Q6_K tiny (tok=32 n=64 k=256)",      GgmlDType::Q6K, 32,  4,  8,   64,  256),
+        ("Q6_K tiny (tok=64 n=128 k=512)",     GgmlDType::Q6K, 64,  4,  16,  128, 512),
+        ("Q6_K stress tok=128 k=1024",         GgmlDType::Q6K, 128, 8,  32,  256, 1024),
+        ("Q6_K Qwen3.6 down pp128",            GgmlDType::Q6K, 128, 8,  256, 2048, 512),
+        ("Q6_K Qwen3.6 down pp512",            GgmlDType::Q6K, 512, 8,  256, 2048, 512),
+
+        // Q5_K — B4 kernel (single-warp, per-row, same pattern as B2 + qh
+        // merge). Q5_K block = 176 bytes (unsigned 5-bit, dm bias).
+        ("Q5_K tiny (tok=32 n=64 k=256)",      GgmlDType::Q5K, 32,  4,  8,   64,  256),
+        ("Q5_K tiny (tok=64 n=128 k=512)",     GgmlDType::Q5K, 64,  4,  16,  128, 512),
+        ("Q5_K stress tok=128 k=1024",         GgmlDType::Q5K, 128, 8,  32,  256, 1024),
+        // MoE production-class shapes at Qwen-3.6 dims.
+        ("Q5_K gate/up pp128",                 GgmlDType::Q5K, 128, 8,  256, 512, 2048),
+        ("Q5_K down pp128",                    GgmlDType::Q5K, 128, 8,  256, 2048, 512),
+        ("Q5_K gate/up pp512",                 GgmlDType::Q5K, 512, 8,  256, 512, 2048),
     ];
 
     // ---- W3 (per-expert MMVQ gather) — decode shapes (tokens=1) ----
