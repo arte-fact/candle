@@ -258,6 +258,151 @@ impl Gguf {
         }
     }
 
+    /// Range + concat variant of `qmatmul_concat_rows`: reads rows
+    /// `[row_start, row_start + row_count)` of each named 2D tensor,
+    /// byte-concatenates them along dim 0, and wraps the combined
+    /// storage as a single `QMatMul`.
+    ///
+    /// Used by TP-aware DenseMlp loading — the gate+up fused matmul
+    /// wants `[gate_rows; up_rows]` byte-concatenated, where each
+    /// rank reads only its own row range of both tensors.
+    ///
+    /// All constituents must have the same GGML dtype and same
+    /// `in_features` (cols). Mixed-dtype is not supported in the TP
+    /// path (would require per-constituent dequantise + concat; add
+    /// later if needed).
+    pub fn qmatmul_concat_row_range(
+        &self,
+        names: &[&str],
+        row_start: usize,
+        row_count: usize,
+    ) -> Result<QMatMul> {
+        if names.is_empty() {
+            candle::bail!("qmatmul_concat_row_range: empty name list");
+        }
+        let infos: Vec<&gguf_file::TensorInfo> = names
+            .iter()
+            .map(|n| {
+                self.ct
+                    .tensor_infos
+                    .get(*n)
+                    .ok_or_else(|| candle::Error::Msg(format!("missing tensor: {n}")))
+            })
+            .collect::<Result<_>>()?;
+
+        let first_dtype = infos[0].ggml_dtype;
+        let dims0 = infos[0].shape.dims();
+        if dims0.len() != 2 {
+            candle::bail!(
+                "qmatmul_concat_row_range: expected rank-2 tensors, got {dims0:?} for {}",
+                names[0]
+            );
+        }
+        let in_features = dims0[1];
+        for (info, name) in infos.iter().zip(names.iter()) {
+            if info.ggml_dtype != first_dtype {
+                candle::bail!(
+                    "qmatmul_concat_row_range: mixed dtypes not supported; {name} is {:?} vs {first_dtype:?}",
+                    info.ggml_dtype
+                );
+            }
+            let d = info.shape.dims();
+            if d.len() != 2 || d[1] != in_features {
+                candle::bail!(
+                    "qmatmul_concat_row_range: shape mismatch (in_features={in_features}) vs {d:?} for {name}"
+                );
+            }
+            let rows = d[0];
+            if row_start
+                .checked_add(row_count)
+                .map_or(true, |end| end > rows)
+            {
+                candle::bail!(
+                    "qmatmul_concat_row_range({name}): [{row_start}..{end}) exceeds rows={rows}",
+                    end = row_start + row_count
+                );
+            }
+        }
+
+        let dtype = first_dtype;
+        let block_size = dtype.block_size();
+        let type_size = dtype.type_size();
+        if in_features % block_size != 0 {
+            candle::bail!(
+                "qmatmul_concat_row_range: in_features={in_features} not divisible by block_size={block_size}"
+            );
+        }
+        let bytes_per_row = in_features / block_size * type_size;
+        let slice_bytes_per_tensor = row_count * bytes_per_row;
+        let total_rows = names.len() * row_count;
+        let total_bytes = total_rows * bytes_per_row;
+
+        let mut combined = Vec::<u8>::with_capacity(total_bytes);
+        for info in &infos {
+            let abs = self.ct.tensor_data_offset
+                + info.offset
+                + (row_start * bytes_per_row) as u64;
+            let raw = self.blob.read_to_vec(abs, slice_bytes_per_tensor)?;
+            combined.extend_from_slice(&raw);
+        }
+        let combined_dims = vec![total_rows, in_features];
+        let qt = candle::quantized::ggml_file::qtensor_from_ggml(
+            dtype,
+            &combined,
+            combined_dims,
+            &self.device,
+        )?;
+        QMatMul::from_weights(qt.into())
+    }
+
+    /// Load only experts `[e_start, e_start + e_count)` of a 3D MoE
+    /// tensor directly from the mmap'd blob — avoids the "load full +
+    /// narrow on device" 2× VRAM spike.
+    ///
+    /// Used by EP / TP+EP load paths so each rank allocates only its
+    /// local expert shard. Shape of the returned QTensor is
+    /// `[e_count, D1, D2]` where the original is `[E, D1, D2]`.
+    pub fn tensor_expert_range(
+        &self,
+        name: &str,
+        e_start: usize,
+        e_count: usize,
+    ) -> Result<QTensor> {
+        self.ct.tensor_expert_range_from_blob(
+            &self.blob, name, e_start, e_count, &self.device,
+        )
+    }
+
+    /// Load only rows `[row_start, row_start + row_count)` of a 2D
+    /// weight directly from the mmap'd blob. Used for TP row-splits
+    /// (Q/K/V projections, FFN gate/up — the "output-sharded" matmuls).
+    pub fn tensor_row_range(
+        &self,
+        name: &str,
+        row_start: usize,
+        row_count: usize,
+    ) -> Result<QTensor> {
+        self.ct.tensor_row_range_from_blob(
+            &self.blob, name, row_start, row_count, &self.device,
+        )
+    }
+
+    /// Load only columns `[col_start, col_start + col_count)` of a 2D
+    /// weight directly from the mmap'd blob. Used for TP column-splits
+    /// (attention output proj, FFN down — the "input-sharded" matmuls
+    /// that all-reduce at their output). Strided reads (one pread per
+    /// row); `col_start` and `col_count` must be block-aligned.
+    pub fn tensor_column_range(
+        &self,
+        name: &str,
+        col_start: usize,
+        col_count: usize,
+    ) -> Result<QTensor> {
+        self.ct.tensor_column_range_from_blob(
+            &self.blob, name, col_start, col_count, &self.device,
+        )
+    }
+
     /// Load a tensor and immediately dequantize to f32 on the target device.
     /// Use for small tensors (biases, scalar params) that don't benefit from quantization.
     pub fn dequantize(&self, name: &str) -> Result<Tensor> {

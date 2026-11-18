@@ -675,6 +675,98 @@ pub struct StandardAttention {
     /// Per-layer RoPE — owned, not Arc'd, so each layer can have its own
     /// `freq_base`/`freq_factors`/`dim` (gemma4 sliding vs global, etc.).
     rotary: Arc<RotaryEmbedding>,
+    /// When `Some`, attention is TP-sharded: `finish_attn` runs the
+    /// column-split output projection to produce a PARTIAL `[B, S, hidden]`
+    /// and all-reduces across ranks via the cluster's barrier collective
+    /// before returning. Caller is the worker thread for `rank`.
+    #[cfg(feature = "hip")]
+    tp_ctx: Option<TpContext>,
+}
+
+/// TP-mode context for a sharded block. Stored on the block so its
+/// forward can drop into `all_reduce_sum_f32_barrier` transparently
+/// when multiple worker threads run their rank's forward concurrently.
+#[cfg(feature = "hip")]
+#[derive(Clone)]
+pub struct TpContext {
+    pub cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+    pub rank: usize,
+}
+
+/// TP helper: given a rank-local f32 HIP tensor holding a partial sum,
+/// run the barrier all-reduce across all W ranks and return a fresh
+/// tensor holding the reduced result on the same device.
+///
+/// Assumes the input is contiguous f32 on a HIP device. Caller is
+/// responsible for running concurrently across W threads.
+#[cfg(feature = "hip")]
+pub(crate) fn all_reduce_sum_tensor(
+    cluster: &std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+    rank: usize,
+    input: &Tensor,
+) -> Result<Tensor> {
+    if input.dtype() != candle::DType::F32 {
+        candle::bail!("all_reduce_sum_tensor: dtype must be F32, got {:?}", input.dtype());
+    }
+    if !input.is_contiguous() {
+        candle::bail!("all_reduce_sum_tensor: input must be contiguous");
+    }
+    let input = input.contiguous()?;
+    let shape = input.shape().clone();
+    let n_elems = input.elem_count();
+    let device = input.device().clone();
+    let hip_dev = match &device {
+        candle::Device::Hip(d) => d.clone(),
+        _ => candle::bail!("all_reduce_sum_tensor: expected HIP device"),
+    };
+
+    // Allocate the output buffer on this rank's device.
+    let mut out_slab = unsafe { hip_dev.alloc::<f32>(n_elems)? };
+
+    // Pull the input's underlying HipSlice for the barrier call.
+    let (in_storage, in_layout) = input.storage_and_layout();
+    let in_hip = match &*in_storage {
+        candle::Storage::Hip(s) => s,
+        _ => candle::bail!("all_reduce_sum_tensor: input storage not HIP"),
+    };
+    let in_slice = in_hip.as_hip_slice::<f32>()?;
+    let (lo, hi) = in_layout
+        .contiguous_offsets()
+        .ok_or_else(|| candle::Error::Msg("all_reduce_sum_tensor: non-contig layout".into()))?;
+    // The backing slab is the whole allocation; we need a non-view
+    // HipSlice view restricted to [lo, hi). For the barrier API we
+    // pass the full HipSlice (which covers the tensor's bytes exactly
+    // when input.elem_count() matches the slab's len). Verify.
+    if hi - lo != n_elems {
+        candle::bail!(
+            "all_reduce_sum_tensor: contig slice len {} != elem_count {}",
+            hi - lo, n_elems
+        );
+    }
+    let in_view = in_slice.slice(lo..hi);
+    // Convert HipView back to HipSlice shape for the barrier call via
+    // the DECODE_ALLOC_SENTINEL non-owning view pattern.
+    let in_slice_view = unsafe {
+        candle::hip_backend::hipdarc::driver::HipSlice::<f32>::decode_view(
+            in_view.device_ptr(),
+            in_view.len(),
+        )
+    };
+
+    cluster.all_reduce_sum_f32_barrier(rank, &in_slice_view, &mut out_slab)?;
+
+    // Keep the non-owning view alive as long as the barrier needed it,
+    // then drop (no-op on DECODE_ALLOC_SENTINEL).
+    drop(in_slice_view);
+    drop(in_storage);
+
+    let hip_storage = candle::hip_backend::HipStorage::wrap_hip_slice(out_slab, hip_dev);
+    Ok(candle::Tensor::from_storage(
+        candle::Storage::Hip(hip_storage),
+        shape,
+        candle::op::BackpropOp::none(),
+        false,
+    ))
 }
 
 /// Configuration for loading a StandardAttention layer.
@@ -792,7 +884,198 @@ impl StandardAttention {
             attn_scale,
             v_norm_eps: if opts.use_v_norm { Some(cfg.rms_norm_eps) } else { None },
             rotary,
+            #[cfg(feature = "hip")]
+            tp_ctx: None,
         })
+    }
+
+    /// TP-aware load: range-reads the four attention weights so this rank
+    /// holds only its local head slice.
+    ///
+    /// Partition (contiguous-block, rank `r` of `world`):
+    /// - `wq`: row-split on `[n_head * head_dim, hidden]` → rows
+    ///   `[r * (n_head/W) * head_dim, (r+1) * (n_head/W) * head_dim)`.
+    ///   Each rank owns `n_head / W` heads' Q rows.
+    /// - `wk`, `wv`: row-split on `[n_kv_head * head_dim, hidden]`
+    ///   — rank `r` gets `n_kv_head / W` KV heads' rows.
+    /// - `wo`: column-split on `[hidden, n_head * head_dim]` → cols
+    ///   `[r * (n_head/W) * head_dim, (r+1) * (n_head/W) * head_dim)`.
+    ///   The output projection is "input-sharded"; forward output is
+    ///   a PARTIAL `[B, S, hidden]` that the caller must all-reduce
+    ///   across ranks to recover the full hidden-dim result.
+    ///
+    /// `q_norm` / `k_norm` (per-head RMS norm weights) are loaded in
+    /// full per rank — tiny tensors (one `[head_dim]` vector per head),
+    /// no benefit to sharding.
+    ///
+    /// Requires `n_head`, `n_kv_head` divisible by `world_size`. Returns
+    /// an error otherwise rather than silently mis-partitioning.
+    ///
+    /// Peak VRAM per rank = `(attention_bytes) / world_size` (no load-time
+    /// spike — uses the X5 tensor-range readers end-to-end).
+    #[cfg(feature = "hip")]
+    pub fn load_tp(
+        gg: &Gguf,
+        prefix: &str,
+        cfg: &GgufConfig,
+        layer_idx: usize,
+        rotary: Arc<RotaryEmbedding>,
+        opts: StandardAttentionOpts,
+        cluster: &std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+        rank: usize,
+    ) -> Result<Self> {
+        let world = cluster.world_size();
+        let n_kv_head_full = *cfg.head_count_kv.get(layer_idx);
+
+        // --- Inspect tensor shapes to derive head_dim + n_head_full ---
+        // (We need the FULL head counts before we can compute per-rank rows.)
+        let wq_info = gg
+            .ct
+            .tensor_infos
+            .get(&format!("{prefix}.attn_q.weight"))
+            .ok_or_else(|| candle::Error::Msg(format!(
+                "StandardAttention::load_tp: missing {prefix}.attn_q.weight"
+            )))?;
+        let wq_rows = wq_info.shape.dims()[0];
+
+        let (head_dim, has_k) = match gg.ct.tensor_infos.get(&format!("{prefix}.attn_k.weight")) {
+            Some(wk_info) => {
+                let wk_rows = wk_info.shape.dims()[0];
+                let d = if n_kv_head_full > 0 { wk_rows / n_kv_head_full } else { cfg.head_dim };
+                (d, true)
+            }
+            None => (cfg.head_dim, false),
+        };
+        let has_v = gg.has_tensor(&format!("{prefix}.attn_v.weight"));
+        let n_head_full = if head_dim > 0 { wq_rows / head_dim } else { cfg.head_count };
+
+        // --- TP divisibility checks ---
+        if n_head_full % world != 0 {
+            candle::bail!(
+                "StandardAttention::load_tp({prefix}): n_head={n_head_full} not divisible by world={world}"
+            );
+        }
+        // K/V head-shard policy: if n_kv_head is not divisible by W
+        // (e.g. gemma4 SWA layers with n_kv_head=2 under W=4), replicate
+        // the FULL K/V on every rank. Q still TP-splits; GQA expansion
+        // at attention time maps each local Q head to its full K/V
+        // group head, so correctness holds. VRAM win for that layer is
+        // lost but the layer still works.
+        let kv_replicated = has_k && n_kv_head_full % world != 0;
+        let n_head_local = n_head_full / world;
+        let n_kv_head_local = if !has_k {
+            0
+        } else if kv_replicated {
+            n_kv_head_full
+        } else {
+            n_kv_head_full / world
+        };
+
+        // --- Range-load Q (row-split) ---
+        let q_rows_per_rank = n_head_local * head_dim;
+        let wq_q = gg.tensor_row_range(
+            &format!("{prefix}.attn_q.weight"),
+            rank * q_rows_per_rank,
+            q_rows_per_rank,
+        )?;
+        let wq = QMatMul::from_weights(std::sync::Arc::new(wq_q).into())?;
+
+        // --- Range-load K/V (row-split) if present; replicate if kv_replicated.
+        let wk = if has_k {
+            if kv_replicated {
+                Some(gg.qmatmul(&format!("{prefix}.attn_k.weight"))?)
+            } else {
+                let kv_rows_per_rank = n_kv_head_local * head_dim;
+                let q = gg.tensor_row_range(
+                    &format!("{prefix}.attn_k.weight"),
+                    rank * kv_rows_per_rank,
+                    kv_rows_per_rank,
+                )?;
+                Some(QMatMul::from_weights(std::sync::Arc::new(q).into())?)
+            }
+        } else {
+            None
+        };
+        let wv = if has_v {
+            if kv_replicated {
+                Some(gg.qmatmul(&format!("{prefix}.attn_v.weight"))?)
+            } else {
+                let kv_rows_per_rank = n_kv_head_local * head_dim;
+                let q = gg.tensor_row_range(
+                    &format!("{prefix}.attn_v.weight"),
+                    rank * kv_rows_per_rank,
+                    kv_rows_per_rank,
+                )?;
+                Some(QMatMul::from_weights(std::sync::Arc::new(q).into())?)
+            }
+        } else {
+            None
+        };
+
+        // --- Range-load output proj (column-split) ---
+        let o_cols_per_rank = n_head_local * head_dim;
+        let wo_q = gg.tensor_column_range(
+            &format!("{prefix}.attn_output.weight"),
+            rank * o_cols_per_rank,
+            o_cols_per_rank,
+        )?;
+        let wo = QMatMul::from_weights(std::sync::Arc::new(wo_q).into())?;
+
+        // --- Q/K norms (replicated; tiny per-head weights) ---
+        let q_norm = if opts.use_gemma_norms {
+            GemmaRmsNorm::try_load(gg, &format!("{prefix}.attn_q_norm.weight"), cfg.rms_norm_eps)
+                .map(AttnNorm::Gemma)
+        } else {
+            gg.try_rms_norm(&format!("{prefix}.attn_q_norm.weight"), cfg.rms_norm_eps)
+                .map(AttnNorm::Standard)
+        };
+        let k_norm = if opts.use_gemma_norms {
+            GemmaRmsNorm::try_load(gg, &format!("{prefix}.attn_k_norm.weight"), cfg.rms_norm_eps)
+                .map(AttnNorm::Gemma)
+        } else {
+            gg.try_rms_norm(&format!("{prefix}.attn_k_norm.weight"), cfg.rms_norm_eps)
+                .map(AttnNorm::Standard)
+        };
+
+        let attn_scale = opts
+            .attention_scale
+            .unwrap_or_else(|| 1.0 / (head_dim as f64).sqrt());
+
+        // Cluster is held by the caller; this struct stores only the
+        // LOCAL head count, so downstream forward code (reshape / RoPE /
+        // attention) automatically operates on the sharded subset.
+        let _ = cluster;
+        Ok(Self {
+            wq,
+            wk,
+            wv,
+            wo,
+            q_norm,
+            k_norm,
+            n_head: n_head_local,
+            n_kv_head: n_kv_head_local,
+            head_dim,
+            attn_scale,
+            v_norm_eps: if opts.use_v_norm { Some(cfg.rms_norm_eps) } else { None },
+            rotary,
+            #[cfg(feature = "hip")]
+            tp_ctx: None,
+        })
+    }
+
+    /// Diagnostic: summed packed-storage bytes across wq + wk + wv + wo
+    /// (skips entries whose `QMatMul` is a dequantised `Tensor`). Used
+    /// by VRAM parity tests to verify TP sharding.
+    pub fn q_weight_bytes_total(&self) -> usize {
+        let mut total = self.wq.storage_size_in_bytes().unwrap_or(0);
+        if let Some(wk) = &self.wk {
+            total += wk.storage_size_in_bytes().unwrap_or(0);
+        }
+        if let Some(wv) = &self.wv {
+            total += wv.storage_size_in_bytes().unwrap_or(0);
+        }
+        total += self.wo.storage_size_in_bytes().unwrap_or(0);
+        total
     }
 
     /// True if this layer has its own K/V projections. False for shared-KV layers
@@ -1172,12 +1455,32 @@ impl StandardAttention {
     }
 
     /// Shared suffix for `forward_with_kv*`: reshape back + wo.
+    ///
+    /// Under TP mode (when `tp_ctx` is set via `set_tp_context`), `wo` is
+    /// column-split so its output is a PARTIAL `[B, S, hidden]` that
+    /// aggregates to the full output only when summed across all W ranks.
+    /// This function performs the barrier-backed all-reduce inline so
+    /// the caller's forward loop is unchanged by TP mode. The ranks
+    /// must be running concurrently (W worker threads, one per rank),
+    /// otherwise the barrier deadlocks.
     pub fn finish_attn(&self, attn_output: Tensor, b_sz: usize, seq_len: usize) -> Result<Tensor> {
         let attn_output = attn_output
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b_sz, seq_len, self.n_head * self.head_dim))?;
-        self.wo.forward(&attn_output)
+        let partial = self.wo.forward(&attn_output)?;
+        #[cfg(feature = "hip")]
+        if let Some(ref ctx) = self.tp_ctx {
+            return all_reduce_sum_tensor(&ctx.cluster, ctx.rank, &partial);
+        }
+        Ok(partial)
+    }
+
+    /// Attach TP context so `finish_attn` runs the cross-rank all-reduce
+    /// after the output projection. Called after `load_tp`.
+    #[cfg(feature = "hip")]
+    pub fn set_tp_context(&mut self, ctx: TpContext) {
+        self.tp_ctx = Some(ctx);
     }
 
     /// Convenience wrapper that allocates a per-instance KV cache and runs the
@@ -1283,7 +1586,13 @@ impl GatedAttention {
         // in the canonical `(B, n_kv_head, T, head_dim)` layout (dim=2).
         let kv_cache = KvCache::new_k_transposed(2, KV_CACHE_INITIAL);
 
-        let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1");
+        // P17 (2026-04-19): default Q8 KV ON for GatedAttention arches.
+        // Kills the 15.8% rocBLAS F32 GEMM cost on FullAttn layers' Q·K/V in
+        // Qwen3.6 decode and unlocks the direct-GEMV path wired in P12.
+        // Set `CANDLE_KV_Q8=0` to opt out (regression baseline).
+        // Memory-verified: Qwen3-Coder-Next +71% tg, Qwen3.5-9B noise,
+        // Qwen3.6 est. +15-20% tg. TQ takes precedence when CANDLE_KV_TQ set.
+        let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() != Some("0");
         let tq_variant: Option<u8> = std::env::var("CANDLE_KV_TQ")
             .ok()
             .and_then(|s| s.parse::<u8>().ok())
@@ -1308,6 +1617,61 @@ impl GatedAttention {
             tq_cache: None,
             tq_variant,
         })
+    }
+
+    // Decode-only Q8 KV fast path: append K/V into the packed Q8 cache
+    // and run `gqa_attention_decode_q8` directly. Returns `Ok(None)` if
+    // any precondition fails (caller falls back to dequant path).
+    //
+    // Preconditions: TQ not active, Q8 KV enabled, `seq_len == 1`,
+    // `head_dim ∈ {64,128,256,512}`, `CANDLE_Q8_KV_DIRECT_GEMV != "0"`.
+    #[cfg(feature = "hip")]
+    fn q8_decode_direct(
+        &mut self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+        seq_len: usize,
+    ) -> Result<Option<Tensor>> {
+        if self.tq_variant.is_some() || !self.use_q8_kv || seq_len != 1 {
+            return Ok(None);
+        }
+        if !matches!(self.head_dim, 64 | 128 | 256 | 512) {
+            return Ok(None);
+        }
+        if std::env::var("CANDLE_Q8_KV_DIRECT_GEMV").ok().as_deref() == Some("0") {
+            return Ok(None);
+        }
+        use candle::hip_backend::q8_kv_cache::{gqa_attention_decode_q8_with_fused_softmax, QKvCache};
+        let hip_dev = match k.device() {
+            candle::Device::Hip(d) => d.clone(),
+            _ => return Ok(None),
+        };
+        let (b_sz_q, _h_kv, _t_new, _d) = k.dims4()?;
+        if self.q8_cache.is_none() {
+            let t_max = kv_max_seq_len();
+            self.q8_cache = Some(QKvCache::new(
+                &hip_dev,
+                b_sz_q,
+                self.n_kv_head,
+                t_max,
+                self.head_dim,
+            )?);
+        }
+        if offset == 0 {
+            self.q8_cache.as_mut().unwrap().reset();
+        }
+        let cache = self.q8_cache.as_mut().unwrap();
+        cache.append(k, v)?;
+        let l_k = cache.current_seq_len();
+        // F5: default-on fused softmax; the fused kernel auto-falls back
+        // to decomposed when grid is too small (protects Qwen3.6 MoE h_q=32).
+        let out = gqa_attention_decode_q8_with_fused_softmax(
+            q, cache, l_k, mask, self.attn_scale, true,
+        )?;
+        Ok(Some(out))
     }
 
     pub fn forward(
@@ -1399,12 +1763,24 @@ impl GatedAttention {
         #[cfg(not(feature = "hip"))]
         let tq_route: Option<(Tensor, Tensor)> = None;
 
-        // Q8 KV path: append to the packed Q8_0 cache and dequantise the
-        // in-use range for attention. K is re-transposed to D-major so
-        // the existing `gqa_attention_k_transposed` dispatcher still
-        // applies. Transient F32 dequant is dropped right after the call.
+        // Q8 KV decode fast path: L_q=1 + supported head_dim -> call
+        // gqa_attention_decode_q8 directly, skipping the F32 dequant +
+        // transpose round-trip. Env `CANDLE_Q8_KV_DIRECT_GEMV=0` forces
+        // the old dequant path. Prefill (seq_len > 1) falls through to
+        // the dequant route since the wrapper is decode-only.
         #[cfg(feature = "hip")]
-        let q8_route = if tq_route.is_none() && self.use_q8_kv {
+        let q8_direct_out: Option<Tensor> =
+            self.q8_decode_direct(&q, &k, &v, mask, offset, seq_len)?;
+        #[cfg(not(feature = "hip"))]
+        let q8_direct_out: Option<Tensor> = None;
+
+        // Q8 KV dequant path (prefill, or decode when fast path skipped):
+        // append to the packed Q8_0 cache and dequantise the in-use range
+        // for attention. K is re-transposed to D-major so the existing
+        // `gqa_attention_k_transposed` dispatcher still applies. Transient
+        // F32 dequant is dropped right after the call.
+        #[cfg(feature = "hip")]
+        let q8_route = if tq_route.is_none() && self.use_q8_kv && q8_direct_out.is_none() {
             use candle::hip_backend::q8_kv_cache::QKvCache;
             let (b_sz_q, _h_kv, _t_new, _d) = k.dims4()?;
             let hip_dev = match k.device() {
@@ -1436,14 +1812,18 @@ impl GatedAttention {
         #[cfg(not(feature = "hip"))]
         let q8_route: Option<(Tensor, Tensor)> = None;
 
-        let (k_t, v) = if let Some(pair) = tq_route {
-            pair
-        } else if let Some(pair) = q8_route {
-            pair
+        let attn_output = if let Some(out) = q8_direct_out {
+            out
         } else {
-            self.kv_cache.append(&k, &v)?
+            let (k_t, v) = if let Some(pair) = tq_route {
+                pair
+            } else if let Some(pair) = q8_route {
+                pair
+            } else {
+                self.kv_cache.append(&k, &v)?
+            };
+            gqa_attention_k_transposed(&q, &k_t, &v, mask, self.attn_scale)?
         };
-        let attn_output = gqa_attention_k_transposed(&q, &k_t, &v, mask, self.attn_scale)?;
 
         // Gate: attn_output * sigmoid(gate). Both are `(B, n_head, L, D)`.
         let gate_sigmoid = candle_nn::ops::sigmoid(&gate)?;

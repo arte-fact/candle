@@ -34,8 +34,8 @@ fn try_topk_fused(
         return None;
     }
     let n_experts_dim = routing_logits.dim(D::Minus1).ok()?;
-    // Only 64 / 128 / 512 are compiled; reject other counts.
-    if !matches!(n_experts_dim, 64 | 128 | 512) {
+    // Only 64 / 128 / 256 / 512 are compiled; reject other counts.
+    if !matches!(n_experts_dim, 64 | 128 | 256 | 512) {
         return None;
     }
     let flat = routing_logits.reshape(((), n_experts_dim)).ok()?;
@@ -48,6 +48,43 @@ fn try_topk_fused(_: &Tensor, _: usize) -> Option<(Tensor, Tensor)> {
 }
 
 /// Compare two devices for equality without allocating.
+/// Load the shared-expert MLP and shared-gate weight for a MoE layer.
+/// Shared across `Self::load` and `Self::load_ep` — both replicate the
+/// shared expert on every rank.
+fn load_shared_expert(
+    gg: &Gguf,
+    prefix: &str,
+) -> Result<(Option<DenseMlp>, Option<Tensor>)> {
+    let shared = if gg.has_tensor(&format!("{prefix}.ffn_up_shexp.weight")) {
+        let shared_gate_name = format!("{prefix}.ffn_gate_shexp.weight");
+        let shared_up_name = format!("{prefix}.ffn_up_shexp.weight");
+        let shared_intermediate = gg
+            .ct
+            .tensor_infos
+            .get(&shared_gate_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing {shared_gate_name}")))?
+            .shape
+            .dims()[0];
+        let shared_gate_up =
+            gg.qmatmul_concat_rows(&[&shared_gate_name, &shared_up_name])?;
+        let shared_down = gg.qmatmul(&format!("{prefix}.ffn_down_shexp.weight"))?;
+        Some(DenseMlp {
+            gate_up: shared_gate_up,
+            intermediate_size: shared_intermediate,
+            down: shared_down,
+            activation: MlpActivation::Silu,
+            #[cfg(feature = "hip")]
+            tp_ctx: None,
+        })
+    } else {
+        None
+    };
+    // Shared-gate weight (qwen35moe convention): 1-D `[hidden]` vector.
+    let shared_gate_weight = gg
+        .try_dequantize(&format!("{prefix}.ffn_gate_inp_shexp.weight"));
+    Ok((shared, shared_gate_weight))
+}
+
 fn device_eq(a: &Device, b: &Device) -> bool {
     format!("{:?}", a.location()) == format!("{:?}", b.location())
 }
@@ -104,6 +141,12 @@ pub struct DenseMlp {
     intermediate_size: usize,
     down: QMatMul,
     activation: MlpActivation,
+    /// When `Some`, the down matmul output is treated as a PARTIAL
+    /// `[B, S, hidden]` and all-reduced across ranks via the barrier
+    /// before returning from `forward`. Set via `set_tp_context` after
+    /// `load_tp`.
+    #[cfg(feature = "hip")]
+    tp_ctx: Option<super::attention::TpContext>,
 }
 
 impl DenseMlp {
@@ -131,7 +174,139 @@ impl DenseMlp {
             .dims()[0];
         let gate_up = gg.qmatmul_concat_rows(&[&gate_name, &up_name])?;
         let down = gg.qmatmul(&format!("{prefix}.ffn_down.weight"))?;
-        Ok(Self { gate_up, intermediate_size, down, activation })
+        Ok(Self {
+            gate_up,
+            intermediate_size,
+            down,
+            activation,
+            #[cfg(feature = "hip")]
+            tp_ctx: None,
+        })
+    }
+
+    /// TP-aware load: range-reads the fused gate+up matmul by row-split
+    /// and the down matmul by column-split, so each rank holds only
+    /// `intermediate_size / world_size` slice of the dense FFN.
+    ///
+    /// Partition (contiguous-block, rank `r` of `world`):
+    /// - `ffn_gate.weight` shape `[intermediate, hidden]` — rows
+    ///   `[r * I/W, (r+1) * I/W)`.
+    /// - `ffn_up.weight` same.
+    /// - Fused gate+up QTensor shape per rank: `[2 * I/W, hidden]`.
+    /// - `ffn_down.weight` shape `[hidden, intermediate]` — cols
+    ///   `[r * I/W, (r+1) * I/W)`.
+    /// - Forward output per rank is a partial `[B, S, hidden]` that
+    ///   caller must all-reduce across ranks to recover the full
+    ///   hidden-dim sum.
+    ///
+    /// Requires `intermediate_size % world_size == 0` and additionally
+    /// `intermediate_size / world_size` divisible by the GGML block
+    /// size of `ffn_down.weight` (so column-range stays block-aligned).
+    ///
+    /// Peak VRAM = (gate+up+down bytes) / world_size. Uses the X5
+    /// range readers end-to-end.
+    #[cfg(feature = "hip")]
+    pub fn load_tp(
+        gg: &Gguf,
+        prefix: &str,
+        activation: MlpActivation,
+        cluster: &std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+        rank: usize,
+    ) -> Result<Self> {
+        let world = cluster.world_size();
+        let gate_name = format!("{prefix}.ffn_gate.weight");
+        let up_name = format!("{prefix}.ffn_up.weight");
+        let down_name = format!("{prefix}.ffn_down.weight");
+
+        let gate_info = gg
+            .ct
+            .tensor_infos
+            .get(&gate_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing {gate_name}")))?;
+        let gate_dims = gate_info.shape.dims();
+        if gate_dims.len() != 2 {
+            candle::bail!(
+                "DenseMlp::load_tp({prefix}): {gate_name} expected 2D, got {:?}",
+                gate_dims
+            );
+        }
+        // Uneven-shard partitioning. `intermediate` may not be divisible
+        // by `world * block_size` (e.g. gemma4-26B-A4B has
+        // intermediate=2112 which fails at W=4, block=32: 66 blocks /
+        // 4 ranks = 16 base + 2 extra). Distribute the extra blocks
+        // across the first `extra` ranks so every rank's shard stays
+        // block-aligned.
+        let intermediate = gate_dims[0];
+        let down_info = gg
+            .ct
+            .tensor_infos
+            .get(&down_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing {down_name}")))?;
+        let down_bs = down_info.ggml_dtype.block_size();
+        // Use down's block_size as the partition granularity — gate/up
+        // are typically the same dtype and the column-split on down is
+        // the tighter alignment constraint.
+        if intermediate % down_bs != 0 {
+            candle::bail!(
+                "DenseMlp::load_tp({prefix}): intermediate={intermediate} not divisible by {down_name} block_size={down_bs}"
+            );
+        }
+        let total_blocks = intermediate / down_bs;
+        let base_blocks = total_blocks / world;
+        let extra = total_blocks % world;
+        // Ranks [0, extra) get base_blocks+1; ranks [extra, world) get base_blocks.
+        let local_blocks = if rank < extra { base_blocks + 1 } else { base_blocks };
+        let prev_extra = rank.min(extra);
+        let start_blocks = prev_extra * (base_blocks + 1) + (rank - prev_extra) * base_blocks;
+        let local_intermediate = local_blocks * down_bs;
+        let row_start = start_blocks * down_bs;
+
+        if local_intermediate == 0 {
+            candle::bail!(
+                "DenseMlp::load_tp({prefix}): rank {rank} has zero local_intermediate (world={world} > blocks={total_blocks})"
+            );
+        }
+
+        // Gate+up fused: per-rank rows concatenated for gate then up.
+        let gate_up = gg.qmatmul_concat_row_range(
+            &[&gate_name, &up_name],
+            row_start,
+            local_intermediate,
+        )?;
+
+        // Down: column-split using the same per-rank ranges.
+        let col_start = row_start;
+        let down_qt = gg.tensor_column_range(&down_name, col_start, local_intermediate)?;
+        let down = crate::models::with_tracing::QMatMul::from_weights(
+            std::sync::Arc::new(down_qt).into(),
+        )?;
+
+        let _ = cluster;
+        Ok(Self {
+            gate_up,
+            intermediate_size: local_intermediate,
+            down,
+            activation,
+            tp_ctx: None,
+        })
+    }
+
+    /// Attach TP context so `forward` all-reduces the down-proj output
+    /// across ranks before returning. Call after `load_tp`.
+    #[cfg(feature = "hip")]
+    pub fn set_tp_context(&mut self, ctx: super::attention::TpContext) {
+        self.tp_ctx = Some(ctx);
+    }
+
+    /// Diagnostic: packed-storage bytes for gate_up + down (sums).
+    pub fn q_weight_bytes_total(&self) -> usize {
+        self.gate_up.storage_size_in_bytes().unwrap_or(0)
+            + self.down.storage_size_in_bytes().unwrap_or(0)
+    }
+
+    /// Accessor for the per-side intermediate width.
+    pub fn intermediate_size(&self) -> usize {
+        self.intermediate_size
     }
 }
 
@@ -221,7 +396,15 @@ impl DenseMlp {
         // down matmul takes `rhs_shape` with last dim = intermediate_size.
         let mut down_rhs_shape: Vec<usize> = rhs_shape.to_vec();
         *down_rhs_shape.last_mut().unwrap() = self.intermediate_size;
-        self.down.forward_preq8(&h_q8_view, b_size, &down_rhs_shape)
+        let partial = self.down.forward_preq8(&h_q8_view, b_size, &down_rhs_shape)?;
+        // TP: under tp_ctx, `down` is column-split so `partial` is the
+        // rank-local partial sum — fire the cross-rank all-reduce before
+        // returning, mirroring the Module::forward path.
+        #[cfg(feature = "hip")]
+        if let Some(ref ctx) = self.tp_ctx {
+            return super::attention::all_reduce_sum_tensor(&ctx.cluster, ctx.rank, &partial);
+        }
+        Ok(partial)
     }
 }
 
@@ -237,37 +420,74 @@ impl Module for DenseMlp {
         // Drops 2 ucopy_f32 launches per FFN per layer per token.
         // Silu covers Qwen3.5; Gelu (W5) covers Gemma-family dense
         // layers.
-        #[cfg(feature = "hip")]
-        if matches!(gate_up.device(), candle::Device::Hip(_))
-            && gate_up.dtype() == candle::DType::F32
-            && gate_up.is_contiguous()
-        {
-            let activated = match self.activation {
-                MlpActivation::Silu => Some(
-                    candle::hip_backend::silu_mul_split_last_fused(&gate_up)?,
-                ),
-                MlpActivation::Gelu => Some(
-                    candle::hip_backend::gelu_mul_split_last_fused(&gate_up)?,
-                ),
-                _ => None,
-            };
-            if let Some(activated) = activated {
-                return self.down.forward(&activated);
+        let partial = {
+            #[cfg(feature = "hip")]
+            {
+                if matches!(gate_up.device(), candle::Device::Hip(_))
+                    && gate_up.dtype() == candle::DType::F32
+                    && gate_up.is_contiguous()
+                {
+                    let activated = match self.activation {
+                        MlpActivation::Silu => Some(
+                            candle::hip_backend::silu_mul_split_last_fused(&gate_up)?,
+                        ),
+                        MlpActivation::Gelu => Some(
+                            candle::hip_backend::gelu_mul_split_last_fused(&gate_up)?,
+                        ),
+                    };
+                    if let Some(activated) = activated {
+                        self.down.forward(&activated)?
+                    } else {
+                        let gate = gate_up
+                            .narrow(D::Minus1, 0, self.intermediate_size)?
+                            .contiguous()?;
+                        let up = gate_up
+                            .narrow(
+                                D::Minus1,
+                                self.intermediate_size,
+                                self.intermediate_size,
+                            )?
+                            .contiguous()?;
+                        let activated = self.activation.apply_with_mul(&gate, &up)?;
+                        self.down.forward(&activated)?
+                    }
+                } else {
+                    let gate = gate_up
+                        .narrow(D::Minus1, 0, self.intermediate_size)?
+                        .contiguous()?;
+                    let up = gate_up
+                        .narrow(
+                            D::Minus1,
+                            self.intermediate_size,
+                            self.intermediate_size,
+                        )?
+                        .contiguous()?;
+                    let activated = self.activation.apply_with_mul(&gate, &up)?;
+                    self.down.forward(&activated)?
+                }
             }
-        }
+            #[cfg(not(feature = "hip"))]
+            {
+                let gate = gate_up
+                    .narrow(D::Minus1, 0, self.intermediate_size)?
+                    .contiguous()?;
+                let up = gate_up
+                    .narrow(
+                        D::Minus1,
+                        self.intermediate_size,
+                        self.intermediate_size,
+                    )?
+                    .contiguous()?;
+                let activated = self.activation.apply_with_mul(&gate, &up)?;
+                self.down.forward(&activated)?
+            }
+        };
 
-        // Fallback: narrow + contiguous + activation*mul. The narrows
-        // are non-contiguous views into the same buffer; the fused
-        // activation kernel works against contiguous inputs so we
-        // materialize once via .contiguous().
-        let gate = gate_up
-            .narrow(D::Minus1, 0, self.intermediate_size)?
-            .contiguous()?;
-        let up = gate_up
-            .narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?
-            .contiguous()?;
-        let activated = self.activation.apply_with_mul(&gate, &up)?;
-        self.down.forward(&activated)
+        #[cfg(feature = "hip")]
+        if let Some(ref ctx) = self.tp_ctx {
+            return super::attention::all_reduce_sum_tensor(&ctx.cluster, ctx.rank, &partial);
+        }
+        Ok(partial)
     }
 }
 
@@ -312,6 +532,23 @@ pub struct MoeExperts {
     /// in the real gather/scatter is the next phase (X3 core).
     #[cfg(feature = "hip")]
     pub(crate) ep_partition: Option<EpPartition>,
+}
+
+impl MoeExperts {
+    /// Diagnostic accessor: the down-projection expert weight tensor.
+    /// Exposed (post-X5) so external tooling — VRAM parity tests and
+    /// benches — can inspect per-rank shard sizes without poking at
+    /// private fields.
+    pub fn down_exps(&self) -> &std::sync::Arc<QTensor> {
+        &self.down_exps
+    }
+
+    /// EP partition metadata, if this MoE branch was constructed via
+    /// `load_ep`. Returns `None` when EP is not attached.
+    #[cfg(feature = "hip")]
+    pub fn ep_partition(&self) -> Option<&EpPartition> {
+        self.ep_partition.as_ref()
+    }
 }
 
 /// Expert-parallel partition state for one rank.
@@ -383,42 +620,7 @@ impl MoeExperts {
             cfg.feed_forward_length.unwrap_or(0)
         };
 
-        // Detect shared expert. Build it via DenseMlp::load_with_activation
-        // so it picks up the same fused gate+up packing as the dense
-        // FFN path — saves one MMVQ launch per shared-expert call too.
-        let shared = if gg.has_tensor(&format!("{prefix}.ffn_up_shexp.weight")) {
-            // The shared-expert tensors live under `{prefix}.ffn_*_shexp.weight`,
-            // so DenseMlp::load_with_activation needs a virtual prefix
-            // that resolves to those names. Concretely we want it to
-            // try `{prefix}_shexp.ffn_*.weight`, but that's not the
-            // actual layout. Instead, build the fused weight directly
-            // here using the same helper.
-            let shared_gate_name = format!("{prefix}.ffn_gate_shexp.weight");
-            let shared_up_name = format!("{prefix}.ffn_up_shexp.weight");
-            let shared_intermediate = gg
-                .ct
-                .tensor_infos
-                .get(&shared_gate_name)
-                .ok_or_else(|| candle::Error::Msg(format!("missing {shared_gate_name}")))?
-                .shape
-                .dims()[0];
-            let shared_gate_up =
-                gg.qmatmul_concat_rows(&[&shared_gate_name, &shared_up_name])?;
-            let shared_down = gg.qmatmul(&format!("{prefix}.ffn_down_shexp.weight"))?;
-            Some(DenseMlp {
-                gate_up: shared_gate_up,
-                intermediate_size: shared_intermediate,
-                down: shared_down,
-                activation: MlpActivation::Silu,
-            })
-        } else {
-            None
-        };
-
-        // Shared expert gate is a 1-D weight vector (qwen35moe convention).
-        // Load + dequantize and keep as a Tensor.
-        let shared_gate_weight = gg
-            .try_dequantize(&format!("{prefix}.ffn_gate_inp_shexp.weight"));
+        let (shared, shared_gate_weight) = load_shared_expert(gg, prefix)?;
 
         Ok(Self {
             router,
@@ -435,20 +637,19 @@ impl MoeExperts {
         })
     }
 
-    /// EP-aware load: narrows each expert tensor to the local expert
-    /// range `[local_start, local_start + local_count)` so this rank
-    /// holds only its partition of the MoE weights.
+    /// EP-aware load: reads ONLY experts `[local_start, local_start +
+    /// local_count)` directly from the mmap'd GGUF blob (no full-tensor
+    /// materialisation, no 2× VRAM spike). Router, shared expert, and
+    /// shared gate are loaded in full on every rank (replicated).
     ///
     /// Partition policy v1: contiguous block. Rank r owns experts
     /// `[r * block, min((r+1) * block, num_experts))` where
     /// `block = ceil(num_experts / world_size)`.
     ///
-    /// NB: the implementation loads the FULL tensor and then slices
-    /// (peak VRAM during load = 2× steady-state for that layer).
-    /// That's fine for gemma4-26B-class models where one layer's
-    /// experts are ~1.6 GB. For larger MoE models that don't fit
-    /// one-layer-at-a-time on a single GPU, X5 will add a GGUF-side
-    /// range reader so the full tensor never materialises.
+    /// Peak VRAM = steady-state: each rank allocates exactly its shard's
+    /// worth of expert bytes, nothing more. This is what unlocks
+    /// OOM-class MoE models (DeepSeek-V3-Lite, Kimi-K2.5) that cannot
+    /// fit the full expert tensor on any single MI50.
     #[cfg(feature = "hip")]
     pub fn load_ep(
         gg: &Gguf,
@@ -457,38 +658,112 @@ impl MoeExperts {
         cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
         rank: usize,
     ) -> Result<Self> {
-        let mut me = Self::load(gg, prefix, cfg)?;
-        let num_experts = me.down_exps.shape().dims()[0];
+        let num_experts_per_tok = cfg.expert_used_count.unwrap_or(1);
+
+        // --- Router (replicated across ranks). Same path as Self::load. ---
+        let mut router = gg.qmatmul(&format!("{prefix}.ffn_gate_inp.weight"))?;
+        if !router.is_qtensor()
+            && std::env::var("CANDLE_MOE_ROUTER_NO_REQUANT").is_err()
+        {
+            let dtype = match std::env::var("CANDLE_MOE_ROUTER_REQUANT_DTYPE")
+                .ok().as_deref()
+            {
+                Some("q4_0") => candle::quantized::GgmlDType::Q4_0,
+                Some("q4_1") => candle::quantized::GgmlDType::Q4_1,
+                Some("q5_0") => candle::quantized::GgmlDType::Q5_0,
+                _ => candle::quantized::GgmlDType::Q8_0,
+            };
+            let _ = router.requantize_to(dtype);
+        }
+
+        // --- Determine partition by peeking at the down_exps shape. ---
+        let down_exps_name = format!("{prefix}.ffn_down_exps.weight");
+        let down_info = gg
+            .ct
+            .tensor_infos
+            .get(&down_exps_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing {down_exps_name}")))?;
+        let num_experts = down_info.shape.dims()[0];
         let world = cluster.world_size();
         let block = (num_experts + world - 1) / world;
         let local_start = rank * block;
-        let local_count = (num_experts - local_start).min(block);
+        let local_count = num_experts.saturating_sub(local_start).min(block);
+
+        // Intermediate size derived from the FULL tensor shape (invariant
+        // across ranks); range-reading doesn't change dims[1].
+        let down_shape_full = down_info.shape.dims().to_vec();
+        let intermediate_size = if down_shape_full.len() == 3 {
+            down_shape_full[1]
+        } else {
+            cfg.feed_forward_length.unwrap_or(0)
+        };
+
         if local_count == 0 {
-            // Rank is past the end (W > num_experts). Leave weights alone
-            // but mark an empty partition; forward_ep returns zero.
-            me.ep_partition = Some(EpPartition {
-                cluster, rank, local_start, local_count, num_experts,
+            // Rank past the end (W > num_experts). Build with empty experts:
+            // forward_ep short-circuits on local_count==0.
+            //
+            // We still need SHAPE-valid expert tensors so broadcasting
+            // doesn't panic; read an empty range (byte_len=0) → QTensor
+            // with shape [0, ...].
+            let down_exps = std::sync::Arc::new(gg.tensor_expert_range(&down_exps_name, num_experts, 0)?);
+            let (gate_exps, up_exps, gate_up_exps) = if gg.has_tensor(&format!("{prefix}.ffn_gate_exps.weight")) {
+                let g = gg.tensor_expert_range(&format!("{prefix}.ffn_gate_exps.weight"), num_experts, 0)?;
+                let u = gg.tensor_expert_range(&format!("{prefix}.ffn_up_exps.weight"), num_experts, 0)?;
+                (Some(std::sync::Arc::new(g)), Some(std::sync::Arc::new(u)), None)
+            } else {
+                let gu = gg.tensor_expert_range(&format!("{prefix}.ffn_gate_up_exps.weight"), num_experts, 0)?;
+                (None, None, Some(std::sync::Arc::new(gu)))
+            };
+
+            let (shared, shared_gate_weight) = load_shared_expert(gg, prefix)?;
+
+            return Ok(Self {
+                router,
+                up_exps, gate_exps, gate_up_exps, down_exps,
+                num_experts_per_tok, intermediate_size,
+                shared, shared_gate_weight,
+                ep_partition: Some(EpPartition {
+                    cluster, rank, local_start, local_count, num_experts,
+                }),
             });
-            return Ok(me);
         }
 
-        // Actually narrow each expert tensor to the local range.
-        // Drops the full tensor once the narrow Arc replaces it.
-        me.down_exps = std::sync::Arc::new(me.down_exps.narrow_experts(local_start, local_count)?);
-        if let Some(ref gu) = me.gate_up_exps.clone() {
-            me.gate_up_exps = Some(std::sync::Arc::new(gu.narrow_experts(local_start, local_count)?));
-        }
-        if let Some(ref g) = me.gate_exps.clone() {
-            me.gate_exps = Some(std::sync::Arc::new(g.narrow_experts(local_start, local_count)?));
-        }
-        if let Some(ref u) = me.up_exps.clone() {
-            me.up_exps = Some(std::sync::Arc::new(u.narrow_experts(local_start, local_count)?));
-        }
+        // --- Range-read expert tensors (this rank's shard only). ---
+        let down_exps = std::sync::Arc::new(
+            gg.tensor_expert_range(&down_exps_name, local_start, local_count)?,
+        );
+        let (gate_exps, up_exps, gate_up_exps) = if gg.has_tensor(&format!("{prefix}.ffn_gate_exps.weight")) {
+            let g = gg.tensor_expert_range(
+                &format!("{prefix}.ffn_gate_exps.weight"),
+                local_start, local_count,
+            )?;
+            let u = gg.tensor_expert_range(
+                &format!("{prefix}.ffn_up_exps.weight"),
+                local_start, local_count,
+            )?;
+            (Some(std::sync::Arc::new(g)), Some(std::sync::Arc::new(u)), None)
+        } else if gg.has_tensor(&format!("{prefix}.ffn_gate_up_exps.weight")) {
+            let gu = gg.tensor_expert_range(
+                &format!("{prefix}.ffn_gate_up_exps.weight"),
+                local_start, local_count,
+            )?;
+            (None, None, Some(std::sync::Arc::new(gu)))
+        } else {
+            candle::bail!("MoE layer at {prefix} has neither gate_exps nor gate_up_exps");
+        };
 
-        me.ep_partition = Some(EpPartition {
-            cluster, rank, local_start, local_count, num_experts,
-        });
-        Ok(me)
+        // --- Shared expert + gate (replicated across ranks). ---
+        let (shared, shared_gate_weight) = load_shared_expert(gg, prefix)?;
+
+        Ok(Self {
+            router,
+            up_exps, gate_exps, gate_up_exps, down_exps,
+            num_experts_per_tok, intermediate_size,
+            shared, shared_gate_weight,
+            ep_partition: Some(EpPartition {
+                cluster, rank, local_start, local_count, num_experts,
+            }),
+        })
     }
 
     /// Phase O1 fast path: pre-quantise x to Q8_1 once and feed BOTH the
@@ -617,13 +892,61 @@ impl MoeExperts {
 
         let moe_out = if let Some(ref gate_exps) = self.gate_exps {
             let up_exps = self.up_exps.as_ref().unwrap();
-            let gate_out =
-                gate_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
-            let up_out =
-                up_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
-            let activated = candle_nn::ops::silu_mul(&gate_out, &up_out)?;
-            self.down_exps
-                .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?
+            // P21: try the fused gate+up kernel first (one launch for both
+            // outputs instead of two). Falls through to sequential calls
+            // when dtype/shape isn't supported.
+            let (gate_out, up_out) = match gate_exps
+                .indexed_moe_gate_up_forward_preq8(up_exps, &q8_view, &in_shape, &topk_ids)?
+            {
+                Some((g, u)) => (g, u),
+                None => {
+                    let g = gate_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
+                    let u = up_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
+                    (g, u)
+                }
+            };
+            // P25: try fused silu_mul + quantize_q8_1 → down preq8
+            // (single kernel instead of silu_mul + contiguous + internal
+            // requantise inside indexed_moe_forward).  Falls back to the
+            // legacy 3-kernel path if the gate/up shapes / dtypes don't
+            // match what the kernel expects, or env opt-out.
+            #[cfg(feature = "hip")]
+            let try_p25 = matches!(gate_out.device(), candle::Device::Hip(_))
+                && gate_out.dtype() == candle::DType::F32
+                && up_out.dtype() == candle::DType::F32
+                && gate_out.rank() == 3
+                && self.intermediate_size % 32 == 0
+                && std::env::var("CANDLE_MOE_DOWN_FUSED_SILU").as_deref() != Ok("0");
+            #[cfg(not(feature = "hip"))]
+            let try_p25 = false;
+            let used_p25 = if try_p25 {
+                #[cfg(feature = "hip")]
+                {
+                    let g_c = gate_out.contiguous()?;
+                    let u_c = up_out.contiguous()?;
+                    match candle::hip_backend::silu_mul_quantize_q8_1_separate_fused(&g_c, &u_c) {
+                        Ok((q8_buf, q8_shape)) => {
+                            let q8_view = q8_buf.slice(0..q8_buf.len());
+                            Some(self.down_exps.indexed_moe_forward_preq8(
+                                &q8_view, &q8_shape, &topk_ids,
+                            )?)
+                        }
+                        Err(_) => None,
+                    }
+                }
+                #[cfg(not(feature = "hip"))]
+                None
+            } else {
+                None
+            };
+            match used_p25 {
+                Some(out) => out,
+                None => {
+                    let activated = candle_nn::ops::silu_mul(&gate_out, &up_out)?;
+                    self.down_exps
+                        .indexed_moe_forward(&activated.contiguous()?, &topk_ids)?
+                }
+            }
         } else if let Some(ref gate_up_exps) = self.gate_up_exps {
             let gate_up =
                 gate_up_exps.indexed_moe_forward_preq8(&q8_view, &in_shape, &topk_ids)?;
@@ -646,9 +969,35 @@ impl MoeExperts {
         #[cfg(feature = "hip")]
         candle::quantized::hip::w3_cached_ids_clear();
 
-        let topk_weights = topk_weights.unsqueeze(D::Minus1)?;
-        let weighted = moe_out.broadcast_mul(&topk_weights)?;
-        let mut result = weighted.sum(1)?;
+        // W3a (C1): prefer fused `moe_combine_weighted_sum_fused` on HIP —
+        // replaces broadcast_mul + sum(1) with a single kernel launch.
+        // Kill-switch CANDLE_W3A_COMBINE=0 restores the unfused path.
+        let mut result = {
+            #[cfg(feature = "hip")]
+            let try_fused =
+                matches!(moe_out.device(), candle::Device::Hip(_))
+                && moe_out.dtype() == candle::DType::F32
+                && topk_weights.dtype() == candle::DType::F32
+                && moe_out.rank() == 3
+                && topk_weights.rank() == 2
+                && std::env::var("CANDLE_W3A_COMBINE").as_deref() != Ok("0");
+            #[cfg(not(feature = "hip"))]
+            let try_fused = false;
+            if try_fused {
+                #[cfg(feature = "hip")]
+                {
+                    let moe_out_c = moe_out.contiguous()?;
+                    let topk_w_c = topk_weights.contiguous()?;
+                    candle::hip_backend::moe_combine_weighted_sum_fused(&moe_out_c, &topk_w_c)?
+                }
+                #[cfg(not(feature = "hip"))]
+                unreachable!()
+            } else {
+                let topk_weights_u = topk_weights.unsqueeze(D::Minus1)?;
+                let weighted = moe_out.broadcast_mul(&topk_weights_u)?;
+                weighted.sum(1)?
+            }
+        };
 
         if let Some(ref shared_mlp) = self.shared {
             let shared_out = shared_mlp.forward(&x_flat)?;
@@ -658,6 +1007,22 @@ impl MoeExperts {
                 } else {
                     sg_weight.to_device(x_flat.device())?
                 };
+                // P28: fused dot replaces broadcast_mul + sum_keepdim (2
+                // kernels → 1) when both are on HIP and f32.
+                #[cfg(feature = "hip")]
+                let gate_logits = if matches!(x_flat.device(), candle::Device::Hip(_))
+                    && x_flat.dtype() == candle::DType::F32
+                    && sg.dtype() == candle::DType::F32
+                    && x_flat.is_contiguous()
+                    && sg.is_contiguous()
+                    && sg.rank() == 1
+                    && std::env::var("CANDLE_DOT_LAST_DIM_FUSED").as_deref() == Ok("1")
+                {
+                    candle::hip_backend::dot_last_dim_fused(&x_flat, &sg)?
+                } else {
+                    x_flat.broadcast_mul(&sg)?.sum_keepdim(D::Minus1)?
+                };
+                #[cfg(not(feature = "hip"))]
                 let gate_logits = x_flat.broadcast_mul(&sg)?.sum_keepdim(D::Minus1)?;
                 let gate = candle_nn::ops::sigmoid(&gate_logits)?;
                 shared_out.broadcast_mul(&gate)?
@@ -714,6 +1079,22 @@ impl MoeExperts {
     /// - topk_ids are remapped to local indices: global_id - local_start
     ///   if in range, else 0 (safe dummy; corresponding weight = 0).
     /// - Uses the same Q8_1 shared-input fast path as `forward_shared_q8_decode`.
+    ///
+    /// `forward_ep` returns the PARTIAL MoE output (this rank's
+    /// contribution). For multi-threaded TP+EP forward the caller wants
+    /// the FULL (summed) output on every rank — see
+    /// [`Self::forward_ep_reduced`] which wraps `forward_ep` with the
+    /// barrier all-reduce.
+    #[cfg(feature = "hip")]
+    pub fn forward_ep_reduced(&self, x: &Tensor) -> Result<Tensor> {
+        let partial = self.forward_ep(x)?;
+        if let Some(ref ep) = self.ep_partition {
+            super::attention::all_reduce_sum_tensor(&ep.cluster, ep.rank, &partial)
+        } else {
+            Ok(partial)
+        }
+    }
+
     #[cfg(feature = "hip")]
     pub fn forward_ep(&self, x: &Tensor) -> Result<Tensor> {
         use candle::quantized::hip::{pad, quantize_q8_1, MATRIX_ROW_PADDING};
@@ -874,6 +1255,20 @@ impl MoeExperts {
                     } else {
                         sg_weight.to_device(x_flat.device())?
                     };
+                    #[cfg(feature = "hip")]
+                    let gate_logits = if matches!(x_flat.device(), candle::Device::Hip(_))
+                        && x_flat.dtype() == candle::DType::F32
+                        && sg.dtype() == candle::DType::F32
+                        && x_flat.is_contiguous()
+                        && sg.is_contiguous()
+                        && sg.rank() == 1
+                        && std::env::var("CANDLE_DOT_LAST_DIM_FUSED").as_deref() == Ok("1")
+                    {
+                        candle::hip_backend::dot_last_dim_fused(&x_flat, &sg)?
+                    } else {
+                        x_flat.broadcast_mul(&sg)?.sum_keepdim(D::Minus1)?
+                    };
+                    #[cfg(not(feature = "hip"))]
                     let gate_logits = x_flat.broadcast_mul(&sg)?.sum_keepdim(D::Minus1)?;
                     let gate = candle_nn::ops::sigmoid(&gate_logits)?;
                     shared_out.broadcast_mul(&gate)?
@@ -969,10 +1364,33 @@ impl MoeExperts {
             candle::bail!("MoE has no expert weights");
         };
 
-        // Weight and sum across topk
-        let topk_weights = topk_weights.unsqueeze(D::Minus1)?;
-        let weighted = moe_out.broadcast_mul(&topk_weights)?;
-        let mut result = weighted.sum(1)?; // sum across topk dim
+        // W3a (C1): fused combine on HIP — see line 926 for detail.
+        let mut result = {
+            #[cfg(feature = "hip")]
+            let try_fused =
+                matches!(moe_out.device(), candle::Device::Hip(_))
+                && moe_out.dtype() == candle::DType::F32
+                && topk_weights.dtype() == candle::DType::F32
+                && moe_out.rank() == 3
+                && topk_weights.rank() == 2
+                && std::env::var("CANDLE_W3A_COMBINE").as_deref() != Ok("0");
+            #[cfg(not(feature = "hip"))]
+            let try_fused = false;
+            if try_fused {
+                #[cfg(feature = "hip")]
+                {
+                    let moe_out_c = moe_out.contiguous()?;
+                    let topk_w_c = topk_weights.contiguous()?;
+                    candle::hip_backend::moe_combine_weighted_sum_fused(&moe_out_c, &topk_w_c)?
+                }
+                #[cfg(not(feature = "hip"))]
+                unreachable!()
+            } else {
+                let topk_weights_u = topk_weights.unsqueeze(D::Minus1)?;
+                let weighted = moe_out.broadcast_mul(&topk_weights_u)?;
+                weighted.sum(1)?
+            }
+        };
 
         // Add shared expert output if present
         if let Some(ref shared_mlp) = self.shared {

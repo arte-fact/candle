@@ -30,6 +30,94 @@
 #include <stdint.h>
 
 // ================================================================
+// D3 (2026-04-20): gfx906 L2-prefetch helpers, ported from
+// llamacpp-turbo gfx906/matmul/mmq-prefetch.cuh. Warp 0 lanes 0-15
+// issue `global_load_dword` for next iteration's Y tile; warp 1
+// lanes 0-15 do the same for the next X tile. The returned dummy
+// value is consumed by `gfx906_prefetch_consume` (a self-move) to
+// prevent the compiler from eliminating the load.
+// ================================================================
+#if defined(__gfx906__)
+
+template <int mmq_x, int mmq_tile_y_k, int nwarps, int warp_size_>
+static __device__ __forceinline__ int gfx906_prefetch_y_tile(
+    const int * __restrict__ y,
+    const int ncols_y,
+    const int kb0,
+    const int kb0_stop,
+    const int qk,
+    const int blocks_per_iter) {
+
+    const int kb0_next = kb0 + blocks_per_iter;
+    if (kb0_next >= kb0_stop) return 0;
+
+    constexpr int block_q8_1_mmq_bytes = 144;
+    constexpr int QK8_1_val = 32;
+    const int stride_factor =
+        qk * block_q8_1_mmq_bytes / (4 * QK8_1_val * (int) sizeof(int));
+
+    const int * by_next = y + ncols_y * (kb0_next * stride_factor);
+
+    const int lane_id = threadIdx.x;
+    if (threadIdx.y != 0 || lane_id >= 16) return 0;
+
+    const int prefetch_offset = lane_id * 16;
+    const int * prefetch_addr = by_next + prefetch_offset;
+
+    int prefetch_data;
+    asm volatile(
+        "global_load_dword %0, %1, off\n"
+        : "=v"(prefetch_data)
+        : "v"(prefetch_addr)
+        : "memory");
+    return prefetch_data;
+}
+
+template <int mmq_y_>
+static __device__ __forceinline__ int gfx906_prefetch_x_tile(
+    const char * __restrict__ x,
+    const int offset_x,
+    const int kb0,
+    const int kb0_stop,
+    const int blocks_per_iter,
+    const int stride_row_x) {
+
+    const int kb0_next = kb0 + blocks_per_iter;
+    if (kb0_next >= kb0_stop) return 0;
+
+    const int lane_id = threadIdx.x;
+    if (threadIdx.y != 1 || lane_id >= 16) return 0;
+
+    const int row = lane_id;
+    const char * x_row = x + (offset_x + kb0_next) + row * stride_row_x;
+    const int  * x_ptr = (const int *) x_row;
+
+    int prefetch_data;
+    asm volatile(
+        "global_load_dword %0, %1, off\n"
+        : "=v"(prefetch_data)
+        : "v"(x_ptr)
+        : "memory");
+    return prefetch_data;
+}
+
+static __device__ __forceinline__ void gfx906_prefetch_consume(int v) {
+    asm volatile("v_mov_b32 %0, %0\n" : "+v"(v));
+}
+
+#else  // !__gfx906__
+
+template <int mmq_x, int mmq_tile_y_k, int nwarps, int warp_size_>
+static __device__ __forceinline__ int gfx906_prefetch_y_tile(
+    const int *, int, int, int, int, int) { return 0; }
+template <int mmq_y_>
+static __device__ __forceinline__ int gfx906_prefetch_x_tile(
+    const char *, int, int, int, int, int) { return 0; }
+static __device__ __forceinline__ void gfx906_prefetch_consume(int) {}
+
+#endif  // __gfx906__
+
+// ================================================================
 // Block layouts
 // ================================================================
 
@@ -1623,8 +1711,10 @@ static __device__ void mul_mat_q4_K_turbo_moe_impl(
             }
         }
 
-        float sumf_d[TILE_N] = {0.0f};
-        float sumf_m[TILE_N] = {0.0f};
+        // v3 merged-accumulator pattern (ported from Q5_K v3, 2026-04-19).
+        // No sumf_d[TILE_N] / sumf_m[TILE_N] intermediates. Per-sub contribution
+        // is folded directly into sums[c] via pre-combined scd = super_d * sc_f
+        // and smm = super_dmin * m_f. Saves 2×TILE_N VGPRs of intermediates.
 
         #pragma unroll
         for (int sub = 0; sub < 8; ++sub) {
@@ -1641,8 +1731,10 @@ static __device__ void mul_mat_q4_K_turbo_moe_impl(
                         : ((ql_word >> 4) & 0x0F0F0F0F);
                 }
             }
-            const float sc_f = (float) sub_sc[sub];
-            const float m_f  = (float) sub_m [sub];
+            // Pre-combine super-level scales with per-sub scales so the
+            // column loop only adds `d8 * (scd * sumi_d - smm * sumi_y)`.
+            const float scd = super_d    * (float) sub_sc[sub];
+            const float smm = super_dmin * (float) sub_m [sub];
 
             const int big_y      = 2 * ib + (sub >> 2);
             const int within_big = sub & 3;
@@ -1670,14 +1762,8 @@ static __device__ void mul_mat_q4_K_turbo_moe_impl(
                     sumi_d = dp4a_sdot4(v[j], y_j, sumi_d);
                     sumi_y = dp4a_sdot4(0x01010101, y_j, sumi_y);
                 }
-                sumf_d[c] += d8 * ((float) sumi_d) * sc_f;
-                sumf_m[c] += d8 * ((float) sumi_y) * m_f;
+                sums[c] += d8 * (scd * (float) sumi_d - smm * (float) sumi_y);
             }
-        }
-
-        #pragma unroll
-        for (int c = 0; c < TILE_N; ++c) {
-            sums[c] += super_d * sumf_d[c] - super_dmin * sumf_m[c];
         }
     }
 
@@ -1721,6 +1807,864 @@ MMQ_TURBO_MOE_Q4K_EXPORT(64, false, unchecked)
 MMQ_TURBO_MOE_Q4K_EXPORT(64, true,  checked)
 
 #undef MMQ_TURBO_MOE_Q4K_EXPORT
+
+// ================================================================
+// P37 (2026-04-20): DENSE Q4_K turbo MMQ. Port of the MoE Q4_K turbo
+// with MoE-specific bits (ids_dst, expert_bounds, per-expert x_offset)
+// stripped. Kernel body is otherwise identical — 64 threads per block,
+// each owns one output row × TILE_N columns, reads Y directly from the
+// (big_block, col) layout produced by `quantize_q8_1_mmq_q4_0`.
+//
+// Layout:
+//   vx : [nrows_x * blocks_per_row_x] block_q4_K (== block_q4_K_moe,
+//         both are 144-byte half2+12+128 layout).
+//   vy : [big_blocks, total_b_padded] × 144-byte Q8_1 MMQ blocks
+//         (produced by `quantize_q8_1_mmq_q4_0` — dense Y quantizer).
+//   dst: [nrows_x × total_b] F32 column-major output.
+//
+// Grid: (ceil(nrows_x / WARP_SIZE), ceil(total_b / TILE_N), 1).
+// Block: (64, 1, 1).
+template <int TILE_N, bool need_check>
+static __device__ void mul_mat_q4_K_turbo_dense_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float      * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int stride_col_y,
+    const int stride_row_x,             // = ncols_x / QK_K_Q4K_MOE (k/256)
+    const int total_b,                  // active columns (non-padded)
+    const int nrows_dst) {
+
+    const int tid = threadIdx.x;        // 0..63
+    const int it  = blockIdx.x;
+    const int jt  = blockIdx.y;
+    if (jt * TILE_N >= total_b) return;
+
+    const int row        = it * WARP_SIZE + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_K_moe * x = (const block_q4_K_moe *) vx;
+    const int blocks_per_row = stride_row_x;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row; ++ib) {
+        float super_d = 0.0f, super_dmin = 0.0f;
+        uint8_t sub_sc[8] = {0};
+        uint8_t sub_m [8] = {0};
+        const block_q4_K_moe * bx = nullptr;
+        if (row_valid) {
+            bx = &x[row * blocks_per_row + ib];
+            const float2 dmf = __half22float2(bx->dm);
+            super_d    = dmf.x;
+            super_dmin = dmf.y;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int ksc = j;
+                if (ksc < 4) {
+                    sub_sc[j] = bx->scales[ksc]     & 63;
+                    sub_m [j] = bx->scales[ksc + 4] & 63;
+                } else {
+                    sub_sc[j] = (bx->scales[ksc + 4] & 0xF) | ((bx->scales[ksc - 4] >> 6) << 4);
+                    sub_m [j] = (bx->scales[ksc + 4] >>  4) | ((bx->scales[ksc - 0] >> 6) << 4);
+                }
+            }
+        }
+
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const int il   = sub >> 1;
+            const int half = sub & 1;
+            int v[8] = {0};
+            if (row_valid) {
+                const int * ql_ptr = (const int *)(bx->qs + 32 * il);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int ql_word = ql_ptr[j];
+                    v[j] = (half == 0)
+                        ? (ql_word & 0x0F0F0F0F)
+                        : ((ql_word >> 4) & 0x0F0F0F0F);
+                }
+            }
+            const float scd = super_d    * (float) sub_sc[sub];
+            const float smm = super_dmin * (float) sub_m [sub];
+
+            const int big_y      = 2 * ib + (sub >> 2);
+            const int within_big = sub & 3;
+
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int local_j = jt * TILE_N + c;
+                if (local_j >= total_b) continue;
+                // Dense: direct col position, no gather/bucket indirection.
+                const uint8_t * y_bytes = (const uint8_t *) vy
+                    + ((size_t) big_y * stride_col_y + local_j)
+                      * Q8_1_MMQ_BYTES;
+                const half2 * ds = (const half2 *) y_bytes;
+                const int   * qs = (const int   *)(y_bytes + 16);
+
+                const half2   ds8   = ds[within_big];
+                const int   * qs_sub = qs + within_big * 8;
+                const float   d8     = __half2float(__low2half(ds8));
+
+                int sumi_d = 0, sumi_y = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int y_j = qs_sub[j];
+                    sumi_d = dp4a_sdot4(v[j], y_j, sumi_d);
+                    sumi_y = dp4a_sdot4(0x01010101, y_j, sumi_y);
+                }
+                sums[c] += d8 * (scd * (float) sumi_d - smm * (float) sumi_y);
+            }
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int local_j = jt * TILE_N + c;
+        if (local_j >= total_b) continue;
+        if (need_check && row >= nrows_dst) continue;
+        // Dense: dst layout is column-major (total_b rows of nrows_dst floats).
+        dst[(size_t) local_j * nrows_dst + row] = sums[c];
+    }
+}
+
+#define MMQ_TURBO_DENSE_Q4K_EXPORT(MMQ_X, CHECK, SUFFIX)                    \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE, 1)                                         \
+    void mul_mat_q4_K_turbo_dense_x##MMQ_X##_##SUFFIX(                      \
+        const void * __restrict__ vx,                                       \
+        const void * __restrict__ vy,                                       \
+        float      * __restrict__ dst,                                      \
+        const int ncols_x, const int nrows_x,                               \
+        const int stride_col_y, const int stride_row_x,                     \
+        const int total_b, const int nrows_dst) {                           \
+        mul_mat_q4_K_turbo_dense_impl<MMQ_X, CHECK>(                        \
+            vx, vy, dst, ncols_x, nrows_x,                                  \
+            stride_col_y, stride_row_x, total_b, nrows_dst);                \
+    }
+
+MMQ_TURBO_DENSE_Q4K_EXPORT( 8, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_EXPORT( 8, true,  checked)
+MMQ_TURBO_DENSE_Q4K_EXPORT(16, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_EXPORT(16, true,  checked)
+MMQ_TURBO_DENSE_Q4K_EXPORT(32, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_EXPORT(32, true,  checked)
+MMQ_TURBO_DENSE_Q4K_EXPORT(64, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_EXPORT(64, true,  checked)
+
+#undef MMQ_TURBO_DENSE_Q4K_EXPORT
+
+// ================================================================
+// D1.5: mmq_y=128 variants of load_tiles_q4_K / vec_dot_q4_K for the
+// 4-warp dense path. Turbo uses mmq_y=128 (128 rows per block) on
+// gfx906; our MoE helpers are hardcoded to MMQ_Y_Q8=64, so we can't
+// reuse them for the taller tile. Structure is identical — just the
+// compile-time row count changes. Keeps MoE path bit-for-bit the same.
+//
+// LDS layout for mmq_y=128:
+//   x_qs: 128 * (MMQ_TILE_NE_K + 1)            = 128 * 33 = 4224 ints
+//   x_dm: 128 half2                            = 64 ints-worth
+//   x_sc: 128 * (MMQ_TILE_NE_K/8) + 128/8      = 128 * 4 + 16 = 528 ints
+//
+// Occupancy check: mmq_x=16 tile_y=pad(16*36,256)=768 ints. Total
+// 768+4224+528+528 = 6048 ints = 24 192 B/block. At 2 blocks/CU →
+// 48 384 B LDS (fits in gfx906's 64 KB LDS/CU).
+// ================================================================
+
+template <bool need_check>
+static __device__ __forceinline__ void load_tiles_q4_K_y128(
+    const char * __restrict__ x,
+    int *        __restrict__ x_qs,
+    half2 *      __restrict__ x_dm,
+    int *        __restrict__ x_sc,
+    const int kbx0,
+    const int i_max,
+    const int stride_row_x) {
+
+    constexpr int mmq_y = 128;
+
+    // qs: 32 ints per row, 32 threads per row, 2 rows per warp.
+    constexpr int threads_per_row = 32;
+    constexpr int nrows           = WARP_SIZE / threads_per_row;  // 2
+    const int txi = threadIdx.x % threads_per_row;
+
+    #pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows * MMQ_NWARPS) {
+        int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        if (need_check) i = min(i, i_max);
+        const block_q4_K_moe * bxi =
+            (const block_q4_K_moe *) x + kbx0 + i * stride_row_x;
+        const int * qs_src = (const int *) bxi->qs;
+        x_qs[i * (MMQ_TILE_NE_K + 1) + txi] = qs_src[txi];
+    }
+
+    // dm: 1 half2 per row, 256 threads in flight → 2 iters @ mmq_y=128.
+    #pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += MMQ_NWARPS * WARP_SIZE) {
+        int i = (i0 + threadIdx.y * WARP_SIZE + threadIdx.x) % mmq_y;
+        if (need_check) i = min(i, i_max);
+        const block_q4_K_moe * bxi =
+            (const block_q4_K_moe *) x + kbx0 + i * stride_row_x;
+        x_dm[i] = bxi->dm;
+    }
+
+    // scales: 4 ints per row, 16 rows per warp, 64 rows per iter across 4 warps.
+    constexpr int ksc_per_row   = MMQ_TILE_NE_K / 8;   // 4
+    constexpr int rows_per_warp = WARP_SIZE / ksc_per_row;  // 16
+    #pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += MMQ_NWARPS * rows_per_warp) {
+        int i = (i0 + threadIdx.y * rows_per_warp + threadIdx.x / ksc_per_row) % mmq_y;
+        if (need_check) i = min(i, i_max);
+        const block_q4_K_moe * bxi =
+            (const block_q4_K_moe *) x + kbx0 + i * stride_row_x;
+        const int ksc = threadIdx.x % ksc_per_row;
+        const int * scales = (const int *) bxi->scales;
+        const int scales8  = unpack_scales_q45_K_moe(scales, ksc);
+        x_sc[i * ksc_per_row + i / 8 + ksc] = scales8;
+    }
+}
+
+template <int mmq_x>
+static __device__ __forceinline__ void vec_dot_q4_K_q8_1_dp4a_y128(
+    const int   * __restrict__ x_qs,
+    const half2 * __restrict__ x_dm,
+    const int   * __restrict__ x_sc,
+    const int   * __restrict__ tile_y,
+    float       * __restrict__ sum,
+    const int k00) {
+
+    constexpr int mmq_y = 128;
+    const int   * y_qs = tile_y + 4;
+    const half2 * y_ds = (const half2 *) tile_y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR4_K_Q4K_MOE * VDR_Q4_K_Q8_1_MMQ_MOE) {
+        const int k0 = k00 + k01;
+
+        #pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+            const int j = j0 + threadIdx.y;
+
+            #pragma unroll
+            for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+
+                const uint8_t * sc =
+                    (const uint8_t *) &x_sc[i * (MMQ_TILE_NE_K / 8) + i / 8 + k0 / 32]
+                    + 2 * (k01 / 16);
+
+                const int   * v  = &x_qs[i * (MMQ_TILE_NE_K + 1) + k0 / 2];
+                const int   * u  = &y_qs[j * MMQ_TILE_Y_K + k01];
+                const half2 * ds = &y_ds[j * MMQ_TILE_Y_K + k01 / QI8_1];
+
+                sum[(j0 / MMQ_NWARPS) * (mmq_y / WARP_SIZE) + i0 / WARP_SIZE] +=
+                    q4_K_q8_1_dp4a_impl(v, u, sc, sc + 8, x_dm[i], ds);
+            }
+        }
+    }
+}
+
+template <int mmq_x, bool need_check>
+static __device__ void mul_mat_q4_K_turbo_dense_4warp_y128_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float      * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int stride_col_y,
+    const int stride_row_x,
+    const int total_b,
+    const int nrows_dst) {
+
+    constexpr int MMQ_Y_R        = 128;
+    constexpr int X_QS_INTS_Y128 = MMQ_Y_R * (MMQ_TILE_NE_K + 1);       // 4224
+    constexpr int X_DM_RESERVE   = MMQ_Y_R * 8 + MMQ_Y_R / 4;            // 1056 ints worth
+    constexpr int X_SC_INTS_Y128 = MMQ_Y_R * (MMQ_TILE_NE_K / 8) + MMQ_Y_R / 8; // 528
+
+    extern __shared__ int shared_buf[];
+    int   * tile_y = shared_buf;
+    int   * x_qs   = tile_y + GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+    half2 * x_dm   = (half2 *) (x_qs + X_QS_INTS_Y128);
+    int   * x_sc   = (int *) (x_qs + X_QS_INTS_Y128) + X_DM_RESERVE;
+
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+    if (jt * mmq_x >= total_b) return;
+
+    const int * y_base = (const int *) vy + (jt * mmq_x) * Q8_1_MMQ_INTS;
+
+    constexpr int sum_slots = mmq_x * MMQ_Y_R / (MMQ_NWARPS * WARP_SIZE);
+    float sum[sum_slots];
+    #pragma unroll
+    for (int s = 0; s < sum_slots; ++s) sum[s] = 0.0f;
+
+    constexpr int blocks_per_iter = 1;  // Q4_K: 1 superblock per outer iter
+    const int n_blocks_x = ncols_x / QK_K_Q4K_MOE;
+    const int n_outer    = n_blocks_x;
+    const int i_max      = nrows_x - it * MMQ_Y_R - 1;
+
+    constexpr int TILE_Y_INTS =
+        GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+
+    for (int outer = 0; outer < n_outer; ++outer) {
+        const int kb0 = outer * blocks_per_iter;
+        const int kbx0 = it * MMQ_Y_R * stride_row_x + kb0;
+        const int i_max_arg = need_check ? i_max : 0;
+
+        load_tiles_q4_K_y128<need_check>(
+            (const char *) vx, x_qs, x_dm, x_sc, kbx0, i_max_arg, stride_row_x);
+
+        const int y_big_base = outer * 2;
+
+        const int * by0 =
+            y_base + (size_t) stride_col_y * y_big_base * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) {
+                tile_y[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        vec_dot_q4_K_q8_1_dp4a_y128<mmq_x>(x_qs, x_dm, x_sc, tile_y, sum, 0);
+        __syncthreads();
+
+        const int * by1 =
+            y_base + (size_t) stride_col_y * (y_big_base + 1) * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) {
+                tile_y[l] = by1[l];
+            }
+        }
+        __syncthreads();
+        vec_dot_q4_K_q8_1_dp4a_y128<mmq_x>(x_qs, x_dm, x_sc, tile_y, sum, MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+        const int j       = j0 + threadIdx.y;
+        const int local_j = jt * mmq_x + j;
+        if (local_j >= total_b) continue;
+        #pragma unroll
+        for (int i0 = 0; i0 < MMQ_Y_R; i0 += WARP_SIZE) {
+            const int i     = i0 + threadIdx.x;
+            const int row_g = it * MMQ_Y_R + i;
+            if (need_check && row_g >= nrows_dst) continue;
+            dst[(size_t) local_j * nrows_dst + row_g] =
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y_R / WARP_SIZE) + i0 / WARP_SIZE];
+        }
+    }
+}
+
+#define MMQ_TURBO_DENSE_Q4K_4WARP_Y128_EXPORT(MMQ_X, CHECK, SUFFIX)         \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                            \
+    void mul_mat_q4_K_turbo_dense_4warp_y128_x##MMQ_X##_##SUFFIX(           \
+        const void * __restrict__ vx,                                       \
+        const void * __restrict__ vy,                                       \
+        float      * __restrict__ dst,                                      \
+        const int ncols_x, const int nrows_x,                               \
+        const int stride_col_y, const int stride_row_x,                     \
+        const int total_b, const int nrows_dst) {                           \
+        mul_mat_q4_K_turbo_dense_4warp_y128_impl<MMQ_X, CHECK>(             \
+            vx, vy, dst, ncols_x, nrows_x,                                  \
+            stride_col_y, stride_row_x, total_b, nrows_dst);                \
+    }
+
+MMQ_TURBO_DENSE_Q4K_4WARP_Y128_EXPORT( 8, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_4WARP_Y128_EXPORT( 8, true,  checked)
+MMQ_TURBO_DENSE_Q4K_4WARP_Y128_EXPORT(16, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_4WARP_Y128_EXPORT(16, true,  checked)
+
+#undef MMQ_TURBO_DENSE_Q4K_4WARP_Y128_EXPORT
+
+// ================================================================
+// D1: Q4_K 4-warp LDS-tiled dense MMQ — strips MoE indirection from
+// mul_mat_q_turbo_moe_impl<MOE_Q4_K, ...> to create a dense-matmul
+// driver. Reuses the existing load_tiles_q4_K_moe + vec_dot_q4_K_
+// q8_1_dp4a_moe helpers unchanged — they operate per-row and know
+// nothing about MoE. What changes: no col_low/col_high lookup, no
+// ids_dst, no blockIdx.z expert slab, Y base derived directly from
+// (jt * mmq_x), write-back to dst[local_j * nrows_dst + row].
+//
+// Target: Devstral-24B Q4_K_M prefill. Replaces single-warp turbo_
+// dense_x8 (99 VGPR, 64-thread WG, L1-only Y reuse). With 4 warps
+// cooperating on LDS-staged X + Y tiles we expect to close most of
+// the 2.81× per-call gap vs llama.cpp's mul_mat_q<Q4_K, 8, false>.
+// ================================================================
+
+template <int mmq_x, bool need_check>
+static __device__ void mul_mat_q4_K_turbo_dense_4warp_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float      * __restrict__ dst,
+    const int ncols_x,                    // K (in elements)
+    const int nrows_x,                    // N (rows of weight)
+    const int stride_col_y,               // = total_b_padded (big-block stride)
+    const int stride_row_x,               // = ncols_x / QK_K_Q4K_MOE
+    const int total_b,                    // active columns (non-padded)
+    const int nrows_dst) {                // = nrows_x for dense
+
+    using Tr = moe_dtype_traits<MOE_Q4_K>;
+    constexpr int MMQ_Y_R   = Tr::mmq_y;       // 64
+    constexpr int X_QS_T    = Tr::x_qs_ints;   // 64 * 33
+    constexpr int X_DM_RESERVE = MMQ_Y_R * 8 + MMQ_Y_R / 4;
+
+    extern __shared__ int shared_buf[];
+    int   * tile_y = shared_buf;
+    int   * x_qs   = tile_y + GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+    half2 * x_dm   = (half2 *) (x_qs + X_QS_T);
+    int   * x_sc   = (int *)(x_qs + X_QS_T) + X_DM_RESERVE;
+
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+    if (jt * mmq_x >= total_b) return;
+
+    const int * y_base = (const int *) vy + (jt * mmq_x) * Q8_1_MMQ_INTS;
+
+    constexpr int sum_slots = mmq_x * MMQ_Y_R / (MMQ_NWARPS * WARP_SIZE);
+    float sum[sum_slots];
+    #pragma unroll
+    for (int s = 0; s < sum_slots; ++s) sum[s] = 0.0f;
+
+    constexpr int blocks_per_iter = Tr::elems_per_outer_iter / Tr::qk;  // = 1
+    const int n_blocks_x = ncols_x / Tr::qk;
+    const int n_outer    = (n_blocks_x + blocks_per_iter - 1) / blocks_per_iter;
+    const int i_max      = nrows_x - it * MMQ_Y_R - 1;
+
+    constexpr int TILE_Y_INTS =
+        GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+
+    for (int outer = 0; outer < n_outer; ++outer) {
+        const int kb0 = outer * blocks_per_iter;
+        const int kbx0 = it * MMQ_Y_R * stride_row_x + kb0;
+        const int i_max_arg = need_check ? i_max : 0;
+
+        load_tiles_q4_K_moe<need_check>(
+            (const char *) vx, x_qs, x_dm, x_sc, kbx0, i_max_arg, stride_row_x);
+
+        const int y_big_base = outer * 2;
+
+        const int * by0 =
+            y_base + (size_t) stride_col_y * y_big_base * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) {
+                tile_y[l] = by0[l];
+            }
+        }
+        __syncthreads();
+        // D3 L2-prefetch: measured +16% slower per-call on Devstral
+        // (rocprof 2026-04-20). Volatile global_load_dword acts as a
+        // memory barrier, hurting overlap with vec_dot, and 60 CUs
+        // prefetching simultaneously thrash L2 against live loads.
+        // Helpers kept in this file (gfx906_prefetch_y_tile et al.)
+        // for future attempts with refined issue-rate gating.
+
+        vec_dot_q4_K_q8_1_dp4a_moe<mmq_x>(x_qs, x_dm, x_sc, tile_y, sum, 0);
+        __syncthreads();
+
+        const int * by1 =
+            y_base + (size_t) stride_col_y * (y_big_base + 1) * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) {
+                tile_y[l] = by1[l];
+            }
+        }
+        __syncthreads();
+        vec_dot_q4_K_q8_1_dp4a_moe<mmq_x>(x_qs, x_dm, x_sc, tile_y, sum, MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    // Dense write-back: dst[local_j * nrows_dst + row_g].
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+        const int j       = j0 + threadIdx.y;
+        const int local_j = jt * mmq_x + j;
+        if (local_j >= total_b) continue;
+        #pragma unroll
+        for (int i0 = 0; i0 < MMQ_Y_R; i0 += WARP_SIZE) {
+            const int i     = i0 + threadIdx.x;
+            const int row_g = it * MMQ_Y_R + i;
+            if (need_check && row_g >= nrows_dst) continue;
+            dst[(size_t) local_j * nrows_dst + row_g] =
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y_R / WARP_SIZE) + i0 / WARP_SIZE];
+        }
+    }
+}
+
+#define MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT(MMQ_X, CHECK, SUFFIX)              \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                            \
+    void mul_mat_q4_K_turbo_dense_4warp_x##MMQ_X##_##SUFFIX(                \
+        const void * __restrict__ vx,                                       \
+        const void * __restrict__ vy,                                       \
+        float      * __restrict__ dst,                                      \
+        const int ncols_x, const int nrows_x,                               \
+        const int stride_col_y, const int stride_row_x,                     \
+        const int total_b, const int nrows_dst) {                           \
+        mul_mat_q4_K_turbo_dense_4warp_impl<MMQ_X, CHECK>(                  \
+            vx, vy, dst, ncols_x, nrows_x,                                  \
+            stride_col_y, stride_row_x, total_b, nrows_dst);                \
+    }
+
+MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT( 8, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT( 8, true,  checked)
+MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT(16, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT(16, true,  checked)
+MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT(32, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT(32, true,  checked)
+
+#undef MMQ_TURBO_DENSE_Q4K_4WARP_EXPORT
+
+// ================================================================
+// D2 (2026-04-20): Stream-K partitioning for the 4-warp Q4_K dense
+// kernel. Port of turbo mmq.cuh:3626+ stream-k path.
+//
+// Grid layout:
+//   Non-stream-K: (nty, ntx, 1) = one WG per output tile.
+//   Stream-K:     (nsm,  1,  1) = nsm WGs, each walking its own
+//                                 k-block-continuous (kbc) range.
+//
+// Each WG's kbc range = [bidx*total_kbc/nsm, (bidx+1)*total_kbc/nsm)
+// where total_kbc = ntx*nty*blocks_per_ne00. Inside the range, a
+// WG may process multiple tiles (complete ones write to `dst`, the
+// final partial tile writes to `tmp_fixup[bidx*mmq_x*mmq_y]`). The
+// fixup kernel then sums the per-bidx partials into `dst` for any
+// tile that was split across WGs.
+//
+// Expected gain: mostly reclaims tail waste on small-grid shapes
+// (Devstral pp128 k/v has 46% waste → ~10-15% projected win there).
+// pp512 has smaller tail, expected ~2-5%.
+//
+// Opt-in: CANDLE_Q4K_MMQ_4WARP_STREAM_K=1
+// ================================================================
+
+// Refactored per-tile compute. Called by both the xy-tiling driver
+// (full-range kb0) and the stream-K driver (partial kb0 range).
+// When `fixup`, the sum is written to `tmp_fixup + bidx*(mmq_x*mmq_y)`
+// instead of `dst`; each thread owns sum_slots output values, laid out
+// in the same (j0/nwarps) × (mmq_y/warp_size) pattern as sum[].
+template <int mmq_x, bool need_check, bool fixup>
+static __device__ void mul_mat_q4_K_4warp_process_tile(
+    const char * __restrict__ vx,
+    const int  * __restrict__ vy_for_tile,   // Y base already advanced to (jt*mmq_x)
+    float      * __restrict__ dst_for_tile,  // dst[jt*mmq_x*stride_col_dst + it*mmq_y]
+    float      * __restrict__ tmp_fixup,     // only used when fixup=true
+    const int stride_row_x,
+    const int stride_col_y,
+    const int stride_col_dst,
+    const int tile_x_max_i,
+    const int tile_y_max_j,
+    const int kb0_start,
+    const int kb0_stop,
+    const int it) {
+
+    using Tr = moe_dtype_traits<MOE_Q4_K>;
+    constexpr int MMQ_Y_R    = Tr::mmq_y;       // 64
+    constexpr int X_QS_T     = Tr::x_qs_ints;
+    constexpr int X_DM_RESERVE = MMQ_Y_R * 8 + MMQ_Y_R / 4;
+
+    extern __shared__ int shared_buf[];
+    int   * tile_y = shared_buf;
+    int   * x_qs   = tile_y + GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+    half2 * x_dm   = (half2 *) (x_qs + X_QS_T);
+    int   * x_sc   = (int *) (x_qs + X_QS_T) + X_DM_RESERVE;
+
+    constexpr int sum_slots = mmq_x * MMQ_Y_R / (MMQ_NWARPS * WARP_SIZE);
+    float sum[sum_slots];
+    #pragma unroll
+    for (int s = 0; s < sum_slots; ++s) sum[s] = 0.0f;
+
+    constexpr int TILE_Y_INTS =
+        GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+
+    for (int kb0 = kb0_start; kb0 < kb0_stop; ++kb0) {
+        const int kbx0      = it * MMQ_Y_R * stride_row_x + kb0;
+        const int i_max_arg = need_check ? tile_x_max_i : 0;
+
+        load_tiles_q4_K_moe<need_check>(
+            vx, x_qs, x_dm, x_sc, kbx0, i_max_arg, stride_row_x);
+
+        const int y_big_base = kb0 * 2;
+
+        const int * by0 =
+            vy_for_tile + (size_t) stride_col_y * y_big_base * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) tile_y[l] = by0[l];
+        }
+        __syncthreads();
+        vec_dot_q4_K_q8_1_dp4a_moe<mmq_x>(x_qs, x_dm, x_sc, tile_y, sum, 0);
+        __syncthreads();
+
+        const int * by1 =
+            vy_for_tile + (size_t) stride_col_y * (y_big_base + 1) * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) tile_y[l] = by1[l];
+        }
+        __syncthreads();
+        vec_dot_q4_K_q8_1_dp4a_moe<mmq_x>(x_qs, x_dm, x_sc, tile_y, sum, MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    if constexpr (fixup) {
+        // Write partial sums to tmp_fixup[bidx*(mmq_x*mmq_y) + j*mmq_y + i]
+        // Layout: mmq_y=64 rows × mmq_x cols, contiguous.
+        float * fixup_tile = tmp_fixup + (size_t) blockIdx.x * (mmq_x * MMQ_Y_R);
+        #pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+            const int j = j0 + threadIdx.y;
+            #pragma unroll
+            for (int i0 = 0; i0 < MMQ_Y_R; i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+                fixup_tile[j * MMQ_Y_R + i] =
+                    sum[(j0 / MMQ_NWARPS) * (MMQ_Y_R / WARP_SIZE) + i0 / WARP_SIZE];
+            }
+        }
+    } else {
+        // Write final to dst. Column-major (total_b × nrows_dst).
+        #pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+            const int j = j0 + threadIdx.y;
+            if (need_check && j > tile_y_max_j) continue;
+            #pragma unroll
+            for (int i0 = 0; i0 < MMQ_Y_R; i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+                if (need_check && i > tile_x_max_i) continue;
+                dst_for_tile[(size_t) j * stride_col_dst + i] =
+                    sum[(j0 / MMQ_NWARPS) * (MMQ_Y_R / WARP_SIZE) + i0 / WARP_SIZE];
+            }
+        }
+    }
+}
+
+// Stream-K driver: each of the `nsm` WGs processes a contiguous
+// block-chunk range, iterating over complete tiles that fall in its
+// range and writing a partial sum for the (at most one) partial tile
+// at its start or end.
+template <int mmq_x, bool need_check>
+static __device__ void mul_mat_q4_K_dense_4warp_stream_k_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float      * __restrict__ dst,
+    float      * __restrict__ tmp_fixup,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_dst,            // = total_b
+    const int stride_col_y,         // = total_b_padded
+    const int stride_row_x,         // = ncols_x / QK_K_Q4K_MOE
+    const int stride_col_dst) {     // = nrows_dst (col-major dst)
+
+    constexpr int MMQ_Y_R = MMQ_Y_Q8;
+    constexpr int blocks_per_iter = 1;  // Q4_K superblock per iter
+
+    const int64_t blocks_per_ne00 = ncols_x / QK_K_Q4K_MOE;
+    const int ntx = (ncols_dst + mmq_x - 1) / mmq_x;
+    const int nty = (nrows_x  + MMQ_Y_R - 1) / MMQ_Y_R;
+
+    const int64_t total_kbc = (int64_t) ntx * nty * blocks_per_ne00;
+
+    int64_t kbc      = (int64_t) blockIdx.x       * total_kbc / gridDim.x;
+    int64_t kbc_stop = (int64_t)(blockIdx.x + 1)  * total_kbc / gridDim.x;
+
+    kbc      -= (kbc      % blocks_per_ne00) % blocks_per_iter;
+    kbc_stop -= (kbc_stop % blocks_per_ne00) % blocks_per_iter;
+
+    int kb0_start = (int)(kbc % blocks_per_ne00);
+    int kb0_stop  = (int) min(blocks_per_ne00, (int64_t) kb0_start + (kbc_stop - kbc));
+
+    while (kbc < kbc_stop && kb0_stop == (int) blocks_per_ne00) {
+        int64_t tmp = kbc;
+        const int it = (int)(tmp / (ntx * blocks_per_ne00));
+        tmp -= (int64_t) it * ntx * blocks_per_ne00;
+        const int jt = (int)(tmp / blocks_per_ne00);
+
+        const int tile_x_max_i = nrows_x - it * MMQ_Y_R - 1;
+        const int tile_y_max_j = ncols_dst - jt * mmq_x - 1;
+
+        const int * vy_for_tile = (const int *) vy + (size_t) jt * mmq_x * Q8_1_MMQ_INTS;
+        float * dst_for_tile =
+            dst + (size_t) jt * mmq_x * stride_col_dst + it * MMQ_Y_R;
+
+        mul_mat_q4_K_4warp_process_tile<mmq_x, need_check, /*fixup=*/false>(
+            (const char *) vx, vy_for_tile, dst_for_tile, tmp_fixup,
+            stride_row_x, stride_col_y, stride_col_dst,
+            tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, it);
+
+        kbc += blocks_per_ne00;
+        kbc -= kbc % blocks_per_ne00;
+
+        kb0_start = 0;
+        kb0_stop  = (int) min(blocks_per_ne00, kbc_stop - kbc);
+    }
+
+    if (kbc >= kbc_stop) return;
+
+    // Last partial tile — write partial sum to tmp_fixup.
+    int64_t tmp = kbc;
+    const int it = (int)(tmp / (ntx * blocks_per_ne00));
+    tmp -= (int64_t) it * ntx * blocks_per_ne00;
+    const int jt = (int)(tmp / blocks_per_ne00);
+
+    const int tile_x_max_i = nrows_x - it * MMQ_Y_R - 1;
+    const int tile_y_max_j = ncols_dst - jt * mmq_x - 1;
+
+    const int * vy_for_tile = (const int *) vy + (size_t) jt * mmq_x * Q8_1_MMQ_INTS;
+    // dst_for_tile is unused when fixup=true, but pass something valid.
+    float * dst_for_tile =
+        dst + (size_t) jt * mmq_x * stride_col_dst + it * MMQ_Y_R;
+
+    mul_mat_q4_K_4warp_process_tile<mmq_x, need_check, /*fixup=*/true>(
+        (const char *) vx, vy_for_tile, dst_for_tile, tmp_fixup,
+        stride_row_x, stride_col_y, stride_col_dst,
+        tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, it);
+}
+
+// Fixup kernel: gather partial sums written to tmp_fixup by previous
+// stream-K WGs and add them into the final dst for the tile this WG
+// is finalizing. Mirrors turbo's mul_mat_q_stream_k_fixup (no MoE).
+template <int mmq_x, bool need_check>
+static __device__ void mul_mat_q4_K_dense_4warp_fixup_impl(
+    float       * __restrict__ dst,
+    const float * __restrict__ tmp_last_tile,
+    const int ncols_x,
+    const int nrows_x,
+    const int ncols_dst,
+    const int stride_col_dst) {
+
+    constexpr int mmq_y = MMQ_Y_Q8;
+    constexpr int blocks_per_iter = 1;
+
+    float sum[mmq_x * mmq_y / (MMQ_NWARPS * WARP_SIZE)] = {0.0f};
+
+    const int64_t blocks_per_ne00 = ncols_x / QK_K_Q4K_MOE;
+    const int ntx = (ncols_dst + mmq_x - 1) / mmq_x;
+    const int nty = (nrows_x  + mmq_y - 1) / mmq_y;
+    const int64_t total_kbc = (int64_t) ntx * nty * blocks_per_ne00;
+
+    const int bidx0 = blockIdx.x;
+
+    int64_t kbc0      = (int64_t) bidx0       * total_kbc / gridDim.x;
+    int64_t kbc0_stop = (int64_t)(bidx0 + 1)  * total_kbc / gridDim.x;
+
+    kbc0      -= (kbc0      % blocks_per_ne00) % blocks_per_iter;
+    kbc0_stop -= (kbc0_stop % blocks_per_ne00) % blocks_per_iter;
+
+    const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+    const bool wrote_beginning_of_tile = kbc0 % blocks_per_ne00 == 0;
+    const bool did_not_write_last      =
+        kbc0 / blocks_per_ne00 == kbc0_stop / blocks_per_ne00
+        && kbc0_stop % blocks_per_ne00 != 0;
+    if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last) {
+        return;
+    }
+
+    bool any_fixup = false;
+
+    int64_t bidx = (int64_t) bidx0 - 1;
+    int64_t kbc_stop = kbc0;
+    while (true) {
+        int64_t kbc = bidx * total_kbc / gridDim.x;
+        kbc -= (kbc % blocks_per_ne00) % blocks_per_iter;
+
+        if (kbc == kbc_stop) {
+            bidx--;
+            kbc_stop = kbc;
+            continue;
+        }
+
+        any_fixup = true;
+        #pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+            const int j = j0 + threadIdx.y;
+            #pragma unroll
+            for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+                sum[(j0 / MMQ_NWARPS) * (mmq_y / WARP_SIZE) + i0 / WARP_SIZE] +=
+                    tmp_last_tile[bidx * (mmq_x * mmq_y) + j * mmq_y + i];
+            }
+        }
+
+        if (kbc % blocks_per_ne00 == 0
+            || kbc / blocks_per_ne00 < kbc0 / blocks_per_ne00) {
+            break;
+        }
+        bidx--;
+        kbc_stop = kbc;
+    }
+
+    if (!any_fixup) return;
+
+    int64_t tmp = kbc0;
+    const int it = (int)(tmp / (ntx * blocks_per_ne00));
+    tmp -= (int64_t) it * ntx * blocks_per_ne00;
+    const int jt = (int)(tmp / blocks_per_ne00);
+
+    const int offset_dst = jt * mmq_x * stride_col_dst + it * mmq_y;
+    float * dst_for_tile = dst + offset_dst;
+
+    const int i_max = nrows_x   - it * mmq_y - 1;
+    const int j_max = ncols_dst - jt * mmq_x - 1;
+
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+        const int j = j0 + threadIdx.y;
+        if (j > j_max) return;
+        #pragma unroll
+        for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+            const int i = i0 + threadIdx.x;
+            if (need_check && i > i_max) continue;
+            dst_for_tile[(size_t) j * stride_col_dst + i] +=
+                sum[(j0 / MMQ_NWARPS) * (mmq_y / WARP_SIZE) + i0 / WARP_SIZE];
+        }
+    }
+}
+
+#define MMQ_TURBO_DENSE_Q4K_4WARP_SK_EXPORT(MMQ_X, CHECK, SUFFIX)           \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                            \
+    void mul_mat_q4_K_turbo_dense_4warp_sk_x##MMQ_X##_##SUFFIX(             \
+        const void  * __restrict__ vx,                                      \
+        const void  * __restrict__ vy,                                      \
+        float       * __restrict__ dst,                                     \
+        float       * __restrict__ tmp_fixup,                               \
+        const int ncols_x, const int nrows_x, const int ncols_dst,          \
+        const int stride_col_y, const int stride_row_x,                     \
+        const int stride_col_dst) {                                         \
+        mul_mat_q4_K_dense_4warp_stream_k_impl<MMQ_X, CHECK>(               \
+            vx, vy, dst, tmp_fixup,                                         \
+            ncols_x, nrows_x, ncols_dst,                                    \
+            stride_col_y, stride_row_x, stride_col_dst);                    \
+    }                                                                        \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                            \
+    void mul_mat_q4_K_turbo_dense_4warp_sk_fixup_x##MMQ_X##_##SUFFIX(       \
+        float       * __restrict__ dst,                                     \
+        const float * __restrict__ tmp_last_tile,                           \
+        const int ncols_x, const int nrows_x, const int ncols_dst,          \
+        const int stride_col_dst) {                                         \
+        mul_mat_q4_K_dense_4warp_fixup_impl<MMQ_X, CHECK>(                  \
+            dst, tmp_last_tile, ncols_x, nrows_x, ncols_dst, stride_col_dst); \
+    }
+
+MMQ_TURBO_DENSE_Q4K_4WARP_SK_EXPORT(16, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_4WARP_SK_EXPORT(16, true,  checked)
+MMQ_TURBO_DENSE_Q4K_4WARP_SK_EXPORT(32, false, unchecked)
+MMQ_TURBO_DENSE_Q4K_4WARP_SK_EXPORT(32, true,  checked)
+
+#undef MMQ_TURBO_DENSE_Q4K_4WARP_SK_EXPORT
 
 // ================================================================
 // B3: Q6_K turbo_moe — dedicated per-row single-warp MMQ kernel.
@@ -1910,6 +2854,414 @@ MMQ_TURBO_MOE_Q6K_EXPORT(64, true,  checked)
 #undef MMQ_TURBO_MOE_Q6K_EXPORT
 
 // ================================================================
+// P38: Q6_K turbo_dense — dense analogue of the Q6_K MoE kernel above
+// with MoE bits (ids_dst, expert_bounds, per-expert offset) stripped.
+// Layout matches the Q4_K dense port: dst is column-major F32
+// (total_b × nrows_dst); Y uses the dense (big_block, col) 144-byte
+// Q8_1 MMQ layout produced by `quantize_q8_1_mmq_q4_0`.
+// ================================================================
+template <int TILE_N, bool need_check>
+static __device__ void mul_mat_q6_K_turbo_dense_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float      * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int stride_col_y,
+    const int stride_row_x,             // = ncols_x / 256
+    const int total_b,
+    const int nrows_dst) {
+
+    const int tid = threadIdx.x;        // 0..63
+    const int it  = blockIdx.x;
+    const int jt  = blockIdx.y;
+    if (jt * TILE_N >= total_b) return;
+
+    const int row        = it * WARP_SIZE + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q6_K_moe * x = (const block_q6_K_moe *) vx;
+    const int blocks_per_row = stride_row_x;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row; ++ib) {
+        float super_d = 0.0f;
+        int8_t scales8[16] = {0};
+        const block_q6_K_moe * bx = nullptr;
+        if (row_valid) {
+            bx = &x[row * blocks_per_row + ib];
+            super_d = __half2float(bx->d);
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                scales8[j] = bx->scales[j];
+            }
+        }
+
+        float sumf_d[TILE_N] = {0.0f};
+
+        #pragma unroll
+        for (int sub = 0; sub < 8; ++sub) {
+            const int ip            = sub >> 2;
+            const int is_hi         = (sub >> 1) & 1;
+            const int ql_off_extra  = (sub & 1) * 32;
+            const int qh_shift      = 2 * (sub & 3);
+
+            int v[8] = {0};
+            if (row_valid) {
+                const int * ql_words = (const int *)(bx->ql + 64 * ip + ql_off_extra);
+                const int * qh_words = (const int *)(bx->qh + 32 * ip);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int ql_word = ql_words[j];
+                    const int qh_word = qh_words[j];
+                    const int ql_nib = is_hi
+                        ? ((ql_word >> 4) & 0x0F0F0F0F)
+                        : ( ql_word       & 0x0F0F0F0F);
+                    const int qh_bits = ((qh_word >> qh_shift) & 0x03030303) << 4;
+                    v[j] = vsubss4_moe(ql_nib | qh_bits, 0x20202020);
+                }
+            }
+            const int sc_lo = row_valid ? (int) scales8[2 * sub    ] : 0;
+            const int sc_hi = row_valid ? (int) scales8[2 * sub + 1] : 0;
+
+            const int big_y      = 2 * ib + (sub >> 2);
+            const int within_big = sub & 3;
+
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int local_j = jt * TILE_N + c;
+                if (local_j >= total_b) continue;
+
+                const uint8_t * y_bytes = (const uint8_t *) vy
+                    + ((size_t) big_y * stride_col_y + local_j)
+                      * Q8_1_MMQ_BYTES;
+                const half2 * ds = (const half2 *) y_bytes;
+                const int   * qs = (const int   *)(y_bytes + 16);
+
+                const half2   ds8    = ds[within_big];
+                const int   * qs_sub = qs + within_big * 8;
+                const float   d8     = __half2float(__low2half(ds8));
+
+                int sumi_lo = 0, sumi_hi = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sumi_lo = dp4a_sdot4(v[j], qs_sub[j], sumi_lo);
+                }
+                #pragma unroll
+                for (int j = 4; j < 8; ++j) {
+                    sumi_hi = dp4a_sdot4(v[j], qs_sub[j], sumi_hi);
+                }
+                sumf_d[c] += d8 * (float)(sc_lo * sumi_lo + sc_hi * sumi_hi);
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            sums[c] += super_d * sumf_d[c];
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int local_j = jt * TILE_N + c;
+        if (local_j >= total_b) continue;
+        if (need_check && row >= nrows_dst) continue;
+        dst[(size_t) local_j * nrows_dst + row] = sums[c];
+    }
+}
+
+#define MMQ_TURBO_DENSE_Q6K_EXPORT(MMQ_X, CHECK, SUFFIX)                    \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE, 1)                                         \
+    void mul_mat_q6_K_turbo_dense_x##MMQ_X##_##SUFFIX(                      \
+        const void * __restrict__ vx,                                       \
+        const void * __restrict__ vy,                                       \
+        float      * __restrict__ dst,                                      \
+        const int ncols_x, const int nrows_x,                               \
+        const int stride_col_y, const int stride_row_x,                     \
+        const int total_b, const int nrows_dst) {                           \
+        mul_mat_q6_K_turbo_dense_impl<MMQ_X, CHECK>(                        \
+            vx, vy, dst, ncols_x, nrows_x,                                  \
+            stride_col_y, stride_row_x, total_b, nrows_dst);                \
+    }
+
+MMQ_TURBO_DENSE_Q6K_EXPORT( 8, false, unchecked)
+MMQ_TURBO_DENSE_Q6K_EXPORT( 8, true,  checked)
+MMQ_TURBO_DENSE_Q6K_EXPORT(16, false, unchecked)
+MMQ_TURBO_DENSE_Q6K_EXPORT(16, true,  checked)
+MMQ_TURBO_DENSE_Q6K_EXPORT(32, false, unchecked)
+MMQ_TURBO_DENSE_Q6K_EXPORT(32, true,  checked)
+MMQ_TURBO_DENSE_Q6K_EXPORT(64, false, unchecked)
+MMQ_TURBO_DENSE_Q6K_EXPORT(64, true,  checked)
+
+#undef MMQ_TURBO_DENSE_Q6K_EXPORT
+
+// ================================================================
+// D1 (2026-04-20): Q6_K 4-warp LDS-tiled dense MMQ. Port of turbo
+// mmq.cuh:2438 (load_tiles_q6_K DP4A branch) + 2524 (vec_dot_q6_K_
+// q8_1_dp4a) + 675 (vec_dot_q6_K_q8_1_impl_mmq). 256 threads/block,
+// 4 warps cooperating, mmq_y=64.
+//
+// Target: Devstral-24B Q4_K_M ffn.down + attn.v projections — 80
+// calls/pp512, 41% of candle GPU time at 47ms/call vs llama.cpp's
+// 10.5ms. Replaces single-warp turbo_dense_x8 (119 VGPR).
+//
+// LDS for y=64:
+//   x_qs: 64 × (2*32+1)                = 4160 ints
+//   x_df: mmq_y*(ne_k/QI6) + mmq_y/QI6 = 64 + 2 = 66 floats
+//   x_sc: mmq_y*(ne_k/8) + mmq_y/8     = 264 ints
+// Plus tile_y = pad(mmq_x*36, 256).
+// ================================================================
+
+#define VDR_Q6_K_Q8_1_MMQ_MOE 8
+
+static __device__ __forceinline__ float q6_K_q8_1_dp4a_impl_mmq(
+    const int    * __restrict__ v,    // 8 ints X (pre-subtracted int8 quants)
+    const int    * __restrict__ u,    // 8 ints Y
+    const int8_t * __restrict__ sc,   // 4 scales (one per 16 K-elems)
+    const float    d6,                // super-block scale (float)
+    const half2  * __restrict__ ds) { // 2 Q8_1 ds (half2(d, s)); we use only d
+
+    float sumf_d = 0.0f;
+    #pragma unroll
+    for (int i0 = 0; i0 < VDR_Q6_K_Q8_1_MMQ_MOE; i0 += 4) {
+        int2 sumi_d = {0, 0};
+        #pragma unroll
+        for (int i = i0; i < i0 + 2; ++i) {
+            sumi_d.x = dp4a_sdot4(v[2*i+0], u[2*i+0], sumi_d.x);
+            sumi_d.x = dp4a_sdot4(v[2*i+1], u[2*i+1], sumi_d.x);
+            sumi_d.y = dp4a_sdot4(v[2*i+4], u[2*i+4], sumi_d.y);
+            sumi_d.y = dp4a_sdot4(v[2*i+5], u[2*i+5], sumi_d.y);
+        }
+        const float d8 = __half2float(__low2half(ds[i0/4]));
+        sumf_d += d8 * (sc[i0/2+0]*sumi_d.x + sc[i0/2+1]*sumi_d.y);
+    }
+    return d6 * sumf_d;
+}
+
+template <bool need_check>
+static __device__ __forceinline__ void load_tiles_q6_K_moe(
+    const char * __restrict__ x,
+    int *        __restrict__ x_qs,     // mmq_y * (2*MMQ_TILE_NE_K + 1) ints
+    float *      __restrict__ x_df,     // mmq_y + mmq_y/QI6_K floats
+    int *        __restrict__ x_sc,     // mmq_y * (MMQ_TILE_NE_K/8) + mmq_y/8 ints
+    const int kbx0,
+    const int i_max,
+    const int stride_row_x) {
+
+    constexpr int mmq_y  = MMQ_Y_Q8;  // 64
+    constexpr int QI6_K  = QI6_K_Q6K_MOE;  // 32
+    constexpr int QR6_K  = QR6_K_Q6K_MOE;  // 2
+
+    // qs load: threads_per_row = MMQ_ITER_K / (4 * QR6_K) = 256/8 = 32. nrows=2.
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR6_K);
+    constexpr int nrows           = WARP_SIZE / threads_per_row;  // 2
+    const int txi = threadIdx.x % threads_per_row;
+
+    #pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nrows * MMQ_NWARPS) {
+        int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
+        if (need_check) i = min(i, i_max);
+        const block_q6_K_moe * bxi =
+            (const block_q6_K_moe *) x + kbx0 + i * stride_row_x;
+
+        const int ql  = get_int_b2(bxi->ql, txi);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = get_int_b2(bxi->qh,
+            (QI6_K/4) * (txi / (QI6_K/2)) + txi % (QI6_K/4));
+        const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
+        const int qh1 =  (qh >> ((txi & 0x08) >> 2))       & 0x30303030;
+
+        const int kq0 = 2*txi - txi % (QI6_K/2) + 0;
+        const int kq1 = 2*txi - txi % (QI6_K/2) + QI6_K/2;
+
+        x_qs[i * (QR6_K * MMQ_TILE_NE_K + 1) + kq0] = vsubss4_moe(ql0 | qh0, 0x20202020);
+        x_qs[i * (QR6_K * MMQ_TILE_NE_K + 1) + kq1] = vsubss4_moe(ql1 | qh1, 0x20202020);
+    }
+
+    // df load: 1 float per row (Q6_K has a single super-block scale).
+    #pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += MMQ_NWARPS * WARP_SIZE) {
+        int i = (i0 + threadIdx.y * WARP_SIZE + threadIdx.x) % mmq_y;
+        if (need_check) i = min(i, i_max);
+        const block_q6_K_moe * bxi =
+            (const block_q6_K_moe *) x + kbx0 + i * stride_row_x;
+        x_df[i * (MMQ_TILE_NE_K / QI6_K) + i / QI6_K] = __half2float(bxi->d);
+    }
+
+    // scales load: 8 int8 per row packed into 2 ints; ksc ∈ 0..3 picks one of 4 packed.
+    constexpr int ksc_per_row   = MMQ_TILE_NE_K / 8;   // 4
+    constexpr int rows_per_warp = WARP_SIZE / ksc_per_row;  // 16
+    #pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += MMQ_NWARPS * rows_per_warp) {
+        int i = (i0 + threadIdx.y * rows_per_warp + threadIdx.x / ksc_per_row) % mmq_y;
+        if (need_check) i = min(i, i_max);
+        const int ksc = threadIdx.x % ksc_per_row;
+        const block_q6_K_moe * bxi =
+            (const block_q6_K_moe *) x + kbx0 + i * stride_row_x;
+        x_sc[i * ksc_per_row + i / 8 + ksc] = get_int_b2(bxi->scales, ksc);
+    }
+}
+
+template <int mmq_x>
+static __device__ __forceinline__ void vec_dot_q6_K_q8_1_dp4a_moe(
+    const int   * __restrict__ x_qs,
+    const float * __restrict__ x_df,
+    const int   * __restrict__ x_sc,
+    const int   * __restrict__ tile_y,
+    float       * __restrict__ sum,
+    const int k00) {
+
+    constexpr int mmq_y = MMQ_Y_Q8;
+    constexpr int QI6_K = QI6_K_Q6K_MOE;  // 32
+    constexpr int QR6_K = QR6_K_Q6K_MOE;  // 2
+
+    const int   * y_qs = tile_y + 4;
+    const half2 * y_ds = (const half2 *) tile_y;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR6_K * VDR_Q6_K_Q8_1_MMQ_MOE) {
+        const int k0 = k00 + k01;
+
+        #pragma unroll
+        for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+            const int j = j0 + threadIdx.y;
+
+            #pragma unroll
+            for (int i0 = 0; i0 < mmq_y; i0 += WARP_SIZE) {
+                const int i = i0 + threadIdx.x;
+
+                const int8_t * sc = (const int8_t *) &x_sc[
+                    i * (MMQ_TILE_NE_K / 8) + i / 8 + k0 / 16];
+
+                sum[(j0 / MMQ_NWARPS) * (mmq_y / WARP_SIZE) + i0 / WARP_SIZE] +=
+                    q6_K_q8_1_dp4a_impl_mmq(
+                        &x_qs[i * (QR6_K * MMQ_TILE_NE_K + 1) + k0],
+                        &y_qs[j * MMQ_TILE_Y_K + k01],
+                        sc,
+                        x_df[i * (MMQ_TILE_NE_K / QI6_K) + i / QI6_K],
+                        &y_ds[j * MMQ_TILE_Y_K + k01 / QI8_1]);
+            }
+        }
+    }
+}
+
+template <int mmq_x, bool need_check>
+static __device__ void mul_mat_q6_K_turbo_dense_4warp_impl(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float      * __restrict__ dst,
+    const int ncols_x,
+    const int nrows_x,
+    const int stride_col_y,
+    const int stride_row_x,
+    const int total_b,
+    const int nrows_dst) {
+
+    constexpr int MMQ_Y_R          = MMQ_Y_Q8;                     // 64
+    constexpr int X_QS_INTS_Q6     = MMQ_Y_R * (2 * MMQ_TILE_NE_K + 1); // 4160
+    constexpr int X_DF_FLOATS_Q6   = MMQ_Y_R * (MMQ_TILE_NE_K / QI6_K_Q6K_MOE)
+                                     + MMQ_Y_R / QI6_K_Q6K_MOE;    // 64 + 2 = 66
+    constexpr int X_SC_INTS_Q6     = MMQ_Y_R * (MMQ_TILE_NE_K / 8) + MMQ_Y_R / 8; // 264
+
+    extern __shared__ int shared_buf[];
+    int   * tile_y = shared_buf;
+    int   * x_qs   = tile_y + GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+    float * x_df   = (float *) (x_qs + X_QS_INTS_Q6);
+    int   * x_sc   = (int *)   (x_df + X_DF_FLOATS_Q6);
+
+    const int it = blockIdx.x;
+    const int jt = blockIdx.y;
+    if (jt * mmq_x >= total_b) return;
+
+    const int * y_base = (const int *) vy + (jt * mmq_x) * Q8_1_MMQ_INTS;
+
+    constexpr int sum_slots = mmq_x * MMQ_Y_R / (MMQ_NWARPS * WARP_SIZE);
+    float sum[sum_slots];
+    #pragma unroll
+    for (int s = 0; s < sum_slots; ++s) sum[s] = 0.0f;
+
+    const int n_blocks_x = ncols_x / QK_K_Q6K_MOE;  // 1 superblock/iter
+    const int i_max      = nrows_x - it * MMQ_Y_R - 1;
+
+    constexpr int TILE_Y_INTS =
+        GGML_PAD(mmq_x * MMQ_TILE_Y_K, MMQ_NWARPS * WARP_SIZE);
+
+    for (int outer = 0; outer < n_blocks_x; ++outer) {
+        const int kb0 = outer;
+        const int kbx0 = it * MMQ_Y_R * stride_row_x + kb0;
+        const int i_max_arg = need_check ? i_max : 0;
+
+        load_tiles_q6_K_moe<need_check>(
+            (const char *) vx, x_qs, x_df, x_sc, kbx0, i_max_arg, stride_row_x);
+
+        const int y_big_base = outer * 2;
+
+        const int * by0 = y_base + (size_t) stride_col_y * y_big_base * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) tile_y[l] = by0[l];
+        }
+        __syncthreads();
+        vec_dot_q6_K_q8_1_dp4a_moe<mmq_x>(x_qs, x_df, x_sc, tile_y, sum, 0);
+        __syncthreads();
+
+        const int * by1 = y_base + (size_t) stride_col_y * (y_big_base + 1) * Q8_1_MMQ_INTS;
+        #pragma unroll
+        for (int l0 = 0; l0 < TILE_Y_INTS; l0 += MMQ_NWARPS * WARP_SIZE) {
+            const int l = l0 + threadIdx.y * WARP_SIZE + threadIdx.x;
+            if (l < mmq_x * MMQ_TILE_Y_K) tile_y[l] = by1[l];
+        }
+        __syncthreads();
+        vec_dot_q6_K_q8_1_dp4a_moe<mmq_x>(x_qs, x_df, x_sc, tile_y, sum, MMQ_TILE_NE_K);
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int j0 = 0; j0 < mmq_x; j0 += MMQ_NWARPS) {
+        const int j       = j0 + threadIdx.y;
+        const int local_j = jt * mmq_x + j;
+        if (local_j >= total_b) continue;
+        #pragma unroll
+        for (int i0 = 0; i0 < MMQ_Y_R; i0 += WARP_SIZE) {
+            const int i     = i0 + threadIdx.x;
+            const int row_g = it * MMQ_Y_R + i;
+            if (need_check && row_g >= nrows_dst) continue;
+            dst[(size_t) local_j * nrows_dst + row_g] =
+                sum[(j0 / MMQ_NWARPS) * (MMQ_Y_R / WARP_SIZE) + i0 / WARP_SIZE];
+        }
+    }
+}
+
+#define MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT(MMQ_X, CHECK, SUFFIX)              \
+    extern "C" __global__                                                   \
+    __launch_bounds__(WARP_SIZE * MMQ_NWARPS, 2)                            \
+    void mul_mat_q6_K_turbo_dense_4warp_x##MMQ_X##_##SUFFIX(                \
+        const void * __restrict__ vx,                                       \
+        const void * __restrict__ vy,                                       \
+        float      * __restrict__ dst,                                      \
+        const int ncols_x, const int nrows_x,                               \
+        const int stride_col_y, const int stride_row_x,                     \
+        const int total_b, const int nrows_dst) {                           \
+        mul_mat_q6_K_turbo_dense_4warp_impl<MMQ_X, CHECK>(                  \
+            vx, vy, dst, ncols_x, nrows_x,                                  \
+            stride_col_y, stride_row_x, total_b, nrows_dst);                \
+    }
+
+MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT( 8, false, unchecked)
+MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT( 8, true,  checked)
+MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT(16, false, unchecked)
+MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT(16, true,  checked)
+MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT(32, false, unchecked)
+MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT(32, true,  checked)
+
+#undef MMQ_TURBO_DENSE_Q6K_4WARP_EXPORT
+
+// ================================================================
 // B4: Q5_K turbo_moe — dedicated per-row single-warp MMQ kernel.
 //
 // Q5_K = Q4_K body + 32-byte qh array of 1-bit-per-quant high bits.
@@ -2001,8 +3353,8 @@ static __device__ void mul_mat_q5_K_turbo_moe_impl(
             }
         }
 
-        float sumf_d[TILE_N] = {0.0f};
-        float sumf_m[TILE_N] = {0.0f};
+        // v3 merged-accumulator pattern (ported from Q4_K / Q5_K v3).
+        // No sumf_d[TILE_N] / sumf_m[TILE_N] intermediates.
 
         #pragma unroll
         for (int sub = 0; sub < 8; ++sub) {
@@ -2024,8 +3376,9 @@ static __device__ void mul_mat_q5_K_turbo_moe_impl(
                     v[j] = ql_nib | qh_bits;
                 }
             }
-            const float sc_f = (float) sub_sc[sub];
-            const float m_f  = (float) sub_m [sub];
+            // Pre-combine super-level scales with per-sub scales.
+            const float scd = super_d    * (float) sub_sc[sub];
+            const float smm = super_dmin * (float) sub_m [sub];
 
             const int big_y      = 2 * ib + (sub >> 2);
             const int within_big = sub & 3;
@@ -2053,14 +3406,8 @@ static __device__ void mul_mat_q5_K_turbo_moe_impl(
                     sumi_d = dp4a_sdot4(v[j], y_j, sumi_d);
                     sumi_y = dp4a_sdot4(0x01010101, y_j, sumi_y);
                 }
-                sumf_d[c] += d8 * ((float) sumi_d) * sc_f;
-                sumf_m[c] += d8 * ((float) sumi_y) * m_f;
+                sums[c] += d8 * (scd * (float) sumi_d - smm * (float) sumi_y);
             }
-        }
-
-        #pragma unroll
-        for (int c = 0; c < TILE_N; ++c) {
-            sums[c] += super_d * sumf_d[c] - super_dmin * sumf_m[c];
         }
     }
 

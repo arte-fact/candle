@@ -113,15 +113,24 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
     float *       state_out_bh = state_out + (int64_t)bh   * S_v * S_v;
     float *       attn_bh      = attn_out  + (int64_t)bh   * L * S_v;
 
+    // P23: state stored TRANSPOSED (col is outer, i is inner) so that a warp
+    // reading column `col` hits `S_v` contiguous floats (8 cachelines at S_v=128)
+    // instead of `S_v` cachelines strided by 512 B. Matches llama.cpp's layout
+    // at `ggml-cuda/gated_delta_net.cu:42-54`. Since the state is zero-init in
+    // Rust (`GdnState::init_*`) and only ever touched by this kernel, flipping
+    // both reads and writes symmetrically preserves semantics without any
+    // Rust-side change.
+    const float * state_in_col  = state_in_bh  + (int64_t)col * S_v;
+    float *       state_out_col = state_out_bh + (int64_t)col * S_v;
+
     // Load column `col` of state_in into registers:
-    //   s_shard[r] = state_in[i, col] with i = r * warp_size + lane.
-    // The loads are strided by S_v (one per row); they fire once per warp
-    // per kernel invocation and are amortized over the entire L-step loop.
+    //   s_shard[r] = state[col, i] with i = r * warp_size + lane.
+    // Warp reads `S_v` contiguous floats → coalesced.
     float s_shard[rows_per_lane];
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
-        s_shard[r]  = state_in_bh[i * S_v + col];
+        s_shard[r]  = state_in_col[i];
     }
 
     for (int t = 0; t < L; t++) {
@@ -141,14 +150,14 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
             q_reg[r] = q_bh[t * S_v + i];
         }
 
-        // Apply decay: state[i, col] *= g_val
+        // Apply decay: state[col, i] *= g_val (exact original op order —
+        // preserves numerical parity with the CPU reference).
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             s_shard[r] *= g_val;
         }
 
-        // sk[col] = Σ_i state[i, col] * k[i]
-        // Each lane sums its owned rows, then warp-reduces.
+        // sk[col] = Σ_i state[col, i] * k[i]
         float kv_shard = 0.0f;
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
@@ -156,13 +165,12 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
         }
         const float kv_col = warp_reduce_sum_f32(kv_shard);
 
-        // delta[col] = (v[col] - sk[col]) * beta. v[col] is a scalar the
-        // whole warp reads via L1 broadcast.
+        // delta[col] = (v[col] - sk[col]) * beta
         const float v_col     = v_bh[t * S_v + col];
         const float delta_col = (v_col - kv_col) * beta_val;
 
-        // Fused: state[i, col] += k[i] * delta_col
-        //        attn[col]     = Σ_i state[i, col] * q[i]
+        // Fused: state[col, i] += k[i] * delta_col
+        //        attn[col]     = Σ_i state[col, i] * q[i]
         float attn_partial = 0.0f;
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
@@ -178,11 +186,11 @@ static __device__ __forceinline__ void gated_delta_net_step_impl(
         }
     }
 
-    // Write state column to state_out.
+    // Write state column to state_out (same transposed layout — contiguous write).
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
-        state_out_bh[i * S_v + col] = s_shard[r];
+        state_out_col[i] = s_shard[r];
     }
 }
 

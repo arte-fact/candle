@@ -48,6 +48,18 @@ pub struct RecordedOp {
     pub device_ordinal: i32,
 }
 
+// SAFETY: `hipFunction_t` and `hipStream_t` are raw HIP handles
+// (opaque pointers to driver-managed state). The HIP runtime is
+// thread-safe for these handles — they can be created on one thread
+// and used from another. RecordedOp only carries the handle plus
+// plain-old-data (Vec<u64>, strings, ints), so Send + Sync are safe.
+//
+// Needed so `DecodeState` (which holds RecordedOps) is Send, which
+// in turn lets `ModelWeights` cross thread boundaries in the
+// TP+EP dispatcher (see `quantized_gemma4_tp`).
+unsafe impl Send for RecordedOp {}
+unsafe impl Sync for RecordedOp {}
+
 /// Sentinel kernel name for a recorded HIP→HIP memcpy.
 ///
 /// MI50 has no P2P, so `Tensor::to_device` on HIP→HIP goes through a CPU

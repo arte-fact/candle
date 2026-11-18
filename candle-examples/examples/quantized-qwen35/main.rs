@@ -226,10 +226,23 @@ fn main() -> anyhow::Result<()> {
     } else {
         args.prompt.unwrap_or_else(|| DEFAULT_PROMPT.to_string())
     };
-    let prompt_str = format!("<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n");
+    // V1.7.4 parity-mode: CANDLE_RAW_PROMPT=1 skips the chat template so we
+    // can tokenize "Hello" as a single BPE id (9419) and compare greedy
+    // decode against flambeau + llama.cpp on the same seed token.
+    let raw_prompt = std::env::var("CANDLE_RAW_PROMPT").is_ok();
+    let prompt_str = if raw_prompt {
+        prompt_str
+    } else {
+        format!("<|im_start|>user\n{prompt_str}<|im_end|>\n<|im_start|>assistant\n")
+    };
     print!("prompt: {prompt_str}");
 
-    let tokens = tos.tokenizer().encode(prompt_str, true).map_err(anyhow::Error::msg)?;
+    // Use `add_special_tokens = !raw_prompt` so the parity mode gets a
+    // tokenize-only-the-literal-string encode (no BOS prepended).
+    let tokens = tos
+        .tokenizer()
+        .encode(prompt_str, !raw_prompt)
+        .map_err(anyhow::Error::msg)?;
     let tokens = tokens.get_ids();
     println!("({} tokens)", tokens.len());
 
@@ -267,15 +280,41 @@ fn main() -> anyhow::Result<()> {
     let start_gen = std::time::Instant::now();
 
     let mut next_token = if args.split_prompt || model.is_recurrent() {
-        // Token-by-token: required for recurrent (hybrid GDN) models so the
-        // delta-net state is updated one token at a time. Optional for other
-        // models via `--split-prompt`.
+        // Chunked prefill for recurrent models. `CANDLE_GDN_PREFILL_CHUNK`
+        // controls the chunk size (default 1 = legacy per-token path).
+        // Larger chunks send N tokens through one forward pass which
+        // uses the batched `delta_net_step_vectorized` kernel path —
+        // ONE fused GDN launch per layer per chunk instead of one per
+        // token, eliminating the ~N×3 rocBLAS calls on per-token
+        // delta-net state matmuls. Chunks too large OOM on MoE models
+        // (activations scale with chunk × hidden × intermediate), so
+        // default is conservative. For Qwen3.6-35B-A3B try 16 or 32.
+        let chunk: usize = std::env::var("CANDLE_GDN_PREFILL_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&c: &usize| c > 0)
+            .unwrap_or(1);
         let mut next = 0;
-        for (pos, token) in tokens.iter().enumerate() {
-            let input = Tensor::new(&[*token], &device)?.unsqueeze(0)?;
+        let mut pos = 0usize;
+        while pos < tokens.len() {
+            let end = (pos + chunk).min(tokens.len());
+            let slice = &tokens[pos..end];
+            let input = Tensor::new(slice, &device)?.unsqueeze(0)?;
             let logits = model.forward(&input, pos)?;
-            let logits = logits.squeeze(0)?;
-            next = logits_processor.sample(&logits)?;
+            // Model may emit [1, seq, vocab] or [1, vocab]. Flatten the
+            // leading batch + optional seq dims and take the last slot.
+            // For chunk=1 this is always the single logit vector; for
+            // larger chunks we take slice.len()-1 from the seq axis.
+            let last = match logits.dims().len() {
+                3 => {
+                    let last_idx = slice.len() - 1;
+                    logits.narrow(1, last_idx, 1)?.squeeze(0)?.squeeze(0)?
+                }
+                2 => logits.squeeze(0)?,
+                _ => logits,
+            };
+            next = logits_processor.sample(&last)?;
+            pos = end;
         }
         next
     } else {
@@ -290,6 +329,9 @@ fn main() -> anyhow::Result<()> {
         "prompt processed: {:.2} token/s",
         tokens.len() as f64 / prompt_dt.as_secs_f64(),
     );
+    if std::env::var("CANDLE_RAW_PROMPT").is_ok() {
+        eprintln!("[candle-dbg] first_argmax → id={}", next_token);
+    }
 
     // Generation loop
     let mut all_tokens = vec![next_token];
@@ -321,6 +363,9 @@ fn main() -> anyhow::Result<()> {
         };
         next_token = logits_processor.sample(&logits)?;
         all_tokens.push(next_token);
+        if std::env::var("CANDLE_RAW_PROMPT").is_ok() {
+            eprintln!("[candle-dbg] step {} → id={}", index, next_token);
+        }
         if let Some(t) = tos.next_token(next_token)? {
             print!("{t}");
             std::io::stdout().flush()?;

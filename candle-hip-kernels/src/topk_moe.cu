@@ -184,6 +184,16 @@ extern "C" __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_norm_f32
     topk_moe_norm_f32_n<64>(logits, weights_out, ids_out, n_rows, n_expert_used);
 }
 
+extern "C" __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_norm_f32_n256(
+    const float * logits,
+    float       * weights_out,
+    unsigned int* ids_out,
+    const int n_rows,
+    const int n_expert_used
+) {
+    topk_moe_norm_f32_n<256>(logits, weights_out, ids_out, n_rows, n_expert_used);
+}
+
 extern "C" __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_norm_f32_n512(
     const float * logits,
     float       * weights_out,

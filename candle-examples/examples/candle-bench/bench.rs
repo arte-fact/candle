@@ -153,15 +153,27 @@ fn append_log(path: Option<&Path>, header: &str, out: &str) {
     }
 }
 
-/// Parse `N prompt tokens: X t/s` (pp) or `N tokens generated: X t/s` (tg).
+/// Parse rate from candle binary output. Matches multiple formats:
+/// - `N prompt tokens: X t/s` (quantized-qwen35 / quantized-gemma4)
+/// - `N prompt tokens processed: X token/s` (quantized binary — llama family)
+/// - `N tokens generated: X t/s` / `X token/s`
+/// Needle is the distinguishing substring; the first float token after it is
+/// returned.
 fn parse_rate(out: &str, needle: &str) -> Option<f32> {
+    // Alternate phrasings for each bench phase.
+    let candidates: &[&str] = match needle {
+        "prompt tokens:" => &["prompt tokens:", "prompt tokens processed:"],
+        "tokens generated:" => &["tokens generated:"],
+        _ => &[needle],
+    };
     for line in out.lines() {
-        if let Some(idx) = line.find(needle) {
-            // After the needle comes "X t/s" possibly with surrounding spaces.
-            let rest = &line[idx + needle.len()..];
-            for tok in rest.split_whitespace() {
-                if let Ok(v) = tok.parse::<f32>() {
-                    return Some(v);
+        for cand in candidates {
+            if let Some(idx) = line.find(cand) {
+                let rest = &line[idx + cand.len()..];
+                for tok in rest.split_whitespace() {
+                    if let Ok(v) = tok.parse::<f32>() {
+                        return Some(v);
+                    }
                 }
             }
         }
@@ -188,7 +200,11 @@ fn run_candle(args: &BenchArgs, log: Option<&Path>) -> Result<BenchResult> {
     let n_gpus = args.gpus.split(',').filter(|s| !s.is_empty()).count().max(1);
 
     let mut base_env = env_base(&args.gpus, &[]);
-    base_env.push(("CANDLE_MMQ_TURBO_PORT".into(), "1".into()));
+    // P35 (2026-04-20): removed hardcoded `CANDLE_MMQ_TURBO_PORT=1`.
+    // The flag is now default ON in candle; forcing it here previously
+    // masked the stale default for months (internal tests always ran
+    // turbo, end users without the env var got the ~3× slower path).
+    // User can still set via `--env CANDLE_MMQ_TURBO_PORT=0` to opt out.
     for (k, v) in parse_kvs(&args.envs) {
         // CLI --env overrides defaults.
         base_env.retain(|(kk, _)| kk != &k);

@@ -938,6 +938,57 @@ impl QTensor {
         }
     }
 
+    /// P21: fused gate+up MoE MMVQ. `self` holds the gate weight; `other`
+    /// the up weight. Both must share dtype, shape, and device. Computes
+    /// BOTH gate and up outputs in a single kernel launch. Returns
+    /// `Ok(None)` when the kernel isn't applicable — caller falls back to
+    /// two sequential `indexed_moe_forward_preq8` calls.
+    #[cfg(feature = "hip")]
+    pub fn indexed_moe_gate_up_forward_preq8(
+        &self,
+        other: &QTensor,
+        x_q8_1: &hipdarc::driver::HipView<'_, u8>,
+        x_shape: &Shape,
+        ids: &crate::Tensor,
+    ) -> Result<Option<(crate::Tensor, crate::Tensor)>> {
+        let (s_self, s_other) = match (&self.storage, &other.storage) {
+            (QStorage::Hip(a), QStorage::Hip(b)) => (a, b),
+            _ => return Ok(None),
+        };
+        if self.shape() != other.shape() {
+            return Ok(None);
+        }
+        let ids_storage = ids.storage();
+        let ids_hip = match &*ids_storage {
+            Storage::Hip(h) => h,
+            _ => crate::bail!("indexed_moe_gate_up_forward_preq8: ids must be HIP"),
+        };
+        let ids_view = ids_hip.as_hip_slice::<u32>()?;
+        let result = s_self.indexed_moe_gate_up_forward_preq8(
+            s_other,
+            self.shape(),
+            x_q8_1,
+            x_shape,
+            &ids_view.slice(0..ids_view.len()),
+            ids.layout().shape(),
+        )?;
+        Ok(result.map(|(gs, us, out_shape)| {
+            let g = crate::tensor::from_storage(
+                Storage::Hip(gs),
+                out_shape.clone(),
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            let u = crate::tensor::from_storage(
+                Storage::Hip(us),
+                out_shape,
+                crate::op::BackpropOp::none(),
+                false,
+            );
+            (g, u)
+        }))
+    }
+
     /// Mat-vec multiply using a pre-quantized Q8_1 activation buffer.
     /// Skips the per-call `quantize_q8_1` dispatch — the caller must have
     /// already quantized the input via `quantize_q8_1` or `rmsnorm_q8_fused`.

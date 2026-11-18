@@ -442,15 +442,30 @@ pub fn launch_mul_mat_vec_q8_1_chunk_raw(
     // Q6K still diverges (distinct 4+2 packing; kernel layout not yet ported).
     // Opt into Q6K warp-coop via CANDLE_KQUANT_WARP_COOP=1 (still broken).
     let q6_warp_coop = std::env::var("CANDLE_KQUANT_WARP_COOP").is_ok();
-    // Q4_0 b_size=1 has a 128-thread variant (`_cuda1_b128`) that
+    // Q4_0 / Q8_0 b_size=1 have a 128-thread variant (`_cuda1_b128`) that
     // mirrors llama.cpp's `calc_nwarps=2` dispatch on gfx906 (GCN table).
-    // Measured 22.4 → target <16 µs/call via doubled threads per block,
-    // one output row per block (vs 64-thread / 2-rows). Opt-in via
-    // `CANDLE_MMVQ_B128=1` for A/B bisect; default OFF until validated.
+    // Both default ON as of 2026-04-19:
+    // - Q8_0: P24 measured 20 → 15.7 µs/call (1.29×), Qwen3.6 tg +7.2%.
+    //   Opt-out via `CANDLE_Q8_MMVQ_B128=0`.
+    // - Q4_0: P31 dense cycle — Qwen3.5-27B tg +5.8%, Gemma-4-31B tg +8.1%.
+    //   Qwen3.6 (MoE) unaffected (uses Q4_K for experts, Q8_0 for attn).
+    //   Opt-out via `CANDLE_MMVQ_B128=0`.
     let mmvq_b128 = std::env::var("CANDLE_MMVQ_B128")
         .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    let q8_mmvq_b128 = std::env::var("CANDLE_Q8_MMVQ_B128")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    // P34 (dense llama-family 2026-04-20): Q4_K/Q5_K MMVQ dispatch.
+    // Default ROUTES TO TEMPLATE (256-thread, 1 row/block, has_fusion-style).
+    // Devstral-24B Q4_K_M tg +43% (17.9 → 25.5); Gemma-31B +3%; Qwen3.6 MoE
+    // flat; Qwen3-Coder-30B Q4_K_XL -2% (collateral, MoE with Q4_K attn).
+    // Set `CANDLE_KQUANT_WC=1` to restore the old warp-coop 64-thread path.
+    let kquant_wc = std::env::var("CANDLE_KQUANT_WC")
+        .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     let kernel_name = if b_size == 1
+        && kquant_wc
         && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q5K)
     {
         match dtype {
@@ -459,9 +474,18 @@ pub fn launch_mul_mat_vec_q8_1_chunk_raw(
             _ => unreachable!(),
         }
     } else if b_size == 1 && q6_warp_coop && matches!(dtype, GgmlDType::Q6K) {
+        // Legacy wc (broken — bit-mask unpack divergence). Kept for A/B only.
         "mul_mat_vec_q6_K_q8_1_wc".to_string()
+    } else if b_size == 1 && matches!(dtype, GgmlDType::Q6K)
+        && std::env::var("CANDLE_Q6K_WC_V2").map(|v| v != "0").unwrap_or(true)
+    {
+        // T3 (2026-04-20): correct warp-coop Q6K using canonical vec_dot.
+        // Default ON; disable with CANDLE_Q6K_WC_V2=0 to fall back to template cuda1.
+        "mul_mat_vec_q6_K_q8_1_wc_v2".to_string()
     } else if b_size == 1 && mmvq_b128 && matches!(dtype, GgmlDType::Q4_0) {
         "mul_mat_vec_q4_0_q8_1_cuda1_b128".to_string()
+    } else if b_size == 1 && q8_mmvq_b128 && matches!(dtype, GgmlDType::Q8_0) {
+        "mul_mat_vec_q8_0_q8_1_cuda1_b128".to_string()
     } else {
         format!("{kernel_name}{b_size}")
     };
@@ -475,15 +499,16 @@ pub fn launch_mul_mat_vec_q8_1_chunk_raw(
     // Q4K/Q5K warp-coop kernels correct after Phase B3-redo (pair-layout fix
     // landed 2026-04-13). Q6K still diverges; opt in via
     // CANDLE_KQUANT_WARP_COOP=1 once fixed.
+    let q6k_wc_v2 = std::env::var("CANDLE_Q6K_WC_V2").map(|v| v != "0").unwrap_or(true);
     let warp_coop = b_size == 1
-        && (matches!(
-                dtype,
-                GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0
-                | GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Mxfp4
-            )
-            || (q6_warp_coop && matches!(dtype, GgmlDType::Q6K)));
-    // b128 variant for Q4_0 b_size=1 — 128 threads, 1 output row per block.
-    let use_b128 = b_size == 1 && mmvq_b128 && matches!(dtype, GgmlDType::Q4_0);
+        && ((matches!(dtype, GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q8_0 | GgmlDType::Mxfp4))
+            || (kquant_wc && matches!(dtype, GgmlDType::Q4K | GgmlDType::Q5K))
+            || (q6_warp_coop && matches!(dtype, GgmlDType::Q6K))
+            || (q6k_wc_v2 && matches!(dtype, GgmlDType::Q6K)));
+    // b128 variant for Q4_0/Q8_0 b_size=1 — 128 threads, 1 output row per block.
+    let use_b128 = b_size == 1
+        && ((mmvq_b128 && matches!(dtype, GgmlDType::Q4_0))
+            || (q8_mmvq_b128 && matches!(dtype, GgmlDType::Q8_0)));
     let cfg = if use_b128 {
         hipdarc::driver::LaunchConfig {
             grid_dim: (nrows as u32, 1, 1),
@@ -628,16 +653,25 @@ fn mul_mat_q_v2(
     // the same workload (too few blocks for CU saturation on a 1024-col
     // projection). The `CANDLE_MMQ_TILE_N=8|16|32|64` env var selects a
     // specific variant for A/B diagnostics.
+    //
+    // P32 (dense cycle 2026-04-19): default flipped from 32 → 8. The v2f_tile32
+    // kernel at 88 VGPR caps occupancy at 2 waves/SIMD (gfx906 max=10). The v2
+    // kernel at TILE_N=8 uses 21 VGPR = 10 waves/SIMD = 5× higher occupancy.
+    // Measured: Qwen3.5-27B pp512 +37%, Qwen3-Coder-30B pp512 +16%, Gemma-31B
+    // pp flat, Qwen3.6 MoE flat. Decode (tg) unaffected — MMQ is prefill-only.
     let tile_n: usize = std::env::var("CANDLE_MMQ_TILE_N")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(32);
+        .unwrap_or(8);
 
     // MMQ turbo-port gate. Q4_0 (M2), Q4_1 (M3a), Q8_0 (M3c) covered.
     // See candle-hip-kernels/src/mmq_turbo.cu.
+    // P35 (2026-04-20): default ON. Measured Qwen3.5-27B pp512 95→254 (+168%),
+    // Gemma-31B pp512 95→274 (+188%), Devstral pp untouched (bench didn't parse).
+    // Opt-out: `CANDLE_MMQ_TURBO_PORT=0`.
     let turbo_on = std::env::var("CANDLE_MMQ_TURBO_PORT")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
     if turbo_on
         && (dtype == GgmlDType::Q4_0
             || dtype == GgmlDType::Q4_1
@@ -648,7 +682,715 @@ fn mul_mat_q_v2(
         }
     }
 
+    // P37 (2026-04-20): dense Q4_K turbo path (stripped-MoE variant).
+    // Target: Devstral / Mistral Q4_K_M prefill. Per-call 17.4 ms with
+    // v2f_tile8 (116 VGPR, 2 waves/SIMD) → expected ~2-3× with dense turbo.
+    // Opt-out via CANDLE_MMQ_TURBO_PORT=0 or CANDLE_Q4K_TURBO_DENSE=0.
+    if turbo_on
+        && dtype == GgmlDType::Q4K
+        && std::env::var("CANDLE_Q4K_TURBO_DENSE").map(|v| v != "0").unwrap_or(true)
+    {
+        // D1 (2026-04-20): 4-warp LDS-tiled dense Q4_K MMQ — reuses the
+        // MoE kernel's load_tiles + vec_dot helpers with MoE indirection
+        // stripped. Per-kernel 4-warp cooperative block (256 threads)
+        // with LDS-staged X+Y tiles. Expected to close the 2.81× per-call
+        // gap vs llama.cpp's mul_mat_q<Q4_K, 8, false> (measured in
+        // project_devstral_prefill_gap_elucidation_2026_04_20).
+        // Gate: CANDLE_Q4K_MMQ_4WARP=0 opts out. Default ON (2026-04-20):
+        // Devstral-24B Q4_K_M pp512 +23% alone, +72% combined with Q6_K
+        // 4-warp. No regression on Gemma-4-31B/26B, Qwen3.5-27B, Qwen3-
+        // Coder-30B, Qwen3.6-35B. Correctness: 10-shape sweep vs F32 ref.
+        if std::env::var("CANDLE_Q4K_MMQ_4WARP").map(|v| v != "0").unwrap_or(true) {
+            // D2 stream-K: reclaims tail waste on small-grid shapes.
+            // Opt-in via CANDLE_Q4K_MMQ_4WARP_STREAM_K=1.
+            if std::env::var("CANDLE_Q4K_MMQ_4WARP_STREAM_K").map(|v| v == "1").unwrap_or(false) {
+                if let Some(out) =
+                    mul_mat_q4_K_turbo_dense_4warp_stream_k(data, y, ncols, nrows, total_b, dev)?
+                {
+                    return Ok(Some(out));
+                }
+            }
+            // D1.5 mmq_y=128 variant: null on Devstral (-12%) — 124 VGPR
+            // drops from 3→2 waves/SIMD. Kept opt-in for experimentation.
+            if std::env::var("CANDLE_Q4K_MMQ_4WARP_Y128").map(|v| v == "1").unwrap_or(false) {
+                if let Some(out) =
+                    mul_mat_q4_K_turbo_dense_4warp_y128(data, y, ncols, nrows, total_b, dev)?
+                {
+                    return Ok(Some(out));
+                }
+            }
+            if let Some(out) =
+                mul_mat_q4_K_turbo_dense_4warp(data, y, ncols, nrows, total_b, dev)?
+            {
+                return Ok(Some(out));
+            }
+        }
+        if let Some(out) = mul_mat_q4_K_turbo_dense(data, y, ncols, nrows, total_b, dev)? {
+            return Ok(Some(out));
+        }
+    }
+
+    // P38 (2026-04-20): dense Q6_K turbo path. Targets Devstral-24B Q4_K_M
+    // whose Q6_K attention-output + FFN-down projections were falling to
+    // MMVQ-b8 fallback at prefill (43% of kernel time, 5.77 s/pp512 run).
+    // Opt-out: CANDLE_MMQ_TURBO_PORT=0 or CANDLE_Q6K_TURBO_DENSE=0.
+    if turbo_on
+        && dtype == GgmlDType::Q6K
+        && std::env::var("CANDLE_Q6K_TURBO_DENSE").map(|v| v != "0").unwrap_or(true)
+    {
+        // D1 (2026-04-20): 4-warp LDS-tiled dense Q6_K MMQ. Default ON:
+        // Q6_K per-call 47.41 → 14.11 ms on Devstral (3.36× faster); pp512
+        // with Q4_K 4warp combined = +72%. 109 VGPR @ mmq_x=16 (2 waves/
+        // SIMD, lower than llama.cpp's 125). Opt-out: CANDLE_Q6K_MMQ_4WARP=0.
+        if std::env::var("CANDLE_Q6K_MMQ_4WARP").map(|v| v != "0").unwrap_or(true) {
+            if let Some(out) =
+                mul_mat_q6_K_turbo_dense_4warp(data, y, ncols, nrows, total_b, dev)?
+            {
+                return Ok(Some(out));
+            }
+        }
+        if let Some(out) = mul_mat_q6_K_turbo_dense(data, y, ncols, nrows, total_b, dev)? {
+            return Ok(Some(out));
+        }
+    }
+
     mul_mat_q_v2_with_tile_n(data, y, dtype, ncols, nrows, total_b, dev, tile_n)
+}
+
+/// P37: dense Q4_K turbo MMQ. Mirrors `mul_mat_q40q41_turbo` structure but
+/// dispatches to `mul_mat_q4_K_turbo_dense_xN_{checked,unchecked}` kernels.
+/// Reuses `quantize_q8_1_mmq_q4_0` for Y (144-byte Q8_1 MMQ layout is
+/// dtype-agnostic in this port).
+#[cfg(feature = "hip")]
+fn mul_mat_q4_K_turbo_dense(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    // Q4_K superblock is 256 elems; k must be a multiple of that.
+    const QK_K_LOCAL: usize = 256;
+    if ncols % QK_K_LOCAL != 0 {
+        return Ok(None);
+    }
+    const BIG_BLOCK_ELEMS: usize = 128;
+    const Q8_1_MMQ_BYTES: usize = 144;
+
+    // row-tile: 64 rows per block (single-warp, mmq_y = WARP_SIZE).
+    let mmq_y = WARP_SIZE;
+
+    // P37: empirically mmq_x=8 wins on Devstral prefill (X8 +8% vs v2f_tile8,
+    // X16 -4%, X32 -22%, X64 -19% measured Apr 2026). Override via
+    // CANDLE_MMQ_TURBO_X; default fixed at 8 for dense Q4_K.
+    let mmq_x: usize = std::env::var("CANDLE_MMQ_TURBO_X")
+        .ok().and_then(|s| s.parse().ok())
+        .filter(|x| matches!(x, 8 | 16 | 32 | 64))
+        .unwrap_or(8);
+    if total_b == 0 { return Ok(None); }
+
+    let need_check = nrows % mmq_y != 0;
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let kernel_name = match mmq_x {
+        8 | 16 | 32 | 64 => format!("mul_mat_q4_K_turbo_dense_x{mmq_x}_{suffix}"),
+        _ => return Ok(None),
+    };
+
+    let n_big_blocks_real = ncols.div_ceil(BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
+    let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_b_padded * Q8_1_MMQ_BYTES;
+    let y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+
+    // Quantize Y via the Q4_0/MMQ quantizer (144-byte layout = same as Q4_K expects).
+    {
+        let qkernel = dev.get_or_load_func(
+            "quantize_q8_1_mmq_q4_0",
+            &candle_hip_kernels::MMQ_TURBO,
+        )?;
+        let qcfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (n_big_blocks_real as u32, total_b as u32, 1),
+            block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qkernel.builder();
+        qb.arg(y);
+        qb.arg(&y_mmq);
+        barg!(qb, ncols as i32, total_b_padded as i32);
+        unsafe { qb.launch(qcfg) }.w()?;
+    }
+
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
+    let blocks_per_row_x = ncols / QK_K_LOCAL;
+    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(nrows, mmq_y) as u32,
+            ceil_div(total_b, mmq_x) as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = func.builder();
+    b.arg(&data.inner);
+    b.arg(&y_mmq);
+    b.arg(&dst);
+    barg!(
+        b,
+        ncols as i32,
+        nrows as i32,
+        total_b_padded as i32,       // stride_col_y
+        blocks_per_row_x as i32,     // stride_row_x
+        total_b as i32,
+        nrows as i32                 // nrows_dst
+    );
+    unsafe { b.launch(cfg) }.w()?;
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
+}
+
+/// D1 (2026-04-20): 4-warp LDS-tiled dense Q4_K MMQ. Same Y layout and
+/// arguments as `mul_mat_q4_K_turbo_dense`; switches to the 4-warp
+/// kernel family (`mul_mat_q4_K_turbo_dense_4warp_xN_{checked,unchecked}`)
+/// which uses 256 threads/block with LDS-staged X and Y tiles.
+///
+/// mmq_x=8 register-spills (128 VGPR + private scratch); mmq_x=16 is the
+/// smallest usable tile (63/69 VGPR, 3 waves/SIMD). Default mmq_x=16.
+#[cfg(feature = "hip")]
+fn mul_mat_q4_K_turbo_dense_4warp(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    const QK_K_LOCAL: usize = 256;
+    if ncols % QK_K_LOCAL != 0 {
+        return Ok(None);
+    }
+    const BIG_BLOCK_ELEMS: usize = 128;
+    const Q8_1_MMQ_BYTES: usize = 144;
+
+    // 64 rows per block — matches MMQ_Y_Q8 in the kernel.
+    let mmq_y = WARP_SIZE;
+
+    // mmq_x=16 is the smallest viable tile (x=8 spills to scratch at 128 VGPR).
+    // Override via CANDLE_Q4K_MMQ_4WARP_X ∈ {16, 32}.
+    let mmq_x: usize = std::env::var("CANDLE_Q4K_MMQ_4WARP_X")
+        .ok().and_then(|s| s.parse().ok())
+        .filter(|x| matches!(x, 16 | 32))
+        .unwrap_or(16);
+    if total_b == 0 { return Ok(None); }
+
+    let need_check = nrows % mmq_y != 0;
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let kernel_name = format!("mul_mat_q4_K_turbo_dense_4warp_x{mmq_x}_{suffix}");
+
+    let n_big_blocks_real = ncols.div_ceil(BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
+    let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_b_padded * Q8_1_MMQ_BYTES;
+    let y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+
+    // Reuse the same 144-byte Q8_1 MMQ quantizer as the single-warp path.
+    {
+        let qkernel = dev.get_or_load_func(
+            "quantize_q8_1_mmq_q4_0",
+            &candle_hip_kernels::MMQ_TURBO,
+        )?;
+        let qcfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (n_big_blocks_real as u32, total_b as u32, 1),
+            block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qkernel.builder();
+        qb.arg(y);
+        qb.arg(&y_mmq);
+        barg!(qb, ncols as i32, total_b_padded as i32);
+        unsafe { qb.launch(qcfg) }.w()?;
+    }
+
+    // LDS layout for the 4-warp Q4_K kernel (see mmq_turbo.cu):
+    //   tile_y = PAD(mmq_x * MMQ_TILE_Y_K, nwarps*warp_size) ints  (MMQ_TILE_Y_K=36)
+    //   x_qs   = MMQ_Y_Q8 * (MMQ_TILE_NE_K + 1) = 64*33 = 2112 ints
+    //   x_dm   = MMQ_Y_Q8 * 8 + MMQ_Y_Q8/4 = 528 ints (reserve; actual use is smaller)
+    //   x_sc   = MMQ_Y_Q8 * (MMQ_TILE_NE_K/8) + MMQ_Y_Q8/8 = 264 ints (Q4_K-specific)
+    const MMQ_TILE_Y_K: usize = 36;
+    const MMQ_NWARPS: usize = 4;
+    const X_QS_INTS: usize = 64 * 33;
+    const X_DM_RESERVE_INTS: usize = 64 * 8 + 64 / 4;
+    const X_SC_INTS: usize = 64 * 4 + 64 / 8;
+    let tile_y_ints = {
+        let raw = mmq_x * MMQ_TILE_Y_K;
+        let pad = MMQ_NWARPS * WARP_SIZE;
+        raw.div_ceil(pad) * pad
+    };
+    let shared_mem_bytes =
+        (tile_y_ints + X_QS_INTS + X_DM_RESERVE_INTS + X_SC_INTS) * 4;
+
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
+    let blocks_per_row_x = ncols / QK_K_LOCAL;
+    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(nrows, mmq_y) as u32,
+            ceil_div(total_b, mmq_x) as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+        shared_mem_bytes: shared_mem_bytes as u32,
+    };
+    let mut b = func.builder();
+    b.arg(&data.inner);
+    b.arg(&y_mmq);
+    b.arg(&dst);
+    barg!(
+        b,
+        ncols as i32,
+        nrows as i32,
+        total_b_padded as i32,
+        blocks_per_row_x as i32,
+        total_b as i32,
+        nrows as i32
+    );
+    unsafe { b.launch(cfg) }.w()?;
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
+}
+
+/// D2 (2026-04-20): stream-K partitioning for the 4-warp Q4_K dense
+/// MMQ. Launches `nsm` WGs (one per CU on gfx906 → 60) each walking
+/// a contiguous k-block-continuous range. Complete tiles write to
+/// `dst`; partial tiles at the WG boundary write to `tmp_fixup`.
+/// Fixup kernel then sums per-bidx partials into dst for any tile
+/// that was split. Reclaims tail waste on small-grid shapes.
+#[cfg(feature = "hip")]
+fn mul_mat_q4_K_turbo_dense_4warp_stream_k(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    const QK_K_LOCAL: usize = 256;
+    if ncols % QK_K_LOCAL != 0 {
+        return Ok(None);
+    }
+    const BIG_BLOCK_ELEMS: usize = 128;
+    const Q8_1_MMQ_BYTES: usize = 144;
+
+    let mmq_y = WARP_SIZE;
+
+    let mmq_x: usize = std::env::var("CANDLE_Q4K_MMQ_4WARP_X")
+        .ok().and_then(|s| s.parse().ok())
+        .filter(|x| matches!(x, 16 | 32))
+        .unwrap_or(16);
+    if total_b == 0 { return Ok(None); }
+
+    let need_check = nrows % mmq_y != 0;
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let sk_kernel_name   = format!("mul_mat_q4_K_turbo_dense_4warp_sk_x{mmq_x}_{suffix}");
+    let fix_kernel_name  = format!("mul_mat_q4_K_turbo_dense_4warp_sk_fixup_x{mmq_x}_{suffix}");
+
+    let n_big_blocks_real = ncols.div_ceil(BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
+    let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_b_padded * Q8_1_MMQ_BYTES;
+    let y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+
+    {
+        let qkernel = dev.get_or_load_func(
+            "quantize_q8_1_mmq_q4_0",
+            &candle_hip_kernels::MMQ_TURBO,
+        )?;
+        let qcfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (n_big_blocks_real as u32, total_b as u32, 1),
+            block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qkernel.builder();
+        qb.arg(y);
+        qb.arg(&y_mmq);
+        barg!(qb, ncols as i32, total_b_padded as i32);
+        unsafe { qb.launch(qcfg) }.w()?;
+    }
+
+    // gfx906 MI50 has 60 CUs. Kernel fits 2 blocks/CU at 78 VGPR, so
+    // launch 2×nsm = 120 WGs to saturate block slots (matches turbo's
+    // `__launch_bounds__(..., 2)` hint).
+    const NSM: usize = 120;
+
+    const MMQ_TILE_Y_K: usize = 36;
+    const MMQ_NWARPS: usize = 4;
+    const X_QS_INTS: usize = 64 * 33;
+    const X_DM_RESERVE_INTS: usize = 64 * 8 + 64 / 4;
+    const X_SC_INTS: usize = 64 * 4 + 64 / 8;
+    let tile_y_ints = {
+        let raw = mmq_x * MMQ_TILE_Y_K;
+        let pad = MMQ_NWARPS * WARP_SIZE;
+        raw.div_ceil(pad) * pad
+    };
+    let shared_mem_bytes =
+        (tile_y_ints + X_QS_INTS + X_DM_RESERVE_INTS + X_SC_INTS) * 4;
+
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
+
+    // tmp_fixup: one partial-sum slot per WG (nsm), sized mmq_x * mmq_y floats.
+    let tmp_fixup = dev.alloc_zeros::<f32>(NSM * mmq_x * mmq_y)?;
+
+    let blocks_per_row_x = ncols / QK_K_LOCAL;
+
+    // Main stream-K kernel.
+    {
+        let func = dev.get_or_load_func(&sk_kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (NSM as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+            shared_mem_bytes: shared_mem_bytes as u32,
+        };
+        let mut b = func.builder();
+        b.arg(&data.inner);
+        b.arg(&y_mmq);
+        b.arg(&dst);
+        b.arg(&tmp_fixup);
+        barg!(
+            b,
+            ncols as i32,
+            nrows as i32,
+            total_b as i32,         // ncols_dst
+            total_b_padded as i32,  // stride_col_y
+            blocks_per_row_x as i32,
+            nrows as i32            // stride_col_dst (column-major dst)
+        );
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    // Fixup kernel: gathers per-bidx partials into dst.
+    {
+        let func = dev.get_or_load_func(&fix_kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+        let cfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (NSM as u32, 1, 1),
+            block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = func.builder();
+        b.arg(&dst);
+        b.arg(&tmp_fixup);
+        barg!(
+            b,
+            ncols as i32,
+            nrows as i32,
+            total_b as i32,
+            nrows as i32
+        );
+        unsafe { b.launch(cfg) }.w()?;
+    }
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
+}
+
+/// D1.5 (2026-04-20): mmq_y=128 variant of the 4-warp Q4_K MMQ.
+/// Matches turbo's tile shape for gfx906 — 128 rows × 8 cols per block,
+/// 256 threads cooperating via LDS staging. 124 VGPR at mmq_x=8 (same
+/// 2-waves/SIMD bucket as llama.cpp's mul_mat_q<Q4_K, 8, false>) but
+/// with 2× the X-tile amortization vs the y=64 variant.
+#[cfg(feature = "hip")]
+fn mul_mat_q4_K_turbo_dense_4warp_y128(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    const QK_K_LOCAL: usize = 256;
+    if ncols % QK_K_LOCAL != 0 {
+        return Ok(None);
+    }
+    const BIG_BLOCK_ELEMS: usize = 128;
+    const Q8_1_MMQ_BYTES: usize = 144;
+
+    // 128 rows per block (matches the y128 kernel template).
+    let mmq_y = 128usize;
+
+    // mmq_x=8 is the sweet spot at y=128 (124 VGPR, no scratch, matches
+    // llama.cpp's dispatch). x=16 spills on checked path.
+    // Override via CANDLE_Q4K_MMQ_4WARP_X ∈ {8, 16}.
+    let mmq_x: usize = std::env::var("CANDLE_Q4K_MMQ_4WARP_X")
+        .ok().and_then(|s| s.parse().ok())
+        .filter(|x| matches!(x, 8 | 16))
+        .unwrap_or(8);
+    if total_b == 0 { return Ok(None); }
+
+    let need_check = nrows % mmq_y != 0;
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let kernel_name = format!("mul_mat_q4_K_turbo_dense_4warp_y128_x{mmq_x}_{suffix}");
+
+    let n_big_blocks_real = ncols.div_ceil(BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
+    let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_b_padded * Q8_1_MMQ_BYTES;
+    let y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+
+    {
+        let qkernel = dev.get_or_load_func(
+            "quantize_q8_1_mmq_q4_0",
+            &candle_hip_kernels::MMQ_TURBO,
+        )?;
+        let qcfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (n_big_blocks_real as u32, total_b as u32, 1),
+            block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qkernel.builder();
+        qb.arg(y);
+        qb.arg(&y_mmq);
+        barg!(qb, ncols as i32, total_b_padded as i32);
+        unsafe { qb.launch(qcfg) }.w()?;
+    }
+
+    // LDS for y=128:
+    //   tile_y  = PAD(mmq_x * 36, 256)
+    //   x_qs    = 128 * 33 = 4224 ints
+    //   x_dm    = reserve 128*8 + 128/4 = 1056 ints
+    //   x_sc    = 128 * 4 + 128/8 = 528 ints
+    const MMQ_TILE_Y_K: usize = 36;
+    const MMQ_NWARPS: usize = 4;
+    const X_QS_INTS_Y128: usize = 128 * 33;
+    const X_DM_RESERVE_Y128: usize = 128 * 8 + 128 / 4;
+    const X_SC_INTS_Y128: usize = 128 * 4 + 128 / 8;
+    let tile_y_ints = {
+        let raw = mmq_x * MMQ_TILE_Y_K;
+        let pad = MMQ_NWARPS * WARP_SIZE;
+        raw.div_ceil(pad) * pad
+    };
+    let shared_mem_bytes =
+        (tile_y_ints + X_QS_INTS_Y128 + X_DM_RESERVE_Y128 + X_SC_INTS_Y128) * 4;
+
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
+    let blocks_per_row_x = ncols / QK_K_LOCAL;
+    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(nrows, mmq_y) as u32,
+            ceil_div(total_b, mmq_x) as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+        shared_mem_bytes: shared_mem_bytes as u32,
+    };
+    let mut b = func.builder();
+    b.arg(&data.inner);
+    b.arg(&y_mmq);
+    b.arg(&dst);
+    barg!(
+        b,
+        ncols as i32,
+        nrows as i32,
+        total_b_padded as i32,
+        blocks_per_row_x as i32,
+        total_b as i32,
+        nrows as i32
+    );
+    unsafe { b.launch(cfg) }.w()?;
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
+}
+
+/// D1 (2026-04-20): 4-warp LDS-tiled dense Q6_K MMQ. Mirrors the Q4_K
+/// 4-warp path — 256 threads/block, mmq_y=64, LDS-staged X and Y tiles.
+/// 109 VGPR at mmq_x=16 (2 waves/SIMD, better than llama.cpp's 125).
+#[cfg(feature = "hip")]
+fn mul_mat_q6_K_turbo_dense_4warp(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    const QK_K_LOCAL: usize = 256;
+    if ncols % QK_K_LOCAL != 0 {
+        return Ok(None);
+    }
+    const BIG_BLOCK_ELEMS: usize = 128;
+    const Q8_1_MMQ_BYTES: usize = 144;
+
+    let mmq_y = WARP_SIZE;  // 64
+
+    // mmq_x=8 spills (164 B scratch); 16 is the primary, 32 also valid.
+    let mmq_x: usize = std::env::var("CANDLE_Q6K_MMQ_4WARP_X")
+        .ok().and_then(|s| s.parse().ok())
+        .filter(|x| matches!(x, 16 | 32))
+        .unwrap_or(16);
+    if total_b == 0 { return Ok(None); }
+
+    let need_check = nrows % mmq_y != 0;
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let kernel_name = format!("mul_mat_q6_K_turbo_dense_4warp_x{mmq_x}_{suffix}");
+
+    let n_big_blocks_real = ncols.div_ceil(BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
+    let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_b_padded * Q8_1_MMQ_BYTES;
+    let y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+
+    {
+        let qkernel = dev.get_or_load_func(
+            "quantize_q8_1_mmq_q4_0",
+            &candle_hip_kernels::MMQ_TURBO,
+        )?;
+        let qcfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (n_big_blocks_real as u32, total_b as u32, 1),
+            block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qkernel.builder();
+        qb.arg(y);
+        qb.arg(&y_mmq);
+        barg!(qb, ncols as i32, total_b_padded as i32);
+        unsafe { qb.launch(qcfg) }.w()?;
+    }
+
+    // LDS for Q6_K y=64:
+    //   x_qs: 64 * (2*32 + 1) = 4160 ints
+    //   x_df: 64 * (32/32) + 64/32 = 66 floats
+    //   x_sc: 64 * (32/8) + 64/8 = 264 ints
+    const MMQ_TILE_Y_K: usize = 36;
+    const MMQ_NWARPS: usize = 4;
+    const X_QS_INTS_Q6: usize = 64 * (2 * 32 + 1);
+    const X_DF_FLOATS_Q6: usize = 64 * (32 / 32) + 64 / 32;
+    const X_SC_INTS_Q6: usize = 64 * (32 / 8) + 64 / 8;
+    let tile_y_ints = {
+        let raw = mmq_x * MMQ_TILE_Y_K;
+        let pad = MMQ_NWARPS * WARP_SIZE;
+        raw.div_ceil(pad) * pad
+    };
+    let shared_mem_bytes =
+        (tile_y_ints + X_QS_INTS_Q6 + X_DF_FLOATS_Q6 + X_SC_INTS_Q6) * 4;
+
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
+    let blocks_per_row_x = ncols / QK_K_LOCAL;
+    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(nrows, mmq_y) as u32,
+            ceil_div(total_b, mmq_x) as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, MMQ_NWARPS as u32, 1),
+        shared_mem_bytes: shared_mem_bytes as u32,
+    };
+    let mut b = func.builder();
+    b.arg(&data.inner);
+    b.arg(&y_mmq);
+    b.arg(&dst);
+    barg!(
+        b,
+        ncols as i32,
+        nrows as i32,
+        total_b_padded as i32,
+        blocks_per_row_x as i32,
+        total_b as i32,
+        nrows as i32
+    );
+    unsafe { b.launch(cfg) }.w()?;
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
+}
+
+/// P38: dense Q6_K turbo MMQ. Same Y layout and dispatch shape as
+/// `mul_mat_q4_K_turbo_dense`; dispatches to
+/// `mul_mat_q6_K_turbo_dense_xN_{checked,unchecked}` kernels.
+#[cfg(feature = "hip")]
+fn mul_mat_q6_K_turbo_dense(
+    data: &PaddedHipSlice,
+    y: &HipView<'_, f32>,
+    ncols: usize,
+    nrows: usize,
+    total_b: usize,
+    dev: &HipDevice,
+) -> Result<Option<HipStorage>> {
+    const QK_K_LOCAL: usize = 256;
+    if ncols % QK_K_LOCAL != 0 {
+        return Ok(None);
+    }
+    const BIG_BLOCK_ELEMS: usize = 128;
+    const Q8_1_MMQ_BYTES: usize = 144;
+
+    let mmq_y = WARP_SIZE;
+
+    // Start conservative: mmq_x=8 matched P37 Q4_K optimum on gfx906
+    // (K-quant register pressure keeps higher TILE_N below 2 waves/SIMD).
+    // Override via CANDLE_MMQ_TURBO_X.
+    let mmq_x: usize = std::env::var("CANDLE_MMQ_TURBO_X")
+        .ok().and_then(|s| s.parse().ok())
+        .filter(|x| matches!(x, 8 | 16 | 32 | 64))
+        .unwrap_or(8);
+    if total_b == 0 { return Ok(None); }
+
+    let need_check = nrows % mmq_y != 0;
+    let suffix = if need_check { "checked" } else { "unchecked" };
+    let kernel_name = match mmq_x {
+        8 | 16 | 32 | 64 => format!("mul_mat_q6_K_turbo_dense_x{mmq_x}_{suffix}"),
+        _ => return Ok(None),
+    };
+
+    let n_big_blocks_real = ncols.div_ceil(BIG_BLOCK_ELEMS);
+    let n_big_blocks_alloc = n_big_blocks_real + 1;
+    let total_b_padded = total_b.div_ceil(mmq_x) * mmq_x;
+    let y_mmq_size_bytes = n_big_blocks_alloc * total_b_padded * Q8_1_MMQ_BYTES;
+    let y_mmq = dev.alloc_zeros::<u8>(y_mmq_size_bytes)?;
+
+    {
+        let qkernel = dev.get_or_load_func(
+            "quantize_q8_1_mmq_q4_0",
+            &candle_hip_kernels::MMQ_TURBO,
+        )?;
+        let qcfg = hipdarc::driver::LaunchConfig {
+            grid_dim: (n_big_blocks_real as u32, total_b as u32, 1),
+            block_dim: (BIG_BLOCK_ELEMS as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut qb = qkernel.builder();
+        qb.arg(y);
+        qb.arg(&y_mmq);
+        barg!(qb, ncols as i32, total_b_padded as i32);
+        unsafe { qb.launch(qcfg) }.w()?;
+    }
+
+    let dst = unsafe { dev.alloc::<f32>(total_b * nrows)? };
+    let blocks_per_row_x = ncols / QK_K_LOCAL;
+    let func = dev.get_or_load_func(&kernel_name, &candle_hip_kernels::MMQ_TURBO)?;
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (
+            ceil_div(nrows, mmq_y) as u32,
+            ceil_div(total_b, mmq_x) as u32,
+            1,
+        ),
+        block_dim: (WARP_SIZE as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = func.builder();
+    b.arg(&data.inner);
+    b.arg(&y_mmq);
+    b.arg(&dst);
+    barg!(
+        b,
+        ncols as i32,
+        nrows as i32,
+        total_b_padded as i32,
+        blocks_per_row_x as i32,
+        total_b as i32,
+        nrows as i32
+    );
+    unsafe { b.launch(cfg) }.w()?;
+
+    Ok(Some(HipStorage::wrap_hip_slice(dst, dev.clone())))
 }
 
 /// Turbo-port path: Q4_0 (M2) / Q4_1 (M3a) MMQ with turbo's tile geometry
@@ -921,13 +1663,22 @@ fn mul_mat_q_v2_with_tile_n(
             // unrolled inner body is 8× larger (8 sub-blocks per K
             // super-block). Dropping the per-col bounds check should
             // give the biggest absolute savings here.
+            //
+            // P8 v3 (CANDLE_Q5K_MMQ_V3=1): merges sumf_d[]/sumf_m[]
+            // intermediates directly into sums[], targeting the 192→≤128
+            // VGPR reduction that unlocks 2 waves/SIMD. Correctness-gated
+            // by hip_q5k_mmq_vgpr_test.
             let want_legacy = std::env::var("CANDLE_MMQ_VARIANT")
                 .map(|s| s == "v2_legacy")
+                .unwrap_or(false);
+            let want_v3 = std::env::var("CANDLE_Q5K_MMQ_V3")
+                .map(|s| s == "1")
                 .unwrap_or(false);
             match tile_n_hint {
                 8 => ("mul_mat_q5_K_gfx906_v2", 8),
                 16 => ("mul_mat_q5_K_gfx906_v2_tile16", 16),
                 _ if want_legacy => ("mul_mat_q5_K_gfx906_v2_tile32", 32),
+                _ if want_v3 => ("mul_mat_q5_K_gfx906_v3_tile32", 32),
                 _ => ("mul_mat_q5_K_gfx906_v2f_tile32", 32),
             }
         }
@@ -1320,7 +2071,8 @@ fn indexed_moe_forward_turbo_moe(
 
     // Gate: CANDLE_MMQ_TURBO_PORT=1 enables M2/M3/M6/M7; CANDLE_MMQ_TURBO_MOE=0
     // can disable just the MoE path without disabling the regular MMQ port.
-    let port_on = std::env::var("CANDLE_MMQ_TURBO_PORT").map(|v| v == "1").unwrap_or(false);
+    // P35 (2026-04-20): default ON.
+    let port_on = std::env::var("CANDLE_MMQ_TURBO_PORT").map(|v| v != "0" && v != "false").unwrap_or(true);
     let moe_on = std::env::var("CANDLE_MMQ_TURBO_MOE").map(|v| v != "0").unwrap_or(true);
     if !(port_on && moe_on) {
         return Ok(None);
@@ -1697,23 +2449,96 @@ fn launch_indexed_moe_forward_with_q8(
     let outsize = batch * topk * n;
     let out = unsafe { dev.alloc::<f32>(outsize)? };
 
-    let kernel_name = match w_dtype {
-        GgmlDType::Q2K => "indexed_moe_forward_q2k_q8_1",
-        GgmlDType::Q3K => "indexed_moe_forward_q3k_q8_1",
-        GgmlDType::Q4K => "indexed_moe_forward_q4k_q8_1",
-        GgmlDType::Q5K => "indexed_moe_forward_q5k_q8_1",
-        GgmlDType::Q6K => "indexed_moe_forward_q6k_q8_1",
-        GgmlDType::Q8_0 => "indexed_moe_forward_q8_0_q8_1",
-        GgmlDType::Q4_0 => "indexed_moe_forward_q4_0_q8_1",
-        GgmlDType::Q4_1 => "indexed_moe_forward_q4_1_q8_1",
-        GgmlDType::Q5_0 => "indexed_moe_forward_q5_0_q8_1",
-        GgmlDType::Q5_1 => "indexed_moe_forward_q5_1_q8_1",
+    // P13+P14: single-warp variant + multi-row packing.
+    //   P13 (nw1):   1 warp, 1 row per block — halves waste from nw4 default.
+    //   P14 (nw1 rN): 1 warp, N rows per block — saturates 64 threads when
+    //                 per-row work is < 64 threads (small blocks_per_row_x).
+    //
+    // Work per row = blocks_per_row_x * (qi/vdr). Choose rows_per_block so
+    // that (work_per_row × rows) ≤ 64 while ≥ 32 per row (keeps each sub-
+    // warp's __shfl_xor reduction balanced).
+    //
+    // Example: Q4_K hidden=2048, qi/vdr=4, blocks_per_row_x=8 → work_per_row=32.
+    //   r1 saturates 32 of 64 lanes (50% waste) → choose r2 (2 × 32 = 64 ✓).
+    // Q4_K hidden=768, qi/vdr=4, blocks_per_row_x=3 → work_per_row=12.
+    //   r4 saturates 4 × 12 = 48 of 64 lanes (still < 64 but close).
+    //
+    // Env knobs:
+    //   CANDLE_MOE_MMVQ_NW1=0 → force legacy 4-warp (regression baseline)
+    //   CANDLE_MOE_MMVQ_ROWS={1,2,4} → force rows_per_block (bench / debug)
+    let (k_per_block_q, qi_over_vdr) = match w_dtype {
+        GgmlDType::Q4K => (256usize, 4usize),
+        GgmlDType::Q5K => (256, 4),
+        GgmlDType::Q6K => (256, 4),
+        GgmlDType::Q8_0 => (32, 1),
+        _ => (0, 0),
+    };
+    let want_nw1 = std::env::var("CANDLE_MOE_MMVQ_NW1").ok().as_deref() != Some("0")
+        && qi_over_vdr > 0
+        && matches!(w_dtype, GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K | GgmlDType::Q8_0)
+        && k % k_per_block_q == 0
+        && (k / k_per_block_q) * qi_over_vdr <= 64;
+
+    // rows_per_block dispatch: only applies to Q4_K / Q5_K / Q6_K (r2, r4
+    // variants compiled) when nw1 is active.
+    let work_per_row = if qi_over_vdr > 0 && k_per_block_q > 0 {
+        (k / k_per_block_q) * qi_over_vdr
+    } else { 0 };
+    let env_rows = std::env::var("CANDLE_MOE_MMVQ_ROWS").ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|r| matches!(r, 1 | 2 | 4));
+    // P29 (2026-04-19): multi-row r2 now wins after replacing __shfl_xor(width=32)
+    // with DPP-fused `gfx906_half_warp_reduce_sum_dpp`. Measured Qwen3.6-35B tg
+    // +4.2%, Qwen3-Coder-30B tg +3.3%. Auto-select r2 for Q4K/Q5K/Q6K; Q8_0 has
+    // no r2 variant yet. Override with CANDLE_MOE_MMVQ_ROWS={1,2,4}.
+    let auto_rows: usize = if want_nw1
+        && matches!(w_dtype, GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q6K)
+    {
+        2
+    } else {
+        1
+    };
+    let rows_per_block: usize = if !want_nw1 {
+        1
+    } else if let Some(r) = env_rows {
+        r
+    } else {
+        auto_rows
+    };
+    // Unused in the auto-path for now (kept for env override above):
+    let _ = work_per_row;
+    // Guard: r4/r2 require n % rows == 0 for the kernel's simple row-slot
+    // packing, otherwise the extra slots write OOB — skip up to r1 if not
+    // aligned.
+    let rows_per_block = if n % rows_per_block == 0 { rows_per_block } else { 1 };
+
+    let kernel_name: &str = match (w_dtype, want_nw1, rows_per_block) {
+        (GgmlDType::Q2K, _, _) => "indexed_moe_forward_q2k_q8_1",
+        (GgmlDType::Q3K, _, _) => "indexed_moe_forward_q3k_q8_1",
+        (GgmlDType::Q4K, false, _) => "indexed_moe_forward_q4k_q8_1",
+        (GgmlDType::Q4K, true, 4)  => "indexed_moe_forward_q4k_q8_1_nw1_r4",
+        (GgmlDType::Q4K, true, 2)  => "indexed_moe_forward_q4k_q8_1_nw1_r2",
+        (GgmlDType::Q4K, true, _)  => "indexed_moe_forward_q4k_q8_1_nw1",
+        (GgmlDType::Q5K, false, _) => "indexed_moe_forward_q5k_q8_1",
+        (GgmlDType::Q5K, true, 4)  => "indexed_moe_forward_q5k_q8_1_nw1_r4",
+        (GgmlDType::Q5K, true, 2)  => "indexed_moe_forward_q5k_q8_1_nw1_r2",
+        (GgmlDType::Q5K, true, _)  => "indexed_moe_forward_q5k_q8_1_nw1",
+        (GgmlDType::Q6K, false, _) => "indexed_moe_forward_q6k_q8_1",
+        (GgmlDType::Q6K, true, 2)  => "indexed_moe_forward_q6k_q8_1_nw1_r2",
+        (GgmlDType::Q6K, true, _)  => "indexed_moe_forward_q6k_q8_1_nw1",
+        (GgmlDType::Q8_0, false, _) => "indexed_moe_forward_q8_0_q8_1",
+        (GgmlDType::Q8_0, true, _)  => "indexed_moe_forward_q8_0_q8_1_nw1",
+        (GgmlDType::Q4_0, _, _) => "indexed_moe_forward_q4_0_q8_1",
+        (GgmlDType::Q4_1, _, _) => "indexed_moe_forward_q4_1_q8_1",
+        (GgmlDType::Q5_0, _, _) => "indexed_moe_forward_q5_0_q8_1",
+        (GgmlDType::Q5_1, _, _) => "indexed_moe_forward_q5_1_q8_1",
         _ => crate::bail!("unsupported dtype for indexed_moe_forward {w_dtype:?}"),
     };
     let func = dev.get_or_load_func(kernel_name, &candle_hip_kernels::QUANTIZED)?;
-    let (nblocks, nwarps) = (n as u32, 4);
+    let nwarps: u32 = if want_nw1 { 1 } else { 4 };
+    let grid_x = (n as u32) / (rows_per_block as u32);
     let cfg = hipdarc::driver::LaunchConfig {
-        grid_dim: (nblocks, batch as u32, topk as u32),
+        grid_dim: (grid_x, batch as u32, topk as u32),
         block_dim: (WARP_SIZE as u32, nwarps, 1),
         shared_mem_bytes: 0,
     };
@@ -1742,6 +2567,110 @@ fn launch_indexed_moe_forward_with_q8(
         HipStorage::wrap_hip_slice(out, dev.clone()),
         out_shape.into(),
     ))
+}
+
+/// P21: dual-weight MoE MMVQ fused launch for gate+up.
+/// Mirrors `launch_indexed_moe_forward_with_q8` but dispatches the nw1
+/// gate_up variant that computes BOTH gate and up outputs in a single
+/// kernel. Input Q8_1 buffer is read once (L1-hot), saving HIP launch
+/// overhead vs two separate MMVQ calls. Falls back to Ok(None) when the
+/// dtype / shape isn't supported by a gate_up kernel.
+pub fn launch_indexed_moe_gate_up_with_q8(
+    gate_weight: &HipView<'_, u8>,
+    up_weight: &HipView<'_, u8>,
+    w_shape: &crate::Shape,            // [num_experts, n, k] (same for gate and up)
+    w_dtype: GgmlDType,
+    input_q8_1: &HipView<'_, u8>,
+    in_shape: &crate::Shape,           // [batch, topk_or_1, k]
+    ids: &HipView<'_, u32>,
+    idx_shape: &crate::Shape,          // [batch, topk]
+    dev: &HipDevice,
+) -> Result<Option<(HipStorage, HipStorage, crate::Shape)>> {
+    let (_, n, k) = w_shape.dims3()?;
+    let batch = in_shape.dims()[0];
+    let input_dim1 = in_shape.dims()[1];
+    let topk = idx_shape.dims()[1];
+    let k_padded = pad(k, MATRIX_ROW_PADDING);
+
+    // Only Q4_K / Q5_K / Q8_0 gate_up kernels exist. Must also match the
+    // nw1 dispatch condition: work_per_row ≤ 64.
+    let (k_per_block_q, qi_over_vdr, kname_r1): (usize, usize, &str) = match w_dtype {
+        GgmlDType::Q4K => (256, 4, "indexed_moe_forward_q4k_q8_1_gate_up_nw1"),
+        GgmlDType::Q5K => (256, 4, "indexed_moe_forward_q5k_q8_1_gate_up_nw1"),
+        GgmlDType::Q8_0 => (32, 1, "indexed_moe_forward_q8_0_q8_1_gate_up_nw1"),
+        _ => return Ok(None),
+    };
+    if k % k_per_block_q != 0 || (k / k_per_block_q) * qi_over_vdr > 64 {
+        return Ok(None);
+    }
+    if std::env::var("CANDLE_MOE_MMVQ_NW1").ok().as_deref() == Some("0") {
+        return Ok(None);
+    }
+    if std::env::var("CANDLE_MOE_GATE_UP_FUSED").ok().as_deref() == Some("0") {
+        return Ok(None);
+    }
+
+    // P30: multi-row r2 variant for gate+up (Q4K/Q5K only — Q8_0 not built).
+    // Analogue of P29 for MoE down. Default ON; opt-out via CANDLE_MOE_GATE_UP_ROWS=1.
+    let env_rows = std::env::var("CANDLE_MOE_GATE_UP_ROWS").ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|r| *r == 1 || *r == 2);
+    let rows_per_block: usize = match env_rows {
+        Some(r) => r,
+        None => if matches!(w_dtype, GgmlDType::Q4K | GgmlDType::Q5K) && n % 2 == 0 {
+            2
+        } else {
+            1
+        },
+    };
+    let kname: &str = match (w_dtype, rows_per_block) {
+        (GgmlDType::Q4K, 2) => "indexed_moe_forward_q4k_q8_1_gate_up_nw1_r2",
+        (GgmlDType::Q5K, 2) => "indexed_moe_forward_q5k_q8_1_gate_up_nw1_r2",
+        _ => kname_r1,
+    };
+
+    // SAFETY: kernel writes every element of both outputs.
+    let outsize = batch * topk * n;
+    let gate_out = unsafe { dev.alloc::<f32>(outsize)? };
+    let up_out = unsafe { dev.alloc::<f32>(outsize)? };
+
+    let func = dev.get_or_load_func(kname, &candle_hip_kernels::QUANTIZED)?;
+    // Grid x divided by rows_per_block when r2 fires.
+    let grid_x = (n as u32).div_ceil(rows_per_block as u32);
+    let cfg = hipdarc::driver::LaunchConfig {
+        grid_dim: (grid_x, batch as u32, topk as u32),
+        block_dim: (WARP_SIZE as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let mut builder = func.builder();
+    builder.arg(gate_weight);
+    builder.arg(up_weight);
+    builder.arg(input_q8_1);
+    builder.arg(ids);
+    builder.arg(&gate_out);
+    builder.arg(&up_out);
+    barg!(
+        builder,
+        n as i32,
+        k as i32,
+        batch as i32,
+        topk as i32,
+        k_padded as i32,
+        input_dim1 as i32
+    );
+    unsafe { builder.launch(cfg) }.w()?;
+
+    let mut out_shape = in_shape.dims().to_vec();
+    out_shape.pop();
+    out_shape.push(n);
+    out_shape[1] = topk;
+    let shape: crate::Shape = out_shape.into();
+    Ok(Some((
+        HipStorage::wrap_hip_slice(gate_out, dev.clone()),
+        HipStorage::wrap_hip_slice(up_out, dev.clone()),
+        shape,
+    )))
 }
 
 fn indexed_moe_forward_fused_q8_1_input(
@@ -1890,6 +2819,44 @@ impl QHipStorage {
 
         launch_indexed_moe_forward_with_q8(
             &self.data.inner.slice(0..self.data.inner.len()),
+            self_shape,
+            self.dtype(),
+            input_q8_1,
+            in_shape,
+            ids,
+            idx_shape,
+            &self.device,
+        )
+    }
+
+    /// P21: fused gate+up MoE MMVQ. Returns Ok(None) when the dtype/shape
+    /// can't use the fused kernel — caller should fall back to two
+    /// sequential `indexed_moe_forward_preq8` calls.
+    pub fn indexed_moe_gate_up_forward_preq8(
+        &self,
+        other: &QHipStorage,
+        self_shape: &crate::Shape,
+        input_q8_1: &HipView<'_, u8>,
+        in_shape: &crate::Shape,
+        ids: &HipView<'_, u32>,
+        idx_shape: &crate::Shape,
+    ) -> Result<Option<(HipStorage, HipStorage, crate::Shape)>> {
+        if self.dtype() != other.dtype() {
+            return Ok(None);
+        }
+        if !matches!(
+            self.dtype(),
+            GgmlDType::Q4K | GgmlDType::Q5K | GgmlDType::Q8_0
+        ) {
+            return Ok(None);
+        }
+        // Devices must match (they usually do for same-layer gate+up).
+        if !self.device.same_device(&other.device) {
+            return Ok(None);
+        }
+        launch_indexed_moe_gate_up_with_q8(
+            &self.data.inner.slice(0..self.data.inner.len()),
+            &other.data.inner.slice(0..other.data.inner.len()),
             self_shape,
             self.dtype(),
             input_q8_1,

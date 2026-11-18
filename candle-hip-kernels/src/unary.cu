@@ -402,6 +402,40 @@ extern "C" __global__ void FN_NAME(                                            \
 L2_NORM_OP(float, l2_norm_f32, sqrtf)
 
 // ---------------------------------------------------------------------------
+// P28: fused dot-product along last dim with a shared weight vector.
+//     out[row, 0] = Σ_i x[row, i] * w[i]
+// Replaces the 2-kernel chain `x.broadcast_mul(w).sum_keepdim(D::Minus1)`
+// used for the MoE shared-expert scalar gate. Saves ~13 µs per call on
+// Qwen3.6 decode (fast_sum_f32 13 µs + bmul_f32 4 µs → single 2-3 µs launch).
+//
+// Grid: (n_rows, 1, 1)   — one block per output row.
+// Block: (64, 1, 1)      — one Wave64 per row.
+// Each lane walks `row_len / 64` elements strided by 64, multiplies with
+// the matching weight slot, accumulates, then warp-reduces via DPP.
+extern "C" __global__ void dot_last_dim_f32(
+    const size_t row_len,
+    const float *__restrict__ x,     // [n_rows, row_len]
+    const float *__restrict__ w,     // [row_len] — shared across rows
+    float       *__restrict__ out    // [n_rows, 1]
+) {
+    const int row = blockIdx.x;
+    const int lane = threadIdx.x;
+    const float *row_x = x + (size_t)row * row_len;
+
+    float partial = 0.0f;
+    for (size_t i = lane; i < row_len; i += blockDim.x) {
+        partial += row_x[i] * w[i];
+    }
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        partial += __shfl_xor(partial, mask);
+    }
+    if (lane == 0) {
+        out[row] = partial;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fused V normalisation along the last dimension (parameter-free RMS-norm):
 //     out[row, i] = x[row, i] / sqrt(mean(x[row, :]²) + eps)
 //                 = x[row, i] / sqrt(Σ x² / N + eps)

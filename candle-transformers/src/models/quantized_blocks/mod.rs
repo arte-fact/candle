@@ -36,7 +36,11 @@ pub use gguf_loader::Gguf;
 pub use rope::RotaryEmbedding;
 pub use norms::{causal_mask, causal_mask_padded, v_norm, GemmaRmsNorm};
 pub use attention::{StandardAttention, StandardAttentionOpts, AttnNorm, GatedAttention};
+#[cfg(feature = "hip")]
+pub use attention::TpContext;
 pub use ffn::{DenseMlp, MlpActivation, MoeExperts};
+#[cfg(feature = "hip")]
+pub use ffn::EpPartition;
 pub use delta_net::{DeltaNetLayer, GdnState, GdnDimensions};
 
 use candle::Device;

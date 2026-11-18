@@ -40,8 +40,13 @@ pub struct ModelWeights {
 }
 
 /// Compare two devices for equality without allocating.
+#[inline]
 fn device_eq(a: &Device, b: &Device) -> bool {
-    format!("{:?}", a.location()) == format!("{:?}", b.location())
+    // P18 (2026-04-19): was `format!("{:?}",...) == format!("{:?}",...)` —
+    // 2 String allocations + formatter dispatch per call. Called ~3×/layer
+    // per decode token → 8k allocs/tg64 on 40-layer models. Use candle's
+    // native same_device() which is a tagged-enum match + ptr/id compare.
+    a.same_device(b)
 }
 
 impl ModelWeights {
@@ -188,21 +193,23 @@ impl ModelWeights {
         // `normed_for_attn` via the fused (residual + next attn_norm)
         // path when the next layer is on the same device.
         let layers_len = self.layers.len();
-        let layer0_dev = self.layers[0].device.clone();
-        if !device_eq(h.device(), &layer0_dev) {
-            h = h.to_device(&layer0_dev)?;
+        // P18 (2026-04-19): borrow devices instead of clone() in the hot
+        // decode loop. Device is Arc-backed so clone is cheap, but still a
+        // ref-count bump × 40 layers × 64 decode steps.
+        let layer0_dev = &self.layers[0].device;
+        if !device_eq(h.device(), layer0_dev) {
+            h = h.to_device(layer0_dev)?;
         }
         let mut normed_for_attn = self.layers[0].attn_norm.forward(&h)?;
 
         for il in 0..layers_len {
-            let layer_dev = self.layers[il].device.clone();
-
             let mask_for_layer = if l == 1 {
                 None
             } else {
+                let layer_dev = &self.layers[il].device;
                 let key = format!("{:?}", layer_dev.location());
                 if !mask_cache.contains_key(&key) {
-                    let m = causal_mask(b, l, offset, None, DType::F32, &layer_dev)?;
+                    let m = causal_mask(b, l, offset, None, DType::F32, layer_dev)?;
                     mask_cache.insert(key.clone(), m);
                 }
                 mask_cache.get(&key).cloned()
@@ -227,8 +234,10 @@ impl ModelWeights {
             if is_last {
                 h = (&h + ffn_out)?;
             } else {
-                let next_dev = self.layers[il + 1].device.clone();
-                if device_eq(&next_dev, &layer_dev) {
+                // Borrow both devices directly (was two .clone()s per layer).
+                let layer_dev = &self.layers[il].device;
+                let next_dev = &self.layers[il + 1].device;
+                if device_eq(next_dev, layer_dev) {
                     let (next_normed, h_after_ffn) = self.layers[il + 1]
                         .attn_norm
                         .forward_residual(&h, &ffn_out)?;
@@ -236,7 +245,7 @@ impl ModelWeights {
                     normed_for_attn = next_normed;
                 } else {
                     h = (&h + ffn_out)?;
-                    h = h.to_device(&next_dev)?;
+                    h = h.to_device(next_dev)?;
                     normed_for_attn = self.layers[il + 1].attn_norm.forward(&h)?;
                 }
             }

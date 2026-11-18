@@ -158,6 +158,16 @@ static __device__ __forceinline__ float gfx906_half_warp_reduce_sum_dpp(float x)
     return x;
 }
 
+// Quarter-warp (16-wide) — stops at ror8, skips cross-8 swap.
+// Used by multi-row MMVQ with ROWS_PER_BLOCK=4 (16 lanes per row).
+static __device__ __forceinline__ float gfx906_quarter_warp_reduce_sum_dpp(float x) {
+    x = gfx906_dpp_add_xor1(x);
+    x = gfx906_dpp_add_xor2(x);
+    x = x + gfx906_shuffle_xor4(x);
+    x = gfx906_dpp_add_ror8(x);
+    return x;
+}
+
 static __device__ __forceinline__ float gfx906_half_warp_reduce_max_dpp(float x) {
     x = gfx906_dpp_max_xor1(x);
     x = gfx906_dpp_max_xor2(x);
@@ -189,6 +199,14 @@ static __device__ __forceinline__ float gfx906_half_warp_reduce_sum_dpp(float x)
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         x += __shfl_xor(x, offset, 32);
+    }
+    return x;
+}
+
+static __device__ __forceinline__ float gfx906_quarter_warp_reduce_sum_dpp(float x) {
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        x += __shfl_xor(x, offset, 16);
     }
     return x;
 }
@@ -332,6 +350,14 @@ static __device__ __forceinline__ float gfx906_half_warp_reduce_sum_dpp(float x)
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         x += __shfl_xor(x, offset, 32);
+    }
+    return x;
+}
+
+static __device__ __forceinline__ float gfx906_quarter_warp_reduce_sum_dpp(float x) {
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset >>= 1) {
+        x += __shfl_xor(x, offset, 16);
     }
     return x;
 }

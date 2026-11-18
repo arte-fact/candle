@@ -46,10 +46,22 @@ impl RocBlas {
 
 impl Drop for RocBlas {
     fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe {
+        if self.handle.is_null() {
+            return;
+        }
+        unsafe {
+            // Long-ctx teardown fix (2026-04-20): if HIP runtime is already
+            // winding down (e.g. process exit with large outstanding KV),
+            // `rocblas_destroy_handle` fails with internal_error AND writes
+            // a line to stderr we can't suppress. Probe HIP first: if the
+            // device API doesn't return `hipSuccess`, skip destroy — leaking
+            // the handle is harmless since the process is exiting.
+            let mut count: std::os::raw::c_int = 0;
+            if sys::hipGetDeviceCount(&mut count) == sys::hipError_t::hipSuccess {
                 let _ = sys::rocblas_destroy_handle(self.handle);
             }
+            // else: HIP context already torn down → leak (process exit cleans up).
+            self.handle = std::ptr::null_mut();
         }
     }
 }

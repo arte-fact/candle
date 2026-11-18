@@ -32,6 +32,22 @@ use std::sync::Arc;
 
 #[cfg(feature = "hip")]
 use candle::hip_backend::decode_cache::DecodeState;
+#[cfg(feature = "hip")]
+use crate::models::quantized_blocks::EpPartition;
+
+/// Load-time TP+EP context. Carries the cluster + this rank's index
+/// so the shared loader (`from_gguf_impl`) can dispatch to
+/// `load_tp` / `load_ep` / `set_tp_context` at the right sites.
+#[cfg(feature = "hip")]
+#[derive(Clone)]
+pub struct TpLoadCtx {
+    pub cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+    pub rank: usize,
+}
+
+#[cfg(not(feature = "hip"))]
+#[derive(Clone)]
+pub struct TpLoadCtx;
 
 /// Helper used by the H1 n_kv-padding code path: pull `seq_len` (dim 2) from
 /// either the shared Q tensor or from x_norm.
@@ -58,6 +74,71 @@ fn q_precomputed_device_or_xnorm<'a>(
         Some((q, _, _)) => q.device(),
         None => x_norm.device(),
     }
+}
+
+/// Decode-only fast path: if `any_cache` is a Q8 KV cache and preconditions
+/// hold, call `gqa_attention_decode_q8` directly, skipping the F32 dequant +
+/// `gqa_decode_mv_fast` chain. Returns `Ok(None)` (falls through to existing
+/// code) if any precondition fails.
+///
+/// **Default is OFF on gemma4** because the existing fused F32 kernel
+/// `gqa_decode_mv_fast_d{256,512}_f32` outperforms the decomposed Q8 GEMV
+/// pipeline (qk_gemv → softmax chain → v_gemv is ~7 launches vs 1 fused).
+/// Measured on gemma4-26B-A4B 4-GPU: direct-GEMV tg=46.13 vs dequant
+/// tg=50.56 (-8.8%). Opt-in via `CANDLE_Q8_KV_DIRECT_GEMV=1` for
+/// experimentation. GatedAttention (qwen35 family) has the opposite
+/// default because its dequant path goes through rocBLAS + separate
+/// softmax, which the decomposed chain beats.
+///
+/// Preconditions:
+/// - `CANDLE_Q8_KV_DIRECT_GEMV == "1"` — explicit opt-in (default off).
+/// - `seq_len_q == 1` (decode only; wrapper is decode-only).
+/// - `any_cache` is `AnyKvCache::Q8(_)`.
+/// - `head_dim ∈ {64, 128, 256, 512}` (kernel coverage).
+/// - `q.device()` matches the Q8 cache's device (cross-device transfer
+///   would defeat the point; fall back to dequant path if mismatched).
+#[cfg(feature = "hip")]
+fn gemma4_try_q8_decode_direct(
+    q: &Tensor,
+    any_cache: &crate::models::quantized_blocks::any_kv_cache::AnyKvCache,
+    mask: Option<&Tensor>,
+    attn_scale: f64,
+    seq_len_q: usize,
+) -> Result<Option<Tensor>> {
+    if seq_len_q != 1 {
+        return Ok(None);
+    }
+    // Opt-in on gemma4: default off because the fused F32 attention kernel
+    // beats the decomposed Q8 chain on this arch. See doc comment above.
+    if std::env::var("CANDLE_Q8_KV_DIRECT_GEMV").ok().as_deref() != Some("1") {
+        return Ok(None);
+    }
+    let q8_cache = match any_cache.as_q8() {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let head_dim = q.dim(candle::D::Minus1)?;
+    if !matches!(head_dim, 64 | 128 | 256 | 512) {
+        return Ok(None);
+    }
+    let l_k = q8_cache.current_seq_len();
+    if l_k == 0 {
+        return Ok(None);
+    }
+    // Device match check: the Q8 GEMV kernels run on the cache's device.
+    let cache_dev = Device::Hip(q8_cache.dev().clone());
+    if !device_eq(q.device(), &cache_dev) {
+        return Ok(None);
+    }
+    if let Some(m) = mask {
+        if !device_eq(m.device(), &cache_dev) {
+            return Ok(None);
+        }
+    }
+    let out = candle::hip_backend::q8_kv_cache::gqa_attention_decode_q8(
+        q, q8_cache, l_k, mask, attn_scale,
+    )?;
+    Ok(Some(out))
 }
 
 pub const MAX_SEQ_LEN: usize = 131072;
@@ -102,7 +183,7 @@ struct PerLayerEmbeddings {
 ///
 /// THREE post-norms: _1 for dense, _2 for MoE, plain for combined.
 /// Both FFN branches read from `residual` (the post-attention output).
-struct MoeBranch {
+pub struct MoeBranch {
     /// Post-norm for the dense FFN branch (post_ffw_norm_1).
     dense_post_norm: RmsNorm,
     /// Router weight matrix [n_experts, hidden_dim].
@@ -130,6 +211,488 @@ struct MoeBranch {
     n_embd: usize,
     /// RMS norm epsilon (reused for the inline router rms_norm).
     eps: f32,
+    /// Expert-parallel partition (present when EP is active). When set,
+    /// `gate_up_exps`, `down_exps`, and `down_exps_scale` have been
+    /// narrowed to this rank's local expert range; `forward_ep` owns
+    /// the per-rank MoE compute. Caller is responsible for the all-reduce
+    /// across ranks and for applying `post_norm` on the full result.
+    #[cfg(feature = "hip")]
+    ep_partition: Option<EpPartition>,
+}
+
+/// Non-TP full-load for a `MoeBranch`. Mirrors the original inline
+/// construction used by `from_gguf_multi_device`. Both the PP-only
+/// loader and the TP+EP loader go through this; TP+EP instead calls
+/// `MoeBranch::load_ep` which range-reads only the rank's shard.
+fn moe_branch_load_full(
+    gg: &crate::models::quantized_blocks::Gguf,
+    block_prefix: &str,
+    cfg: &crate::models::quantized_blocks::GgufConfig,
+    n_embd: usize,
+    rms_norm_eps: f64,
+) -> Result<Option<MoeBranch>> {
+    let mut gate_inp = gg.qmatmul(&format!("{block_prefix}.ffn_gate_inp.weight"))?;
+    if std::env::var("CANDLE_GEMMA4_ROUTER_NO_REQUANT").is_err() {
+        let dtype = match std::env::var("CANDLE_GEMMA4_ROUTER_REQUANT_DTYPE")
+            .ok()
+            .as_deref()
+        {
+            Some("q4_0") => candle::quantized::GgmlDType::Q4_0,
+            Some("q4_1") => candle::quantized::GgmlDType::Q4_1,
+            Some("q5_0") => candle::quantized::GgmlDType::Q5_0,
+            _ => candle::quantized::GgmlDType::Q8_0,
+        };
+        let _ = gate_inp.requantize_to(dtype);
+    }
+    let gate_inp_s = gg
+        .try_dequantize(&format!("{block_prefix}.ffn_gate_inp.scale"))
+        .ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "MoE layer {block_prefix} has gate_inp but no gate_inp.scale"
+            ))
+        })?;
+    let gate_up_exps = std::sync::Arc::new(
+        gg.tensor(&format!("{block_prefix}.ffn_gate_up_exps.weight"))?,
+    );
+    let down_exps = std::sync::Arc::new(
+        gg.tensor(&format!("{block_prefix}.ffn_down_exps.weight"))?,
+    );
+    let expert_intermediate = gate_up_exps.shape().dims()[1] / 2;
+    let num_experts_used = cfg.expert_used_count.unwrap_or(8);
+    let pre_norm = gg.rms_norm(
+        &format!("{block_prefix}.pre_ffw_norm_2.weight"),
+        rms_norm_eps,
+    )?;
+    let post_norm = gg.rms_norm(
+        &format!("{block_prefix}.post_ffw_norm_2.weight"),
+        rms_norm_eps,
+    )?;
+    let down_exps_scale =
+        gg.try_dequantize(&format!("{block_prefix}.ffn_down_exps.scale"));
+    let dense_post_norm = gg.rms_norm(
+        &format!("{block_prefix}.post_ffw_norm_1.weight"),
+        rms_norm_eps,
+    )?;
+    Ok(Some(MoeBranch {
+        dense_post_norm,
+        gate_inp,
+        gate_inp_s,
+        gate_up_exps,
+        down_exps,
+        down_exps_scale,
+        expert_intermediate,
+        num_experts_used,
+        pre_norm,
+        post_norm,
+        n_embd,
+        eps: rms_norm_eps as f32,
+        #[cfg(feature = "hip")]
+        ep_partition: None,
+    }))
+}
+
+#[cfg(feature = "hip")]
+impl MoeBranch {
+    /// Diagnostic accessor: the fused gate+up expert weight tensor.
+    pub fn gate_up_exps(&self) -> &std::sync::Arc<candle::quantized::QTensor> {
+        &self.gate_up_exps
+    }
+
+    /// Diagnostic accessor: the down expert weight tensor.
+    pub fn down_exps(&self) -> &std::sync::Arc<candle::quantized::QTensor> {
+        &self.down_exps
+    }
+
+    /// Diagnostic accessor: the per-expert down projection scale, if
+    /// present. Shape `[local_count]` when EP is attached.
+    pub fn down_exps_scale(&self) -> Option<&Tensor> {
+        self.down_exps_scale.as_ref()
+    }
+
+    /// EP partition metadata, if this branch was constructed via
+    /// `load_ep` or retrofitted via `attach_ep_partition`.
+    pub fn ep_partition(&self) -> Option<&EpPartition> {
+        self.ep_partition.as_ref()
+    }
+
+    /// Construct a MoE branch DIRECTLY in its EP-partitioned form. Each
+    /// rank reads ONLY its local expert shard from the mmap'd GGUF blob
+    /// via the X5 tensor-range readers — no full-tensor materialisation,
+    /// no 2× VRAM spike.
+    ///
+    /// Replicated across ranks (each rank reads in full):
+    /// - `gate_inp` (router weight, requantised to Q8_0 if it arrived F32)
+    /// - `gate_inp_s` (router input scale, 1D)
+    /// - `pre_norm`, `post_norm`, `dense_post_norm` (RmsNorm weights)
+    /// - `down_exps_scale` (narrowed to local range via axis-0 slice)
+    ///
+    /// Partitioned across ranks (range-read on this rank only):
+    /// - `gate_up_exps` (shape [E, 2*expert_ffn, hidden] → [e_count, ..., ...])
+    /// - `down_exps` (shape [E, hidden, expert_ffn] → [e_count, ..., ...])
+    ///
+    /// Peak VRAM = steady-state: exactly one shard's worth of bytes.
+    pub fn load_ep(
+        gg: &crate::models::quantized_blocks::Gguf,
+        block_prefix: &str,
+        cfg: &crate::models::quantized_blocks::GgufConfig,
+        n_embd: usize,
+        rms_norm_eps: f64,
+        cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+        rank: usize,
+    ) -> Result<Self> {
+        // --- Router (replicated) ---
+        let mut gate_inp = gg.qmatmul(&format!("{block_prefix}.ffn_gate_inp.weight"))?;
+        if !gate_inp.is_qtensor()
+            && std::env::var("CANDLE_GEMMA4_ROUTER_NO_REQUANT").is_err()
+        {
+            let dtype = match std::env::var("CANDLE_GEMMA4_ROUTER_REQUANT_DTYPE")
+                .ok().as_deref()
+            {
+                Some("q4_0") => candle::quantized::GgmlDType::Q4_0,
+                Some("q4_1") => candle::quantized::GgmlDType::Q4_1,
+                Some("q5_0") => candle::quantized::GgmlDType::Q5_0,
+                _ => candle::quantized::GgmlDType::Q8_0,
+            };
+            let _ = gate_inp.requantize_to(dtype);
+        }
+        let gate_inp_s = gg
+            .try_dequantize(&format!("{block_prefix}.ffn_gate_inp.scale"))
+            .ok_or_else(|| candle::Error::Msg(format!(
+                "MoeBranch::load_ep: {block_prefix} has gate_inp but no gate_inp.scale"
+            )))?;
+
+        // --- Inspect expert tensor to derive partition + expert_intermediate ---
+        let gate_up_name = format!("{block_prefix}.ffn_gate_up_exps.weight");
+        let down_name = format!("{block_prefix}.ffn_down_exps.weight");
+        let gate_up_info = gg
+            .ct
+            .tensor_infos
+            .get(&gate_up_name)
+            .ok_or_else(|| candle::Error::Msg(format!("missing {gate_up_name}")))?;
+        let gate_up_dims = gate_up_info.shape.dims().to_vec();
+        if gate_up_dims.len() != 3 {
+            candle::bail!(
+                "MoeBranch::load_ep: {gate_up_name} expected 3D, got shape {:?}",
+                gate_up_dims
+            );
+        }
+        let num_experts = gate_up_dims[0];
+        // shape[1] = 2 * expert_intermediate for the fused gate+up.
+        let expert_intermediate = gate_up_dims[1] / 2;
+        let num_experts_used = cfg.expert_used_count.unwrap_or(8);
+
+        // Partition: contiguous block per rank.
+        let world = cluster.world_size();
+        let block = (num_experts + world - 1) / world;
+        let local_start = rank * block;
+        let local_count = num_experts.saturating_sub(local_start).min(block);
+
+        // --- Range-read the expert tensors (this rank's shard only) ---
+        // When local_count == 0 we still read an empty range so the shape
+        // stays valid (dim0=0); forward_ep short-circuits on local_count==0.
+        let gate_up_exps = std::sync::Arc::new(
+            gg.tensor_expert_range(&gate_up_name, local_start, local_count)?,
+        );
+        let down_exps = std::sync::Arc::new(
+            gg.tensor_expert_range(&down_name, local_start, local_count)?,
+        );
+
+        // --- Norms (replicated) ---
+        let pre_norm = gg.rms_norm(
+            &format!("{block_prefix}.pre_ffw_norm_2.weight"),
+            rms_norm_eps,
+        )?;
+        let post_norm = gg.rms_norm(
+            &format!("{block_prefix}.post_ffw_norm_2.weight"),
+            rms_norm_eps,
+        )?;
+        let dense_post_norm = gg.rms_norm(
+            &format!("{block_prefix}.post_ffw_norm_1.weight"),
+            rms_norm_eps,
+        )?;
+
+        // --- Per-expert down scale: load full then narrow on axis 0.
+        // This tensor is 1D `[num_experts]` (~1 KB), so the "narrow on
+        // device" cost is negligible vs the expert weights.
+        let down_exps_scale = gg
+            .try_dequantize(&format!("{block_prefix}.ffn_down_exps.scale"))
+            .map(|scale| {
+                if local_count == 0 {
+                    scale.narrow(0, num_experts, 0)
+                } else {
+                    scale.narrow(0, local_start, local_count)
+                        .and_then(|t| t.contiguous())
+                }
+            })
+            .transpose()?;
+
+        Ok(MoeBranch {
+            dense_post_norm,
+            gate_inp,
+            gate_inp_s,
+            gate_up_exps,
+            down_exps,
+            down_exps_scale,
+            expert_intermediate,
+            num_experts_used,
+            pre_norm,
+            post_norm,
+            n_embd,
+            eps: rms_norm_eps as f32,
+            ep_partition: Some(EpPartition {
+                cluster,
+                rank,
+                local_start,
+                local_count,
+                num_experts,
+            }),
+        })
+    }
+
+    /// Retrofit an already-loaded MoE branch into an EP-partitioned form:
+    /// narrows `gate_up_exps`, `down_exps` and `down_exps_scale` to the
+    /// local expert range `[local_start, local_start + local_count)` via
+    /// on-device slicing.
+    ///
+    /// Partition policy v1: contiguous block (same as `load_ep`).
+    ///
+    /// Peak VRAM during this call = 2× steady-state because the narrow
+    /// runs on the fully-loaded tensor. Prefer `load_ep` when loading
+    /// from scratch; use `attach_ep_partition` only when a full MoeBranch
+    /// is already in memory.
+    pub fn attach_ep_partition(
+        &mut self,
+        cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+        rank: usize,
+    ) -> Result<()> {
+        let num_experts = self.down_exps.shape().dims()[0];
+        let world = cluster.world_size();
+        let block = (num_experts + world - 1) / world;
+        let local_start = rank * block;
+        let local_count = num_experts.saturating_sub(local_start).min(block);
+
+        if local_count > 0 {
+            self.gate_up_exps = std::sync::Arc::new(
+                self.gate_up_exps.narrow_experts(local_start, local_count)?,
+            );
+            self.down_exps = std::sync::Arc::new(
+                self.down_exps.narrow_experts(local_start, local_count)?,
+            );
+            if let Some(scale) = &self.down_exps_scale {
+                let narrowed = scale.narrow(0, local_start, local_count)?.contiguous()?;
+                self.down_exps_scale = Some(narrowed);
+            }
+        }
+
+        self.ep_partition = Some(EpPartition {
+            cluster,
+            rank,
+            local_start,
+            local_count,
+            num_experts,
+        });
+        Ok(())
+    }
+
+    /// Convenience wrapper around `forward_ep` that additionally runs
+    /// the cross-rank sum via the cluster's barrier collective. Returns
+    /// the FULL `moe_summed` (each rank's contribution already added).
+    /// Caller still owns steps (2) and (3) — `post_norm` and the dense
+    /// branch combine.
+    ///
+    /// Must be called from W concurrent worker threads (one per rank).
+    /// Single-thread usage deadlocks on the barrier — call `forward_ep`
+    /// directly and reduce manually for those cases.
+    pub fn forward_ep_reduced(&self, attn_out: &Tensor) -> Result<Tensor> {
+        let partial = self.forward_ep(attn_out)?;
+        if let Some(ref ep) = self.ep_partition {
+            crate::models::quantized_blocks::attention::all_reduce_sum_tensor(
+                &ep.cluster, ep.rank, &partial,
+            )
+        } else {
+            Ok(partial)
+        }
+    }
+
+    /// Expert-parallel MoE forward. Returns THIS RANK's partial
+    /// `moe_summed` output (AFTER the weighted-sum over topk, BEFORE
+    /// `post_norm`). The caller must:
+    ///   1. All-reduce (sum) across ranks to get the full moe_summed.
+    ///   2. Apply `post_norm` to the reduced result.
+    ///   3. Add it to the dense branch output and apply `post_ffw_norm`.
+    ///
+    /// Replicated across ranks: router + topk (the weight matrix
+    /// `gate_inp` is NOT partitioned, so each rank computes the same
+    /// global topk). Partitioned across ranks: the gate_up / down
+    /// expert weights (narrowed via `attach_ep_partition`).
+    ///
+    /// v1 scope: decode fast path only (b*m ≤ 8, HIP, F32, contiguous,
+    /// `expert_intermediate % 32 == 0`). Mirrors `MoeExperts::forward_ep`.
+    /// Prefill / non-fast-path falls through to an explicit bail.
+    pub fn forward_ep(&self, attn_out: &Tensor) -> Result<Tensor> {
+        use candle::quantized::hip::{pad, quantize_q8_1, MATRIX_ROW_PADDING};
+        use candle::quantized::GgmlDType;
+        use candle::D;
+
+        let partition = self.ep_partition.as_ref().ok_or_else(|| {
+            candle::Error::Msg("MoeBranch::forward_ep called without ep_partition".into())
+        })?;
+
+        let (b_sz, seq_len, hidden) = attn_out.dims3()?;
+        let b_size = b_sz * seq_len;
+
+        if partition.local_count == 0 {
+            // Rank holds no experts (world > num_experts). Contribute zero.
+            return Tensor::zeros((b_sz, seq_len, hidden), attn_out.dtype(), attn_out.device());
+        }
+
+        if b_size > 8
+            || !matches!(attn_out.device(), candle::Device::Hip(_))
+            || attn_out.dtype() != candle::DType::F32
+            || !attn_out.is_contiguous()
+            || self.expert_intermediate % 32 != 0
+        {
+            candle::bail!(
+                "MoeBranch::forward_ep: only decode fast path (b*m<=8, HIP F32 contiguous, \
+                 expert_intermediate % 32 == 0) is supported in v1"
+            );
+        }
+
+        let dev = match attn_out.device() {
+            candle::Device::Hip(d) => d.clone(),
+            _ => candle::bail!("MoeBranch::forward_ep: expected HIP device"),
+        };
+
+        // --- Router prep (fused rmsnorm + 1/sqrt(n_embd) scale + gate_inp_s) ---
+        let router_input = if attn_out.dtype() == candle::DType::F32
+            && attn_out.is_contiguous()
+            && self.gate_inp_s.dtype() == candle::DType::F32
+            && self.gate_inp_s.is_contiguous()
+            && std::env::var("CANDLE_GEMMA4_ROUTER_FUSED_OFF").is_err()
+        {
+            candle::hip_backend::gemma4_router_prep_fused(
+                attn_out,
+                &self.gate_inp_s,
+                self.eps as f64,
+            )?
+        } else {
+            let normed = crate::models::quantized_blocks::norms::v_norm(
+                attn_out,
+                self.eps as f64,
+            )?;
+            let scaled = (normed * (1.0 / (self.n_embd as f64).sqrt()))?;
+            scaled.broadcast_mul(&self.gate_inp_s)?
+        };
+
+        let router_logits = self.gate_inp.forward(&router_input)?;
+
+        // --- topk (fused softmax+topk+norm; global expert ids) ---
+        let n_experts_dim = router_logits.dim(D::Minus1)?;
+        let flat_logits = router_logits.reshape(((), n_experts_dim))?;
+        let (topk_weights, topk_ids_global) = match candle::hip_backend::topk_moe_norm_fused(
+            &flat_logits,
+            self.num_experts_used,
+        ) {
+            Ok((w, ids)) => (w, ids),
+            Err(_) => {
+                let routing_weights = candle_nn::ops::softmax_last_dim(&router_logits)?;
+                let rw_flat = routing_weights.reshape(((), n_experts_dim))?;
+                let rw_cpu = rw_flat.to_device(&candle::Device::Cpu)?;
+                let ids_cpu = rw_cpu
+                    .arg_sort_last_dim(false)?
+                    .narrow(D::Minus1, 0, self.num_experts_used)?
+                    .contiguous()?;
+                let hip_dev = candle::Device::Hip(dev.clone());
+                let ids = ids_cpu.to_device(&hip_dev)?;
+                let w = rw_flat.gather(&ids, D::Minus1)?;
+                let w = (&w / w.sum_keepdim(D::Minus1)?.broadcast_as(w.shape())?)?;
+                (w, ids)
+            }
+        };
+
+        // --- Remap topk_ids to local range; mask out-of-range weights. ---
+        // Tiny tensor (b_size * topk), CPU round-trip is cheap.
+        let ids_global_cpu: Vec<u32> = topk_ids_global
+            .to_device(&candle::Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()?;
+        let local_start = partition.local_start as u32;
+        let local_count = partition.local_count as u32;
+        let mut local_ids_cpu = Vec::with_capacity(ids_global_cpu.len());
+        let mut weight_mask_cpu = Vec::with_capacity(ids_global_cpu.len());
+        for id in &ids_global_cpu {
+            if *id >= local_start && *id < local_start + local_count {
+                local_ids_cpu.push(*id - local_start);
+                weight_mask_cpu.push(1.0f32);
+            } else {
+                local_ids_cpu.push(0);
+                weight_mask_cpu.push(0.0f32);
+            }
+        }
+        let hip_dev = candle::Device::Hip(dev.clone());
+        let topk_ids_local = Tensor::from_vec(
+            local_ids_cpu,
+            topk_ids_global.shape().dims(),
+            &hip_dev,
+        )?;
+        let weight_mask = Tensor::from_vec(
+            weight_mask_cpu,
+            topk_weights.shape().dims(),
+            &hip_dev,
+        )?;
+        let topk_weights_masked = topk_weights.mul(&weight_mask)?;
+
+        // --- Expert compute on narrowed weights ---
+        let moe_in = self.pre_norm.forward(attn_out)?;
+        let moe_in_flat = moe_in.reshape((b_size, hidden))?;
+        let x_3d = moe_in_flat.unsqueeze(1)?.contiguous()?;
+
+        let gate_up = self.gate_up_exps.indexed_moe_forward(&x_3d, &topk_ids_local)?;
+
+        // W3d fused gelu_mul_quantize → down (preq8). Same as inline path.
+        let w3d_on = gate_up.is_contiguous()
+            && gate_up.dtype() == candle::DType::F32
+            && std::env::var("CANDLE_W3D").as_deref() != Ok("0");
+        let mut moe_out = if w3d_on {
+            let (q8_buf, activated_shape) =
+                candle::hip_backend::gelu_mul_quantize_q8_1_fused(
+                    &gate_up,
+                    self.expert_intermediate,
+                )?;
+            let q8_view = q8_buf.slice(0..q8_buf.len());
+            let out = self.down_exps.indexed_moe_forward_preq8(
+                &q8_view,
+                &activated_shape,
+                &topk_ids_local,
+            )?;
+            drop(q8_buf);
+            out
+        } else {
+            let gate = gate_up
+                .narrow(D::Minus1, 0, self.expert_intermediate)?
+                .contiguous()?;
+            let up = gate_up
+                .narrow(D::Minus1, self.expert_intermediate, self.expert_intermediate)?
+                .contiguous()?;
+            let activated = gate.gelu()?.broadcast_mul(&up)?;
+            self.down_exps.indexed_moe_forward(&activated.contiguous()?, &topk_ids_local)?
+        };
+
+        // --- Per-expert down scale (narrowed), indexed by local ids ---
+        if let Some(ref scale) = self.down_exps_scale {
+            let expert_scales = scale
+                .index_select(&topk_ids_local.flatten_all()?, 0)?
+                .reshape(topk_ids_local.shape())?;
+            let expert_scales = expert_scales.unsqueeze(D::Minus1)?;
+            moe_out = moe_out.broadcast_mul(&expert_scales)?;
+        }
+
+        // --- Weighted sum across topk with masked weights ---
+        let topk_w = topk_weights_masked.unsqueeze(D::Minus1)?;
+        let weighted = moe_out.broadcast_mul(&topk_w)?;
+        let result = weighted.sum(1)?;
+        result.reshape((b_sz, seq_len, hidden))
+    }
 }
 
 struct LayerWeights {
@@ -217,6 +780,36 @@ impl ModelWeights {
         ct: gguf_file::Content,
         blob: Arc<GgufBlob>,
         devices: &[Device],
+    ) -> Result<Self> {
+        Self::from_gguf_impl(ct, blob, devices, None)
+    }
+
+    /// TP+EP single-rank loader. All layers live on `device` with
+    /// TP-sharded attention + dense MLP (`load_tp` + `set_tp_context`)
+    /// and EP-sharded MoE experts (`MoeBranch::load_ep`). Router,
+    /// norms, embedding, and lm_head are replicated per rank.
+    ///
+    /// The returned `ModelWeights` can be driven through the
+    /// single-device forward path — the in-block all-reduces fire
+    /// automatically when the struct is forwarded concurrently across
+    /// W worker threads (one per rank).
+    #[cfg(feature = "hip")]
+    pub fn from_gguf_tp_ep_rank(
+        ct: gguf_file::Content,
+        blob: Arc<GgufBlob>,
+        device: Device,
+        cluster: std::sync::Arc<candle::hip_backend::cluster::HipCluster>,
+        rank: usize,
+    ) -> Result<Self> {
+        let ctx = TpLoadCtx { cluster, rank };
+        Self::from_gguf_impl(ct, blob, &[device], Some(ctx))
+    }
+
+    fn from_gguf_impl(
+        ct: gguf_file::Content,
+        blob: Arc<GgufBlob>,
+        devices: &[Device],
+        tp_ctx: Option<TpLoadCtx>,
     ) -> Result<Self> {
         if devices.is_empty() {
             candle::bail!("from_gguf_multi_device requires at least one device");
@@ -472,13 +1065,25 @@ impl ModelWeights {
                     use_gemma_norms: false,
                     attention_scale: Some(1.0),
                 };
+                #[cfg(feature = "hip")]
+                let attn = if let Some(ref tpc) = tp_ctx {
+                    let mut a = StandardAttention::load_tp(
+                        &lgg, &block_prefix, &layer_cfg, il,
+                        rotary, attn_opts, &tpc.cluster, tpc.rank,
+                    )?;
+                    a.set_tp_context(crate::models::quantized_blocks::TpContext {
+                        cluster: tpc.cluster.clone(),
+                        rank: tpc.rank,
+                    });
+                    a
+                } else {
+                    StandardAttention::load_with_opts(
+                        &lgg, &block_prefix, &layer_cfg, il, rotary, attn_opts,
+                    )?
+                };
+                #[cfg(not(feature = "hip"))]
                 let attn = StandardAttention::load_with_opts(
-                    &lgg,
-                    &block_prefix,
-                    &layer_cfg,
-                    il,
-                    rotary,
-                    attn_opts,
+                    &lgg, &block_prefix, &layer_cfg, il, rotary, attn_opts,
                 )?;
 
                 let attn_norm =
@@ -493,87 +1098,50 @@ impl ModelWeights {
                     .rms_norm(&format!("{block_prefix}.post_ffw_norm.weight"), rms_norm_eps)?;
 
                 // Gemma4 FFN uses GeGLU.
+                #[cfg(feature = "hip")]
+                let mlp = if let Some(ref tpc) = tp_ctx {
+                    let mut m = DenseMlp::load_tp(
+                        &lgg, &block_prefix, MlpActivation::Gelu, &tpc.cluster, tpc.rank,
+                    )?;
+                    m.set_tp_context(crate::models::quantized_blocks::TpContext {
+                        cluster: tpc.cluster.clone(),
+                        rank: tpc.rank,
+                    });
+                    m
+                } else {
+                    DenseMlp::load_with_activation(&lgg, &block_prefix, MlpActivation::Gelu)?
+                };
+                #[cfg(not(feature = "hip"))]
                 let mlp = DenseMlp::load_with_activation(
-                    &lgg,
-                    &block_prefix,
-                    MlpActivation::Gelu,
+                    &lgg, &block_prefix, MlpActivation::Gelu,
                 )?;
 
                 // Detect MoE layer: present if ffn_gate_inp.weight exists.
+                //
+                // TP+EP fast path: when `tp_ctx` is attached, route the
+                // entire MoE load through `MoeBranch::load_ep` — it
+                // range-reads only this rank's expert shard (no full
+                // tensor materialisation) and carries the cluster in
+                // its ep_partition.
+                #[cfg(feature = "hip")]
                 let moe = if lgg.has_tensor(&format!("{block_prefix}.ffn_gate_inp.weight")) {
-                    let mut gate_inp = lgg.qmatmul(&format!("{block_prefix}.ffn_gate_inp.weight"))?;
-                    // Gemma-4 ships `ffn_gate_inp.weight` as F32 in all Q*_0 /
-                    // Q*_1 GGUFs.  F32 matmul lowers to rocBLAS gemv, which the
-                    // steady-state profiler shows at ~25 % of total decode on
-                    // 4-GPU 26B-A4B (7.3 ms / 29 ms summed across 30 layers).
-                    // Requantising to Q8_0 forces the router onto the MMVQ
-                    // kernel chain (same fix as O4 for Qwen3-Coder-Next,
-                    // memory `project_phase_o2_o4_qwen3next.md`).  The router
-                    // head is tiny ([hidden, 128]) so Q8_0 is essentially
-                    // lossless.  Opt-out: `CANDLE_GEMMA4_ROUTER_NO_REQUANT=1`,
-                    // override dtype: `CANDLE_GEMMA4_ROUTER_REQUANT_DTYPE=q4_0|q4_1|q5_0|q8_0`.
-                    if std::env::var("CANDLE_GEMMA4_ROUTER_NO_REQUANT").is_err() {
-                        let dtype = match std::env::var("CANDLE_GEMMA4_ROUTER_REQUANT_DTYPE")
-                            .ok().as_deref()
-                        {
-                            Some("q4_0") => candle::quantized::GgmlDType::Q4_0,
-                            Some("q4_1") => candle::quantized::GgmlDType::Q4_1,
-                            Some("q5_0") => candle::quantized::GgmlDType::Q5_0,
-                            _ => candle::quantized::GgmlDType::Q8_0,
-                        };
-                        let _ = gate_inp.requantize_to(dtype);
+                    if let Some(ref tpc) = tp_ctx {
+                        Some(MoeBranch::load_ep(
+                            &lgg, &block_prefix, &layer_cfg,
+                            embedding_length, rms_norm_eps,
+                            tpc.cluster.clone(), tpc.rank,
+                        )?)
+                    } else {
+                        moe_branch_load_full(&lgg, &block_prefix, &layer_cfg,
+                            embedding_length, rms_norm_eps)?
                     }
-                    let gate_inp_s = lgg
-                        .try_dequantize(&format!("{block_prefix}.ffn_gate_inp.scale"))
-                        .ok_or_else(|| {
-                            candle::Error::Msg(format!(
-                                "MoE layer {block_prefix} has gate_inp but no gate_inp.scale"
-                            ))
-                        })?;
-                    let gate_up_exps = std::sync::Arc::new(
-                        lgg.tensor(&format!("{block_prefix}.ffn_gate_up_exps.weight"))?,
-                    );
-                    let down_exps = std::sync::Arc::new(
-                        lgg.tensor(&format!("{block_prefix}.ffn_down_exps.weight"))?,
-                    );
-                    // Expert FFN intermediate: infer from gate_up_exps shape
-                    // [n_experts, 2*intermediate, hidden] → intermediate = dim[1]/2
-                    let expert_intermediate = gate_up_exps.shape().dims()[1] / 2;
-                    let num_experts_used = cfg.expert_used_count.unwrap_or(8);
-                    let pre_norm = lgg.rms_norm(
-                        &format!("{block_prefix}.pre_ffw_norm_2.weight"),
-                        rms_norm_eps,
-                    )?;
-                    let post_norm = lgg.rms_norm(
-                        &format!("{block_prefix}.post_ffw_norm_2.weight"),
-                        rms_norm_eps,
-                    )?;
-                    let down_exps_scale =
-                        lgg.try_dequantize(&format!("{block_prefix}.ffn_down_exps.scale"));
-                    // post_ffw_norm_1 is the dense branch post-norm.
-                    // post_ffw_norm (plain, no suffix) stays as the THIRD
-                    // norm applied to the COMBINED dense+MoE output.
-                    let dense_post_norm = lgg.rms_norm(
-                        &format!("{block_prefix}.post_ffw_norm_1.weight"),
-                        rms_norm_eps,
-                    )?;
-                    Some(MoeBranch {
-                        dense_post_norm,
-                        gate_inp,
-                        gate_inp_s,
-                        gate_up_exps,
-                        down_exps,
-                        down_exps_scale,
-                        expert_intermediate,
-                        num_experts_used,
-                        pre_norm,
-                        post_norm,
-                        n_embd: embedding_length,
-                        eps: rms_norm_eps as f32,
-                    })
-                } else {
-                    None
-                };
+                } else { None };
+                #[cfg(not(feature = "hip"))]
+                let moe = if lgg.has_tensor(&format!("{block_prefix}.ffn_gate_inp.weight")) {
+                    moe_branch_load_full(&lgg, &block_prefix, &layer_cfg,
+                        embedding_length, rms_norm_eps)?
+                } else { None };
+
 
                 let layer_output_scale =
                     lgg.try_dequantize(&format!("{block_prefix}.layer_output_scale.weight"));
@@ -690,7 +1258,10 @@ impl ModelWeights {
 
         #[cfg(feature = "hip")]
         let n_devices = devices.len();
-        let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1");
+        // P33 audit: flipped default ON (was opt-in =="1"). Gemma-4-31B dense
+        // +2% tg, Gemma-26B-A4B MoE flat. Matches GatedAttention default.
+        // Opt-out: `CANDLE_KV_Q8=0`.
+        let use_q8_kv = std::env::var("CANDLE_KV_Q8").ok().as_deref() != Some("0");
         let tq_variant: Option<u8> = std::env::var("CANDLE_KV_TQ")
             .ok()
             .and_then(|s| s.parse::<u8>().ok())
@@ -1299,10 +1870,26 @@ impl ModelWeights {
                     // compute_qkv_norm_q8_fused) it fires ONCE per
                     // prefill call and keeps the whole cache at one
                     // consistent dtype.
+                    //
+                    // Q8/TQ KV caches pack F32 inputs directly — the
+                    // F16 cast would be rejected by their `append`.
+                    // Mutually exclusive with F16 KV; Q8/TQ wins.
                     #[cfg(feature = "hip")]
-                    let (k_new, v_new) = if std::env::var("CANDLE_KV_F16").ok().as_deref().map(|s| s != "0").unwrap_or(true) {
+                    let kv_f16 = std::env::var("CANDLE_KV_F16")
+                        .ok().as_deref().map(|s| s != "0").unwrap_or(true)
+                        && !self.use_q8_kv
+                        && self.tq_variant.is_none();
+                    #[cfg(feature = "hip")]
+                    let (k_new, v_new) = if kv_f16 {
                         let k_new = if k_new.dtype() == candle::DType::F16 { k_new } else { k_new.to_dtype(candle::DType::F16)? };
                         let v_new = if v_new.dtype() == candle::DType::F16 { v_new } else { v_new.to_dtype(candle::DType::F16)? };
+                        (k_new, v_new)
+                    } else if self.use_q8_kv || self.tq_variant.is_some() {
+                        // Q8/TQ: ensure F32. Producer kernels may still
+                        // emit F16 under CANDLE_KV_F16=1 even when the
+                        // cache cannot consume it, so cast back here.
+                        let k_new = if k_new.dtype() == candle::DType::F32 { k_new } else { k_new.to_dtype(candle::DType::F32)? };
+                        let v_new = if v_new.dtype() == candle::DType::F32 { v_new } else { v_new.to_dtype(candle::DType::F32)? };
                         (k_new, v_new)
                     } else { (k_new, v_new) };
                     let _ = cache.append(&k_new, &v_new)?;
@@ -1429,6 +2016,27 @@ impl ModelWeights {
                 let head_dim = q_precomputed.dim(candle::D::Minus1)?;
                 let attn_output = if k_is_canonical && k_dim3 == head_dim {
                     if seq_len == 1 {
+                        // Q8 KV decode fast path: call gqa_attention_decode_q8
+                        // directly, skipping F32 dequant + gqa_decode_mv_fast.
+                        // Falls through when cache isn't Q8 or env opts out.
+                        #[cfg(feature = "hip")]
+                        let q8_direct = {
+                            let src = if has_kv { il } else { kv_source_idx };
+                            let any_cache = self.kv_caches[src].as_ref()
+                                .expect("KV cache must exist for has_kv source");
+                            gemma4_try_q8_decode_direct(
+                                q_precomputed, any_cache,
+                                attention_mask.as_ref(),
+                                self.layers[il].attn.attn_scale,
+                                seq_len,
+                            )?
+                        };
+                        #[cfg(not(feature = "hip"))]
+                        let q8_direct: Option<Tensor> = None;
+
+                        if let Some(out) = q8_direct {
+                            out
+                        } else {
                         // Decode: mat-vec kernel on T-major K.
                         // K/V are narrow'd views of the padded cache
                         // (non-contig); the mat-vec kernel requires
@@ -1469,6 +2077,7 @@ impl ModelWeights {
                                 l_k_iter,
                             )?
                         }
+                        }
                     } else {
                         // Prefill: reuse the legacy D-major fast path by
                         // transposing T-major K to (B, H, D, T) once per
@@ -1502,17 +2111,37 @@ impl ModelWeights {
                 let (b_sz, seq_len_q, _) = x_norm.dims3()?;
                 if seq_len_q == 1 {
                     let q = self.layers[il].attn.prepare_q(&x_norm, index_pos)?;
-                    let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
-                    let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
-                    // l_k_iter: same dyn_lk story as the shared_qkv branch
-                    // above — iterate t_cur, not the padded l_k_padded.
-                    let l_k_iter = pad_info.map(|(t_cur, _)| t_cur).unwrap_or(k_c.dim(2)?);
-                    let attn_output = candle::hip_backend::gqa_attention_decode_mv(
-                        &q, &k_c, &v_c,
-                        attention_mask.as_ref(),
-                        self.layers[il].attn.attn_scale,
-                        l_k_iter,
-                    )?;
+                    // Q8 KV decode fast path (same as shared_qkv branch).
+                    #[cfg(feature = "hip")]
+                    let q8_direct = {
+                        let src = if has_kv { il } else { kv_source_idx };
+                        let any_cache = self.kv_caches[src].as_ref()
+                            .expect("KV cache must exist for has_kv source");
+                        gemma4_try_q8_decode_direct(
+                            &q, any_cache,
+                            attention_mask.as_ref(),
+                            self.layers[il].attn.attn_scale,
+                            seq_len_q,
+                        )?
+                    };
+                    #[cfg(not(feature = "hip"))]
+                    let q8_direct: Option<Tensor> = None;
+
+                    let attn_output = if let Some(out) = q8_direct {
+                        out
+                    } else {
+                        let k_c = if k_use.is_contiguous() { k_use.clone() } else { k_use.contiguous()? };
+                        let v_c = if v_use.is_contiguous() { v_use.clone() } else { v_use.contiguous()? };
+                        // l_k_iter: same dyn_lk story as the shared_qkv branch
+                        // above — iterate t_cur, not the padded l_k_padded.
+                        let l_k_iter = pad_info.map(|(t_cur, _)| t_cur).unwrap_or(k_c.dim(2)?);
+                        candle::hip_backend::gqa_attention_decode_mv(
+                            &q, &k_c, &v_c,
+                            attention_mask.as_ref(),
+                            self.layers[il].attn.attn_scale,
+                            l_k_iter,
+                        )?
+                    };
                     self.layers[il].attn.finish_attn(attn_output, b_sz, seq_len_q)?
                 } else {
                     let k_dmajor = k_use.transpose(2, 3)?.contiguous()?;
@@ -1557,6 +2186,7 @@ impl ModelWeights {
             // -------- FFN block --------
             let skip_moe = std::env::var("CANDLE_GEMMA4_SKIP_MOE").is_ok();
             let mut x = if !skip_moe && self.layers[il].moe.is_some() {
+                'moe_block: {
                 let moe_branch = self.layers[il].moe.as_ref().unwrap();
                 // Dual dense+MoE: both branches read from `x` (the
                 // attention residual output, a.k.a. attn_out in turbo).
@@ -1578,7 +2208,41 @@ impl ModelWeights {
                 #[cfg(feature = "hip")]
                 let _t_router_start = std::time::Instant::now();
 
-                // Branch 2: MoE experts
+                // TP+EP fast path: when MoeBranch was loaded via
+                // `MoeBranch::load_ep` (gate_up/down narrowed to this
+                // rank's experts, cluster on ep_partition), the inline
+                // compute is both incorrect (narrowed weights indexed
+                // with global topk_ids → OOB) and unnecessary.
+                // `forward_ep_reduced` returns the full `moe_summed`
+                // with the cross-rank barrier all-reduce applied
+                // inline. Combine with the dense branch and return
+                // out of the MoE block early.
+                #[cfg(feature = "hip")]
+                {
+                    if moe_branch.ep_partition().is_some() {
+                        let moe_summed = moe_branch.forward_ep_reduced(&attn_out)?;
+                        let moe_normed = moe_branch.post_norm.forward(&moe_summed)?;
+                        let moe_normed = if std::env::var("CANDLE_GEMMA4_ZERO_MOE").is_ok() {
+                            Tensor::zeros_like(&moe_normed)?
+                        } else {
+                            moe_normed
+                        };
+                        let dense_normed_use = if std::env::var("CANDLE_GEMMA4_ZERO_DENSE").is_ok() {
+                            Tensor::zeros_like(&dense_normed)?
+                        } else {
+                            dense_normed
+                        };
+                        let combined = (&dense_normed_use + &moe_normed)?;
+                        let result = self.layers[il]
+                            .post_ffn_norm
+                            .forward_post_residual(&combined, &attn_out)?;
+                        // NOTE: `layer_output_scale` is applied by the
+                        // outer loop after this block returns. Do NOT
+                        // apply it here or it gets squared.
+                        break 'moe_block result;
+                    }
+                }
+
                 let moe_in = moe_branch.pre_norm.forward(&attn_out)?;
 
                 // Custom router logits:
@@ -1911,6 +2575,8 @@ impl ModelWeights {
                         weighted.sum(1)?
                     }
                 };
+                // TP+EP path already broke out with the reduced result;
+                // we only reach here on the non-TP path.
                 let moe_summed = moe_summed.reshape((b_sz_ff, seq_len_ff, hidden))?;
 
                 // W3 cache cleanup: ensure no stale topk_ids leak to
@@ -1957,6 +2623,7 @@ impl ModelWeights {
                     t_moe_combine_us += _t_combine_start.elapsed().as_micros();
                 }
                 result
+                } // end 'moe_block
             } else {
                 // Dense-only path (E4B and similar).
                 let residual = x.clone();

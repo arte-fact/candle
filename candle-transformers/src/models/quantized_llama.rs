@@ -44,6 +44,34 @@ impl QMatMul {
         let _enter = self.span.enter();
         self.inner.forward(xs)
     }
+
+    /// F9 (2026-04-20): check if inner is a QTensor (required for preq8 fast path).
+    fn is_qtensor(&self) -> bool {
+        matches!(&self.inner, candle::quantized::QMatMul::QTensor(_))
+    }
+
+    /// F9: forward with a pre-quantized Q8_1 input buffer.
+    #[cfg(feature = "hip")]
+    fn forward_preq8(
+        &self,
+        y_q8_1: &candle::hip_backend::hipdarc::driver::HipView<'_, u8>,
+        b_size: usize,
+        rhs_shape: &[usize],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        match &self.inner {
+            candle::quantized::QMatMul::QTensor(qt) => {
+                let (storage, shape) = qt.matmul_preq8(y_q8_1, b_size, rhs_shape)?;
+                Ok(Tensor::from_storage(
+                    candle::Storage::Hip(storage),
+                    shape,
+                    candle::op::BackpropOp::none(),
+                    false,
+                ))
+            }
+            _ => candle::bail!("QMatMul::forward_preq8: inner not QTensor"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -402,10 +430,68 @@ impl LayerWeights {
         index_pos: usize,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
-        let (b_sz, seq_len, _n_embd) = x.dims3()?;
-        let q = self.attention_wq.forward(x)?;
-        let k = self.attention_wk.forward(x)?;
-        let v = self.attention_wv.forward(x)?;
+        let (b_sz, seq_len, n_embd) = x.dims3()?;
+
+        // F9 (2026-04-20): quantize the attention input to Q8_1 once and
+        // reuse for Q/K/V projections. Saves 2 quantize_q8_1 launches per
+        // layer per decode token. Scoped to seq_len == 1 and QTensor weights
+        // (the `forward_preq8` fast path supports b_size up to 8).
+        #[cfg(feature = "hip")]
+        let preq8_reuse = seq_len == 1
+            && matches!(x.device(), Device::Hip(_))
+            && x.dtype() == DType::F32
+            && self.attention_wq.is_qtensor()
+            && self.attention_wk.is_qtensor()
+            && self.attention_wv.is_qtensor()
+            && std::env::var("CANDLE_ATTN_PREQ8_REUSE").as_deref() != Ok("0");
+        #[cfg(not(feature = "hip"))]
+        let preq8_reuse = false;
+
+        let (q, k, v) = if preq8_reuse {
+            #[cfg(feature = "hip")]
+            {
+                use candle::quantized::hip as qhip;
+                use candle::hip_backend::hipdarc::driver::HipSlice;
+                let dev = match x.device() {
+                    Device::Hip(d) => d.clone(),
+                    _ => unreachable!(),
+                };
+                let x_c = x.contiguous()?;
+                let (xst, xl) = x_c.storage_and_layout();
+                let x_hip = match &*xst {
+                    candle::Storage::Hip(s) => s,
+                    _ => unreachable!(),
+                };
+                let x_f32 = x_hip.as_hip_slice::<f32>()?;
+                let (lo, hi) = xl.contiguous_offsets()
+                    .ok_or_else(|| candle::Error::Msg("F9: x non-contig".into()))?;
+                let x_view = x_f32.slice(lo..hi);
+
+                // Q8_1 buffer for the whole (b_sz * seq_len) batch.
+                let total_rows = b_sz * seq_len;
+                let k_pad = qhip::pad(n_embd, qhip::MATRIX_ROW_PADDING);
+                let blocks_per_row = k_pad / 32;
+                let bytes_per_row = blocks_per_row * 36;
+                let mut xq8: HipSlice<u8> = unsafe {
+                    dev.alloc::<u8>(total_rows * bytes_per_row)?
+                };
+                qhip::quantize_q8_1(&x_view, &mut xq8, n_embd, total_rows, &dev)?;
+                let xq8_view = xq8.slice(0..xq8.len());
+                drop(xst);
+                let rhs_shape: Vec<usize> = x.dims().to_vec();
+                let q = self.attention_wq.forward_preq8(&xq8_view, total_rows, &rhs_shape)?;
+                let k_out = self.attention_wk.forward_preq8(&xq8_view, total_rows, &rhs_shape)?;
+                let v_out = self.attention_wv.forward_preq8(&xq8_view, total_rows, &rhs_shape)?;
+                (q, k_out, v_out)
+            }
+            #[cfg(not(feature = "hip"))]
+            unreachable!()
+        } else {
+            let q = self.attention_wq.forward(x)?;
+            let k = self.attention_wk.forward(x)?;
+            let v = self.attention_wv.forward(x)?;
+            (q, k, v)
+        };
 
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
@@ -422,7 +508,17 @@ impl LayerWeights {
             .contiguous()?;
 
         let q = self.apply_rotary_emb(&q, index_pos)?;
-        let k = self.apply_rotary_emb(&k, index_pos)?;
+        // F2: if Q8 KV is on and we're at decode (seq_len == 1), skip the
+        // separate rope kernel on K — the cache-append kernel will fuse it.
+        // For prefill / F32 KV path, still apply rope as a separate kernel.
+        #[cfg(feature = "hip")]
+        let k_for_q8_fused = self.use_q8_kv && seq_len == 1
+            && std::env::var("CANDLE_Q8_KV_APPEND_ROPE_FUSED").as_deref() != Ok("0")
+            && self.head_dim == self.head_dim;  // full rope only
+        #[cfg(not(feature = "hip"))]
+        let k_for_q8_fused = false;
+        let k_pre_rope = if k_for_q8_fused { Some(k.clone()) } else { None };
+        let k = if k_for_q8_fused { k } else { self.apply_rotary_emb(&k, index_pos)? };
 
         // --- Q8 KV path -------------------------------------------------
         // When `CANDLE_KV_Q8=1`, store K/V in a packed block_q8_0 cache
@@ -436,6 +532,11 @@ impl LayerWeights {
         if self.use_q8_kv {
             // Drop the tracing span borrow so forward_attn_q8 can take &mut self.
             drop(_enter);
+            if let Some(k_pre) = k_pre_rope {
+                return self.forward_attn_q8_fused_rope(
+                    &q, &k_pre, &v, mask, index_pos, b_sz, seq_len,
+                );
+            }
             return self.forward_attn_q8(&q, &k, &v, mask, index_pos, b_sz, seq_len);
         }
 
@@ -627,7 +728,7 @@ impl LayerWeights {
         b_sz: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
-        use candle::hip_backend::q8_kv_cache::{gqa_attention_decode_q8, QKvCache};
+        use candle::hip_backend::q8_kv_cache::{gqa_attention_decode_q8_with_fused_softmax, QKvCache};
 
         let hip_dev = match q.device() {
             Device::Hip(d) => d.clone(),
@@ -675,7 +776,11 @@ impl LayerWeights {
                     Some(add.reshape((1, 1, a, b))?.contiguous()?)
                 }
             };
-            gqa_attention_decode_q8(q, cache, t_cur, mask_additive.as_ref(), scale)?
+            // F3: llama-family dense (Devstral/Mistral/Llama) benefits from
+            // fused softmax. Default ON here; env override via CANDLE_Q8_DECODE_SOFTMAX_FUSED.
+            gqa_attention_decode_q8_with_fused_softmax(
+                q, cache, t_cur, mask_additive.as_ref(), scale, true,
+            )?
         } else {
             // Prefill path: dequantize cache to F32, use existing
             // flash-attn-v2 path (k-transposed layout).
@@ -708,6 +813,90 @@ impl LayerWeights {
             .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
         let y = self.attention_wo.forward(&y)?;
         Ok(y)
+    }
+
+    /// F2: variant of `forward_attn_q8` that takes a PRE-ROPE K and applies
+    /// rope inside the Q8 cache-append kernel, eliminating one `rope_i_f32`
+    /// launch per decode layer. Only fires at seq_len==1 (decode).
+    #[cfg(feature = "hip")]
+    fn forward_attn_q8_fused_rope(
+        &mut self,
+        q: &Tensor,
+        k_pre_rope: &Tensor,
+        v: &Tensor,
+        mask: Option<&Tensor>,
+        index_pos: usize,
+        b_sz: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        use candle::hip_backend::q8_kv_cache::{gqa_attention_decode_q8_with_fused_softmax, QKvCache};
+
+        let hip_dev = match q.device() {
+            Device::Hip(d) => d.clone(),
+            _ => candle::bail!("forward_attn_q8_fused_rope: q must be on HIP"),
+        };
+        let q8_t_max: usize = std::env::var("CANDLE_KV_MAX_T")
+            .ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(4096);
+
+        if index_pos == 0 {
+            if let Some(c) = self.q8_cache.as_mut() {
+                c.reset();
+            }
+        }
+        let cache = match self.q8_cache.as_mut() {
+            Some(c) => c,
+            None => {
+                let c = QKvCache::new(&hip_dev, b_sz, self.n_kv_head, q8_t_max, self.head_dim)?;
+                self.q8_cache = Some(c);
+                self.q8_cache.as_mut().unwrap()
+            }
+        };
+
+        // Fused rope+quantize+append for K; plain append for V.
+        let k_contig = k_pre_rope.contiguous()?;
+        let v_contig = v.contiguous()?;
+        cache.append_with_rope_k(&k_contig, &v_contig, &self.cos, &self.sin)?;
+        let t_cur = cache.current_seq_len();
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+
+        // Decode-only path (seq_len == 1 guaranteed by caller).
+        debug_assert_eq!(seq_len, 1);
+        let mask_additive: Option<Tensor> = match mask {
+            None => None,
+            Some(m) => {
+                let mdims = m.dims();
+                let (a, b) = (mdims[0], mdims[1]);
+                let zero = Tensor::zeros(mdims, DType::F32, q.device())?;
+                let neg = self.neg_inf.broadcast_as(mdims)?;
+                let add = m.where_cond(&neg, &zero)?;
+                Some(add.reshape((1, 1, a, b))?.contiguous()?)
+            }
+        };
+        // F1 (2026-04-20): try the all-in-one fused Q8 attention kernel
+        // (`gqa_decode_mv_fast_q8_d{128,256,512}_f32`). Opt-in via env —
+        // prior measurements (2026-04-19) showed it regressed on gemma4 d=256
+        // but untested on Devstral d=128. Default OFF; CANDLE_Q8_ATTN_FUSED=1 to enable.
+        let want_fused = std::env::var("CANDLE_Q8_ATTN_FUSED").as_deref() == Ok("1")
+            && matches!(self.head_dim, 128 | 256 | 512);
+        let y = if want_fused {
+            match candle::hip_backend::q8_kv_cache::gqa_decode_mv_fast_q8(
+                q, cache, t_cur, mask_additive.as_ref(), scale,
+            ) {
+                Ok(o) => o,
+                Err(_) => gqa_attention_decode_q8_with_fused_softmax(
+                    q, cache, t_cur, mask_additive.as_ref(), scale, true,
+                )?,
+            }
+        } else {
+            gqa_attention_decode_q8_with_fused_softmax(
+                q, cache, t_cur, mask_additive.as_ref(), scale, true,
+            )?
+        };
+
+        let y = y.transpose(1, 2)?
+            .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
+        self.attention_wo.forward(&y)
     }
 }
 
@@ -795,7 +984,7 @@ impl ModelWeights {
                 kv_cache: None,
                 #[cfg(feature = "hip")]
                 q8_cache: None,
-                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1"),
+                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() != Some("0"),
                 device: Device::Cpu,
                 span_attn,
                 span_rot,
@@ -934,7 +1123,7 @@ impl ModelWeights {
                 kv_cache: None,
                 #[cfg(feature = "hip")]
                 q8_cache: None,
-                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1"),
+                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() != Some("0"),
                 device: device.clone(),
                 span_attn,
                 span_rot,
@@ -1113,7 +1302,7 @@ impl ModelWeights {
                 kv_cache: None,
                 #[cfg(feature = "hip")]
                 q8_cache: None,
-                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() == Some("1"),
+                use_q8_kv: std::env::var("CANDLE_KV_Q8").ok().as_deref() != Some("0"),
                 device: layer_device.clone(),
                 span_attn,
                 span_rot,

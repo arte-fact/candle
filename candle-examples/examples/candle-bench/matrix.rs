@@ -88,7 +88,8 @@ pub fn cmd(
             gpus: e.gpus.clone(),
             prompt_lens: prompt_lens.clone(),
             tg_len,
-            envs: vec!["CANDLE_MMQ_TURBO_PORT=1".into()],
+            // P35: CANDLE_MMQ_TURBO_PORT is default ON now; no need to force.
+            envs: vec![],
             extra_args: e.extras.clone(),
             reps,
             timeout,

@@ -342,6 +342,25 @@ pub fn masked_softmax_scale_fused(
         slice.slice(lo..hi)
     });
 
+    let n_rows = (b_sz * n_head * l_q) as u32;
+    // F5 (2026-04-20): auto-fallback when grid is too small to saturate CUs.
+    // On gfx906 the 60-CU × 40-wave/CU scheduler needs ~60+ blocks to hide
+    // memory latency; with 32 blocks (Qwen3.6 MoE decode) the kernel leaves
+    // 97% of the GPU idle, making the decomposed path net-faster via kernel-
+    // concurrency. Fall back by returning an error so callers (e.g.
+    // `gqa_attention_decode_q8`) can use their decomposed path. Override via
+    // CANDLE_FUSED_SOFTMAX_MIN_ROWS=0 to force use.
+    // Empirical threshold: 24 wins Devstral +3% without regressing Qwen3.6
+    // MoE or Qwen3.5-27B dense (Apr 2026). Below ~16 blocks the grid is
+    // too small to amortize warp-reduce setup; above ≈ arch-dependent.
+    let min_rows: u32 = std::env::var("CANDLE_FUSED_SOFTMAX_MIN_ROWS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(24);
+    if n_rows < min_rows {
+        crate::bail!(
+            "masked_softmax_scale_fused: n_rows={n_rows} < min_rows={min_rows} — fall back to decomposed (set CANDLE_FUSED_SOFTMAX_MIN_ROWS=0 to override)"
+        );
+    }
+
     let numel = b_sz * n_head * l_q * l_k;
     // SAFETY: populated by the kernel below.
     let out = unsafe { dev.alloc::<f32>(numel)? };
@@ -350,7 +369,6 @@ pub fn masked_softmax_scale_fused(
 
     // Match the existing `softmax_f32` launch geometry: one Wave64 warp
     // per row, with `block_dim.y` providing the WARP_SIZE lanes.
-    let n_rows = (b_sz * n_head * l_q) as u32;
     let cfg = LaunchConfig {
         grid_dim: (n_rows, 1, 1),
         block_dim: (1, WARP_SIZE, 1),
@@ -599,6 +617,100 @@ pub fn l2_norm_fused(x: &Tensor, eps: f64) -> Result<Tensor> {
         <Shape as From<Vec<usize>>>::from(x.dims().to_vec()),
         BackpropOp::none(),
         /* is_variable */ false,
+    ))
+}
+
+/// P28: fused `x.broadcast_mul(w).sum_keepdim(last_dim)` in one kernel.
+///
+/// For each row of `x` shape `[..., row_len]`, computes
+/// `out[row, 0] = Σ_i x[row, i] * w[i]`. Output shape is the input shape
+/// with last dim replaced by 1.
+///
+/// Replaces the 2-kernel chain used for MoE shared-expert scalar gates:
+/// ```ignore
+/// let gate_logits = x_flat.broadcast_mul(&sg)?.sum_keepdim(D::Minus1)?;
+/// ```
+/// Measured on Qwen3.6 decode: kills ~3200 bmul_f32 + ~3200 fast_sum_f32
+/// launches per 64-decode run. Replaces them with 3200 dot_last_dim_f32
+/// calls at ~2-3 µs each.
+///
+/// # Requirements
+/// - `x` must be on a HIP device, contiguous, f32, rank >= 1.
+/// - `w` must be on the same HIP device, contiguous, f32, rank 1, length == last dim of x.
+pub fn dot_last_dim_fused(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+    let dev = match x.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("dot_last_dim_fused: x must be on a HIP device"),
+    };
+    if x.dtype() != DType::F32 || w.dtype() != DType::F32 {
+        crate::bail!("dot_last_dim_fused: x and w must be f32");
+    }
+    if !x.is_contiguous() || !w.is_contiguous() {
+        crate::bail!("dot_last_dim_fused: x and w must be contiguous");
+    }
+    let row_len = *x.dims().last().unwrap();
+    if w.elem_count() != row_len {
+        crate::bail!(
+            "dot_last_dim_fused: w len {} != x last dim {}",
+            w.elem_count(), row_len
+        );
+    }
+    let n_rows = x.elem_count() / row_len;
+    if row_len == 0 || n_rows == 0 {
+        let mut out_dims = x.dims().to_vec();
+        *out_dims.last_mut().unwrap() = 1;
+        return Tensor::zeros(out_dims, DType::F32, x.device());
+    }
+
+    let (x_st, x_l) = x.storage_and_layout();
+    let x_hip = match &*x_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("dot_last_dim_fused: x storage not HIP"),
+    };
+    let x_slice = x_hip.as_hip_slice::<f32>()?;
+    let x_view = match x_l.contiguous_offsets() {
+        Some((lo, hi)) => x_slice.slice(lo..hi),
+        None => crate::bail!("dot_last_dim_fused: non-contig x"),
+    };
+
+    let (w_st, w_l) = w.storage_and_layout();
+    let w_hip = match &*w_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("dot_last_dim_fused: w storage not HIP"),
+    };
+    let w_slice = w_hip.as_hip_slice::<f32>()?;
+    let w_view = match w_l.contiguous_offsets() {
+        Some((lo, hi)) => w_slice.slice(lo..hi),
+        None => crate::bail!("dot_last_dim_fused: non-contig w"),
+    };
+
+    let out = unsafe { dev.alloc::<f32>(n_rows)? };
+
+    let func = dev.get_or_load_func("dot_last_dim_f32", &kernels::UNARY)?;
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 1, 1),
+        block_dim: (WARP_SIZE, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let row_len_arg = row_len;
+    let mut builder = func.builder();
+    builder.arg(&row_len_arg);
+    builder.arg(&x_view);
+    builder.arg(&w_view);
+    builder.arg(&out);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(x_st);
+    drop(w_st);
+
+    let out_storage = HipStorage::wrap_hip_slice(out, dev);
+    let mut out_dims = x.dims().to_vec();
+    *out_dims.last_mut().unwrap() = 1;
+    Ok(Tensor::from_storage(
+        Storage::Hip(out_storage),
+        <Shape as From<Vec<usize>>>::from(out_dims),
+        BackpropOp::none(),
+        false,
     ))
 }
 
@@ -980,9 +1092,10 @@ pub fn topk_moe_norm_fused(
     let kernel_name = match n_experts {
         64 => "topk_moe_norm_f32_n64",
         128 => "topk_moe_norm_f32_n128",
+        256 => "topk_moe_norm_f32_n256",
         512 => "topk_moe_norm_f32_n512",
         _ => crate::bail!(
-            "topk_moe_norm_fused: no compiled kernel for n_experts={} (have 64, 128, 512)",
+            "topk_moe_norm_fused: no compiled kernel for n_experts={} (have 64, 128, 256, 512)",
             n_experts
         ),
     };
@@ -1416,6 +1529,114 @@ pub fn gelu_mul_quantize_q8_1_fused(
     unsafe { builder.launch(cfg) }.w()?;
 
     drop(st);
+
+    let out_shape: crate::Shape = vec![batch, topk, inter].into();
+    Ok((out, out_shape))
+}
+
+/// P25: Fused `silu(gate) * up → quantize_q8_1` for MoE down input.
+///
+/// Replaces the 3-step chain in `MoeExperts::forward_shared_q8_decode`:
+/// ```ignore
+/// let activated = candle_nn::ops::silu_mul(&gate_out, &up_out)?;     // 1 kernel
+/// activated.contiguous()?;                                           // possible copy
+/// down_exps.indexed_moe_forward(&activated, &topk_ids)?;             // re-quantises to Q8_1 inside
+/// ```
+/// with a single HIP kernel
+/// (`silu_mul_quantize_q8_1_separate_f32` in
+/// `candle-hip-kernels/src/quantized.cu`) producing a Q8_1 buffer
+/// suitable for `down_exps.indexed_moe_forward_preq8`.
+///
+/// Inputs are SEPARATE F32 buffers `[batch, topk, inter]` — matches what
+/// `indexed_moe_gate_up_forward_preq8` (P21) returns.
+pub fn silu_mul_quantize_q8_1_separate_fused(
+    gate: &Tensor,
+    up: &Tensor,
+) -> Result<(hipdarc::driver::HipSlice<u8>, crate::Shape)> {
+    use crate::hip_backend::HipDevice;
+    let dev: HipDevice = match gate.device() {
+        Device::Hip(d) => d.clone(),
+        _ => crate::bail!("silu_mul_quantize_q8_1_separate_fused: gate must be on HIP"),
+    };
+    if gate.dtype() != DType::F32 || up.dtype() != DType::F32 {
+        crate::bail!("silu_mul_quantize_q8_1_separate_fused: gate and up must be f32");
+    }
+    if gate.shape() != up.shape() {
+        crate::bail!(
+            "silu_mul_quantize_q8_1_separate_fused: shape mismatch gate {:?} vs up {:?}",
+            gate.shape(), up.shape()
+        );
+    }
+    if !gate.is_contiguous() || !up.is_contiguous() {
+        crate::bail!("silu_mul_quantize_q8_1_separate_fused: inputs must be contiguous");
+    }
+    if gate.rank() != 3 {
+        crate::bail!(
+            "silu_mul_quantize_q8_1_separate_fused: expected rank 3 [batch, topk, inter], got {:?}",
+            gate.shape()
+        );
+    }
+    let (batch, topk, inter) = gate.dims3()?;
+    if inter % 32 != 0 {
+        crate::bail!(
+            "silu_mul_quantize_q8_1_separate_fused: inter={} must be a multiple of QK8_1=32",
+            inter
+        );
+    }
+
+    let (g_st, g_l) = gate.storage_and_layout();
+    let g_hip = match &*g_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("silu_mul_quantize_q8_1_separate_fused: gate storage not HIP"),
+    };
+    let g_slice = g_hip.as_hip_slice::<f32>()?;
+    let g_view = match g_l.contiguous_offsets() {
+        Some((lo, hi)) => g_slice.slice(lo..hi),
+        None => crate::bail!("silu_mul_quantize_q8_1_separate_fused: non-contiguous gate"),
+    };
+
+    let (u_st, u_l) = up.storage_and_layout();
+    let u_hip = match &*u_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("silu_mul_quantize_q8_1_separate_fused: up storage not HIP"),
+    };
+    let u_slice = u_hip.as_hip_slice::<f32>()?;
+    let u_view = match u_l.contiguous_offsets() {
+        Some((lo, hi)) => u_slice.slice(lo..hi),
+        None => crate::bail!("silu_mul_quantize_q8_1_separate_fused: non-contiguous up"),
+    };
+
+    let inter_padded = crate::quantized::hip::pad(inter, crate::quantized::hip::MATRIX_ROW_PADDING);
+    const Q8_1_BLOCK_BYTES: usize = 36;
+    let n_blocks = batch * topk * (inter_padded / 32);
+    let q8_bytes = n_blocks * Q8_1_BLOCK_BYTES;
+    let out = unsafe { dev.alloc::<u8>(q8_bytes)? };
+
+    let func = dev.get_or_load_func(
+        "silu_mul_quantize_q8_1_separate_f32",
+        &kernels::QUANTIZED,
+    )?;
+    let cfg = LaunchConfig {
+        grid_dim: ((inter_padded / 32) as u32, topk as u32, batch as u32),
+        block_dim: (32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let inter_arg = inter as i32;
+    let inter_padded_arg = inter_padded as i32;
+    let topk_arg = topk as i32;
+    let batch_arg = batch as i32;
+    let mut builder = func.builder();
+    builder.arg(&g_view);
+    builder.arg(&u_view);
+    builder.arg(&out);
+    builder.arg(&inter_arg);
+    builder.arg(&inter_padded_arg);
+    builder.arg(&topk_arg);
+    builder.arg(&batch_arg);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(g_st);
+    drop(u_st);
 
     let out_shape: crate::Shape = vec![batch, topk, inter].into();
     Ok((out, out_shape))

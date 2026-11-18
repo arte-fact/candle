@@ -198,20 +198,46 @@ impl DeltaNetLayer {
         let wqkv = gg.qmatmul(&format!("{prefix}.attn_qkv.weight"))?;
         let wqkv_gate = gg.qmatmul(&format!("{prefix}.attn_gate.weight"))?;
 
+        // P20 (2026-04-19): GDN alpha/beta/ba come as F32 in GGUFs like
+        // Qwen3.6 (Q4_K_S variant stores them dequantized). Loading via
+        // `gg.qmatmul` returns `QMatMul::Tensor(F32)` → the decode-path
+        // forward dispatches to rocBLAS `Cijk_Alik_Bljk_SB_MT32x64x16`
+        // which accounts for ~24% of Qwen3.6 decode kernel time (2520
+        // calls × ~178 µs = 445 ms on 64-token tg). Requantising these
+        // to Q8_0 at load time forces the forward through the MMVQ
+        // kernel chain (~25 µs/call at this hidden size), saving the
+        // bulk of that time. Pattern mirrors `MoeExperts::load`'s
+        // `router.requantize_to(...)` at `ffn.rs:597`.
+        let gdn_requant_dtype = {
+            let want = std::env::var("CANDLE_GDN_REQUANT_DTYPE").ok();
+            match want.as_deref() {
+                Some("0") | Some("off") | Some("none") => None,
+                Some("q4_0") => Some(candle::quantized::GgmlDType::Q4_0),
+                Some("q4_1") => Some(candle::quantized::GgmlDType::Q4_1),
+                Some("q5_0") => Some(candle::quantized::GgmlDType::Q5_0),
+                Some("q5_1") => Some(candle::quantized::GgmlDType::Q5_1),
+                _ => Some(candle::quantized::GgmlDType::Q8_0),
+            }
+        };
         // Auto-detect alpha/beta vs ba (qwen3next uses ssm_ba instead of ssm_alpha+ssm_beta)
         let ba_proj = if gg.has_tensor(&format!("{prefix}.ssm_alpha.weight")) {
-            BaProj::Split {
-                alpha: gg.qmatmul(&format!("{prefix}.ssm_alpha.weight"))?,
-                beta: gg.qmatmul(&format!("{prefix}.ssm_beta.weight"))?,
+            let mut alpha = gg.qmatmul(&format!("{prefix}.ssm_alpha.weight"))?;
+            let mut beta  = gg.qmatmul(&format!("{prefix}.ssm_beta.weight"))?;
+            if let Some(dt) = gdn_requant_dtype {
+                if !alpha.is_qtensor() { let _ = alpha.requantize_to(dt); }
+                if !beta.is_qtensor()  { let _ = beta.requantize_to(dt);  }
             }
+            BaProj::Split { alpha, beta }
         } else if gg.has_tensor(&format!("{prefix}.ssm_ba.weight")) {
             // ssm_ba: fused projection outputting 2*num_v_heads (see qwen3next.cpp:287-315).
             // The layout is reshape(..., num_k_heads, 2*num_v_heads/num_k_heads) with the
             // first half on the last dim = beta, second half = alpha. The forward pass
             // performs the split each step.
-            BaProj::Fused {
-                ba: gg.qmatmul(&format!("{prefix}.ssm_ba.weight"))?,
+            let mut ba = gg.qmatmul(&format!("{prefix}.ssm_ba.weight"))?;
+            if let Some(dt) = gdn_requant_dtype {
+                if !ba.is_qtensor() { let _ = ba.requantize_to(dt); }
             }
+            BaProj::Fused { ba }
         } else {
             candle::bail!("GDN layer {prefix} has neither ssm_alpha nor ssm_ba");
         };
@@ -1205,8 +1231,15 @@ mod tests {
         let v_hip = Tensor::from_slice(&v_vals, (b, h, l, s_v), &dev_hip).unwrap();
         let gate_hip = Tensor::from_slice(&gate_vals, (b, h, l, 1), &dev_hip).unwrap();
         let beta_hip = Tensor::from_slice(&beta_vals, (b, h, l, 1), &dev_hip).unwrap();
-        let mut state_hip =
-            Tensor::from_slice(&state_vals, (b, h, s_v, s_v), &dev_hip).unwrap();
+        // P23: the HIP kernel stores state in a transposed layout (col, i)
+        // so warp-stride reads coalesce. Pre-transpose the initial state
+        // so HIP reads the same semantic values as CPU.
+        let mut state_hip = Tensor::from_slice(&state_vals, (b, h, s_v, s_v), &dev_hip)
+            .unwrap()
+            .transpose(2, 3)
+            .unwrap()
+            .contiguous()
+            .unwrap();
 
         // CPU reference: the tensor-op chain (fallback path).
         let out_cpu = delta_net_step_vectorized(
@@ -1239,7 +1272,12 @@ mod tests {
         );
 
         let st_cpu_vals: Vec<f32> = state_cpu.flatten_all().unwrap().to_vec1().unwrap();
+        // P23: un-transpose HIP state before comparison (stored transposed).
         let st_hip_vals: Vec<f32> = state_hip
+            .transpose(2, 3)
+            .unwrap()
+            .contiguous()
+            .unwrap()
             .to_device(&dev_cpu)
             .unwrap()
             .flatten_all()
@@ -1344,7 +1382,12 @@ mod tests {
 
             let st_cpu_vals: Vec<f32> =
                 state_cpu.flatten_all().unwrap().to_vec1().unwrap();
+            // P23: un-transpose HIP state (kernel stores (col, i) for coalescing).
             let st_hip_vals: Vec<f32> = state_hip
+                .transpose(2, 3)
+                .unwrap()
+                .contiguous()
+                .unwrap()
                 .to_device(&dev_cpu)
                 .unwrap()
                 .flatten_all()
@@ -1567,7 +1610,13 @@ mod tests {
         let v_hip = Tensor::from_slice(&v_vals, (b, h_v, l, s_v), &dev_hip).unwrap();
         let gate_hip = Tensor::from_slice(&gate_vals, (b, h_v, l, 1), &dev_hip).unwrap();
         let beta_hip = Tensor::from_slice(&beta_vals, (b, h_v, l, 1), &dev_hip).unwrap();
-        let mut state_hip = Tensor::from_slice(&state_vals, (b, h_v, s_v, s_v), &dev_hip).unwrap();
+        // P23: HIP kernel stores state transposed (col outer, i inner).
+        let mut state_hip = Tensor::from_slice(&state_vals, (b, h_v, s_v, s_v), &dev_hip)
+            .unwrap()
+            .transpose(2, 3)
+            .unwrap()
+            .contiguous()
+            .unwrap();
 
         let q_cpu = Tensor::from_slice(&q_vals, (b, h_kv, l, s_v), &dev_cpu).unwrap();
         let k_cpu = Tensor::from_slice(&k_vals, (b, h_kv, l, s_v), &dev_cpu).unwrap();
@@ -1603,7 +1652,9 @@ mod tests {
             "GQA n_rep=4 attn drift: max_abs={max_abs}"
         );
 
+        // P23: un-transpose HIP state before comparison.
         let s_a: Vec<f32> = state_hip
+            .transpose(2, 3).unwrap().contiguous().unwrap()
             .to_device(&dev_cpu).unwrap()
             .flatten_all().unwrap().to_vec1().unwrap();
         let s_b: Vec<f32> = state_cpu.flatten_all().unwrap().to_vec1().unwrap();

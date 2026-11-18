@@ -728,7 +728,9 @@ static __device__ __forceinline__ void flash_attn_decode_split_k_lds_phase1_impl
     }
 }
 
-extern "C" __global__ void __launch_bounds__(128, 4) flash_attn_decode_split_k_lds_phase1_d64_f32(
+// LDS-bound: K tile at 16 KiB/block caps occupancy at 4 blocks/CU = 8 waves/CU
+// = 2 waves/SIMD. `(128, 4)` was inconsistent and drew the occupancy warning.
+extern "C" __global__ void __launch_bounds__(128, 2) flash_attn_decode_split_k_lds_phase1_d64_f32(
     const float * __restrict__ q,
     const float * __restrict__ k,
     const float * __restrict__ v,
@@ -747,7 +749,9 @@ extern "C" __global__ void __launch_bounds__(128, 4) flash_attn_decode_split_k_l
         v_head_stride, v_stride_j, v_stride_d, num_chunks);
 }
 
-extern "C" __global__ void __launch_bounds__(128, 4) flash_attn_decode_split_k_lds_phase1_d128_f32(
+// LDS-bound: K tile at 16 KiB/block caps occupancy at 4 blocks/CU = 8 waves/CU
+// = 2 waves/SIMD. `(128, 4)` was inconsistent and drew the occupancy warning.
+extern "C" __global__ void __launch_bounds__(128, 2) flash_attn_decode_split_k_lds_phase1_d128_f32(
     const float * __restrict__ q,
     const float * __restrict__ k,
     const float * __restrict__ v,

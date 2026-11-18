@@ -153,6 +153,13 @@ impl QMatMul {
         matches!(&self.inner, candle::quantized::QMatMul::QTensor(_))
     }
 
+    /// Diagnostic: the underlying packed-storage byte count when the
+    /// weight is a `QTensor`. `None` for dequantised `Tensor` / `TensorF16`
+    /// paths. Used by VRAM parity tests.
+    pub fn storage_size_in_bytes(&self) -> Option<usize> {
+        self.inner.storage_size_in_bytes()
+    }
+
     /// If the inner is a dequantized `Tensor` (loaded from F16/F32/BF16 in
     /// the GGUF), re-quantize it to `dtype` and replace the inner with a
     /// fresh `QTensor`. Used by G2-replay-friendly paths where dequantized

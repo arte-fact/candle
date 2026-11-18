@@ -80,7 +80,37 @@ pub struct HipCluster {
     /// = Vec of `BOUNCE_BUFS_PER_RANK` slabs of `BOUNCE_CHUNK` bytes.
     /// Used as the DtoH landing zone for rank-as-src copies.
     pinned: Mutex<Vec<Option<Arc<Vec<PinnedHostSlab>>>>>,
+    /// Barrier-based all-reduce rendezvous. Each rank publishes its
+    /// (input, output) device pointers into `ar_state[rank]`, waits
+    /// on `ar_barrier`, the leader runs the single-threaded gather
+    /// + reduce + scatter, then all threads wait on `ar_barrier` again
+    /// before the leader clears state. See
+    /// [`Self::all_reduce_sum_f32_barrier`].
+    ar_barrier: std::sync::Barrier,
+    ar_state: Mutex<Vec<AllReduceSlot>>,
 }
+
+/// One rank's contribution to an in-flight barrier all-reduce. Raw
+/// pointers because the borrowed HipSlice refs live in the caller's
+/// thread stack; we fill these in under the lock and read them from
+/// the leader thread between barrier phases.
+#[derive(Clone, Copy)]
+struct AllReduceSlot {
+    input_ptr: *const u8,
+    output_ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the AllReduceSlot raw pointers only ever point to HIP
+// device memory owned by the caller's HipSlice. The cluster never
+// dereferences them outside the synchronous
+// `all_reduce_sum_f32_barrier` call, and the leader dereferences
+// them only while every contributing thread is blocked on the
+// second barrier (so the source HipSlice references cannot have
+// been dropped yet). We implement Send + Sync manually so the
+// containing Vec can cross thread boundaries via &HipCluster.
+unsafe impl Send for AllReduceSlot {}
+unsafe impl Sync for AllReduceSlot {}
 
 impl std::fmt::Debug for HipCluster {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -142,8 +172,13 @@ impl HipCluster {
         let w = devices.len();
         let dtoh_streams = Mutex::new(vec![None; w]);
         let pinned = Mutex::new(vec![None; w]);
+        let ar_barrier = std::sync::Barrier::new(w);
+        let ar_state = Mutex::new(vec![
+            AllReduceSlot { input_ptr: std::ptr::null(), output_ptr: std::ptr::null_mut(), len: 0 };
+            w
+        ]);
 
-        Ok(Self { devices, peer_streams, dtoh_streams, pinned })
+        Ok(Self { devices, peer_streams, dtoh_streams, pinned, ar_barrier, ar_state })
     }
 
     pub fn world_size(&self) -> usize {
@@ -559,6 +594,407 @@ impl HipCluster {
             }
         }
         Ok(())
+    }
+
+    /// All-reduce with SUM op via host bounce. Each rank contributes one
+    /// f32 input slice (`inputs[r]` lives on device r); the element-wise
+    /// sum is written back to each rank's output slice (`outputs[r]`).
+    ///
+    /// Protocol: one DtoH per rank into a host buffer → CPU-side sum →
+    /// one HtoD per rank from the shared summed buffer. All streams
+    /// synchronise before returning.
+    ///
+    /// Sized for the MoE partial-output use case on decode: one
+    /// `[B, S, H]` tensor per rank at ~8 KB (B=S=1, H=2048, f32). At
+    /// 6.75 GB/s pinned-bounce throughput the total round-trip for
+    /// W=4 is ~8 µs of bandwidth time + ~20 µs of launch/sync
+    /// overhead — a few percent of a decode step and amortised over
+    /// the MoE-layer savings.
+    ///
+    /// Correctness note: uses plain host `Vec<f32>` (not pinned), so
+    /// `hipMemcpyAsync` degrades to synchronous on the driver side.
+    /// That's OK here because we sync explicitly after each phase.
+    pub fn all_reduce_sum_f32_via_host(
+        &self,
+        inputs: &[&HipSlice<f32>],
+        outputs: &mut [&mut HipSlice<f32>],
+    ) -> Result<()> {
+        let w = self.devices.len();
+        if inputs.len() != w {
+            crate::bail!(
+                "all_reduce_sum: inputs.len()={} must equal world={}",
+                inputs.len(), w
+            );
+        }
+        if outputs.len() != w {
+            crate::bail!(
+                "all_reduce_sum: outputs.len()={} must equal world={}",
+                outputs.len(), w
+            );
+        }
+        let n = inputs[0].len();
+        for (r, s) in inputs.iter().enumerate() {
+            if s.len() != n {
+                crate::bail!(
+                    "all_reduce_sum: inputs[{r}].len={} != inputs[0].len={}",
+                    s.len(), n
+                );
+            }
+        }
+        for (r, s) in outputs.iter().enumerate() {
+            if s.len() != n {
+                crate::bail!(
+                    "all_reduce_sum: outputs[{r}].len={} != n={}",
+                    s.len(), n
+                );
+            }
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        let total_bytes = n * std::mem::size_of::<f32>();
+
+        // Use the cluster's pinned-host bounce pool so DtoH/HtoD are
+        // truly async. Unpinned Vec<f32> makes hipMemcpyAsync serialise
+        // (~100 µs/call × 2*W = ~400 µs/reduce for W=2), while pinned
+        // memory lets the async copies overlap and lets a single
+        // stream sync per phase suffice.
+        //
+        // Each rank's pool has `BOUNCE_BUFS_PER_RANK` slabs of
+        // `BOUNCE_CHUNK` bytes; for allreduce we only need one slab
+        // per rank large enough to hold `total_bytes`. Fall back to
+        // a single-pass cpu bounce if a payload ever exceeds the
+        // chunk (unlikely for TP activations).
+        if total_bytes > BOUNCE_CHUNK
+            || std::env::var("CANDLE_TP_UNPINNED").is_ok()
+        {
+            return self.all_reduce_sum_f32_via_host_unpinned(inputs, outputs, n, total_bytes);
+        }
+
+        // Ensure pool materialised for every contributing rank.
+        for r in 0..w {
+            self.ensure_pinned_pool(r)?;
+        }
+
+        // Cache per-rank pinned pointers in one lock acquire to avoid
+        // repeated Mutex dance in the hot loop.
+        let (mut dtoh_dsts, htod_src): (Vec<*mut u8>, *const u8) = {
+            let p = self.pinned.lock().unwrap();
+            let dsts: Vec<*mut u8> = (0..w)
+                .map(|r| p[r].as_ref().unwrap()[0].as_mut_ptr())
+                .collect();
+            let src = p[0].as_ref().unwrap()[0].as_ptr();
+            (dsts, src)
+        };
+
+        // Phase 1: DtoH per rank into pinned[r][0]. Async.
+        // NOTE: `hipMemcpyAsync` uses the stream's own device context,
+        // not the thread-current device — skipping `set_current` here
+        // saves ~20 µs per rank. Thread-current device only matters
+        // for `hipStreamSynchronize` in older ROCm versions; the
+        // ROCm we target (7.1.1) handles stream-aware sync regardless.
+        for r in 0..w {
+            let rc = unsafe {
+                sys::hipMemcpyAsync(
+                    dtoh_dsts[r] as *mut c_void,
+                    inputs[r].device_ptr() as *const c_void,
+                    total_bytes,
+                    sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+                    self.peer_streams[r].raw(),
+                )
+            };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum DtoH rank {r}: {:?}", rc);
+            }
+        }
+        for r in 0..w {
+            let rc = unsafe { sys::hipStreamSynchronize(self.peer_streams[r].raw()) };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum DtoH sync rank {r}: {:?}", rc);
+            }
+        }
+        // silence warning: dtoh_dsts values are read via ptr above
+        let _ = &mut dtoh_dsts;
+
+        // Phase 2: CPU reduce. Sum ranks[1..] into pinned[0][0] using
+        // the pointers already cached above.
+        unsafe {
+            let dst = std::slice::from_raw_parts_mut(dtoh_dsts[0] as *mut f32, n);
+            for r in 1..w {
+                let src = std::slice::from_raw_parts(dtoh_dsts[r] as *const f32, n);
+                for i in 0..n {
+                    dst[i] += src[i];
+                }
+            }
+        }
+
+        // Phase 3: HtoD pinned[0][0] → every output. Async, parallel.
+        // Sync after — the pinned source buffer must NOT be overwritten
+        // by the next call's DtoH before every rank's HtoD has read it.
+        for r in 0..w {
+            let rc = unsafe {
+                sys::hipMemcpyAsync(
+                    outputs[r].device_ptr() as *mut c_void,
+                    htod_src as *const c_void,
+                    total_bytes,
+                    sys::hipMemcpyKind::hipMemcpyHostToDevice,
+                    self.peer_streams[r].raw(),
+                )
+            };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum HtoD rank {r}: {:?}", rc);
+            }
+        }
+        for r in 0..w {
+            let rc = unsafe { sys::hipStreamSynchronize(self.peer_streams[r].raw()) };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum HtoD sync rank {r}: {:?}", rc);
+            }
+        }
+        Ok(())
+    }
+
+    /// Fallback unpinned bounce for payloads larger than BOUNCE_CHUNK.
+    /// Same algorithm, plain `Vec<f32>` — each memcpy is effectively
+    /// synchronous, but it's a safe path when pinned pool can't hold
+    /// the payload.
+    fn all_reduce_sum_f32_via_host_unpinned(
+        &self,
+        inputs: &[&HipSlice<f32>],
+        outputs: &mut [&mut HipSlice<f32>],
+        n: usize,
+        total_bytes: usize,
+    ) -> Result<()> {
+        let w = self.devices.len();
+        let mut host_bufs: Vec<Vec<f32>> = (0..w).map(|_| vec![0f32; n]).collect();
+        for r in 0..w {
+            let raw = hipdarc::driver::HipDevice::new(self.devices[r].ordinal())
+                .map_err(crate::Error::wrap)?;
+            raw.set_current().map_err(crate::Error::wrap)?;
+            let rc = unsafe {
+                sys::hipMemcpyAsync(
+                    host_bufs[r].as_mut_ptr() as *mut c_void,
+                    inputs[r].device_ptr() as *const c_void,
+                    total_bytes,
+                    sys::hipMemcpyKind::hipMemcpyDeviceToHost,
+                    self.peer_streams[r].raw(),
+                )
+            };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum (unpinned) DtoH rank {r}: {:?}", rc);
+            }
+            let rc = unsafe { sys::hipStreamSynchronize(self.peer_streams[r].raw()) };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum (unpinned) DtoH sync rank {r}: {:?}", rc);
+            }
+        }
+        for r in 1..w {
+            let (head, tail) = host_bufs.split_at_mut(r);
+            let dst = &mut head[0];
+            let src = &tail[0];
+            for i in 0..n {
+                dst[i] += src[i];
+            }
+        }
+        for r in 0..w {
+            let raw = hipdarc::driver::HipDevice::new(self.devices[r].ordinal())
+                .map_err(crate::Error::wrap)?;
+            raw.set_current().map_err(crate::Error::wrap)?;
+            let rc = unsafe {
+                sys::hipMemcpyAsync(
+                    outputs[r].device_ptr() as *mut c_void,
+                    host_bufs[0].as_ptr() as *const c_void,
+                    total_bytes,
+                    sys::hipMemcpyKind::hipMemcpyHostToDevice,
+                    self.peer_streams[r].raw(),
+                )
+            };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum (unpinned) HtoD rank {r}: {:?}", rc);
+            }
+            let rc = unsafe { sys::hipStreamSynchronize(self.peer_streams[r].raw()) };
+            if rc != sys::hipError_t::hipSuccess {
+                crate::bail!("all_reduce_sum (unpinned) HtoD sync rank {r}: {:?}", rc);
+            }
+        }
+        Ok(())
+    }
+
+    /// Thread-safe barrier-based entry to `all_reduce_sum_f32_via_host`.
+    /// Intended for W concurrent worker threads (one per rank) that each
+    /// call this exactly once per collective. Internally:
+    ///
+    /// 1. Each thread publishes its (input_ptr, output_ptr, len) to a
+    ///    shared slot indexed by `rank`.
+    /// 2. All W threads meet at `ar_barrier` (phase 1 wait).
+    /// 3. The leader thread re-materialises the published pointers as
+    ///    `HipSlice<f32>` views and runs the existing single-threaded
+    ///    `all_reduce_sum_f32_via_host`.
+    /// 4. All W threads meet at `ar_barrier` again (phase 2 wait). This
+    ///    guarantees the published borrows are still valid while the
+    ///    leader reads/writes through them.
+    /// 5. The leader clears the published slots before releasing the
+    ///    final barrier, so the next call starts clean.
+    ///
+    /// Preconditions: `rank < world_size()`; all ranks call with equal
+    /// `input.len()`; the live `HipSlice` references remain valid for
+    /// the full duration of the call (the double-barrier ensures this
+    /// even though the leader uses raw pointers internally).
+    pub fn all_reduce_sum_f32_barrier(
+        &self,
+        rank: usize,
+        input: &HipSlice<f32>,
+        output: &mut HipSlice<f32>,
+    ) -> Result<()> {
+        let trace = std::env::var("CANDLE_TP_TRACE").is_ok();
+        if trace {
+            eprintln!("[tp trace] rank={rank} entering barrier, n={}", input.len());
+        }
+        let w = self.devices.len();
+        if rank >= w {
+            crate::bail!("all_reduce_sum_f32_barrier: rank {rank} >= world {w}");
+        }
+        let n = input.len();
+        if output.len() != n {
+            crate::bail!(
+                "all_reduce_sum_f32_barrier: rank {rank} input.len={n} != output.len={}",
+                output.len()
+            );
+        }
+
+        // Phase 0: publish this rank's slot.
+        {
+            let mut st = self.ar_state.lock().unwrap();
+            st[rank] = AllReduceSlot {
+                input_ptr: input.device_ptr() as *const u8,
+                output_ptr: output.device_ptr() as *mut u8,
+                len: n,
+            };
+        }
+
+        // Phase 1: wait for every rank to publish.
+        if trace {
+            eprintln!("[tp trace] rank={rank} waiting barrier-1");
+        }
+        let leader = self.ar_barrier.wait().is_leader();
+        if trace {
+            eprintln!("[tp trace] rank={rank} past barrier-1 leader={leader}");
+        }
+
+        // Phase 2 (leader only): gather the published pointers and run
+        // the single-threaded implementation. Other ranks spin on the
+        // second barrier.
+        //
+        // Save the leader thread's current device first so we can
+        // restore it afterwards — the single-threaded implementation
+        // calls `set_current` across every device and would otherwise
+        // leave the thread pointed at the last rank's device, causing
+        // subsequent kernel launches on this thread to go to the
+        // wrong device.
+        let mut leader_result: Result<()> = Ok(());
+        let saved_dev: Option<i32> = if leader {
+            let mut d: std::os::raw::c_int = 0;
+            let rc = unsafe { sys::hipGetDevice(&mut d as *mut _) };
+            if rc == sys::hipError_t::hipSuccess {
+                Some(d as i32)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if leader {
+            // Read the slots under the lock, then release so errors
+            // can't deadlock.
+            let slots = {
+                let st = self.ar_state.lock().unwrap();
+                st.clone()
+            };
+
+            // Validate: every rank must have published with matching len.
+            let mut all_ok = true;
+            for (r, slot) in slots.iter().enumerate() {
+                if slot.input_ptr.is_null() || slot.output_ptr.is_null() {
+                    leader_result = Err(crate::Error::Msg(format!(
+                        "all_reduce_sum_f32_barrier: rank {r} slot unpublished"
+                    )));
+                    all_ok = false;
+                    break;
+                }
+                if slot.len != n {
+                    leader_result = Err(crate::Error::Msg(format!(
+                        "all_reduce_sum_f32_barrier: rank {r} len {} != rank 0 len {n}",
+                        slot.len
+                    )));
+                    all_ok = false;
+                    break;
+                }
+            }
+
+            if all_ok {
+                // SAFETY: each slot's pointers come from a live
+                // HipSlice<f32> that the contributing rank holds on
+                // its stack frame. That stack frame is still alive
+                // because the contributing thread is blocked on the
+                // second barrier below. `HipSlice::decode_view` uses
+                // the DECODE_ALLOC_SENTINEL so its Drop is a no-op —
+                // we can safely build a non-owning view and hand it
+                // to the single-threaded implementation.
+                let mut inputs: Vec<HipSlice<f32>> = slots
+                    .iter()
+                    .map(|s| unsafe {
+                        HipSlice::<f32>::decode_view(s.input_ptr as *mut _, s.len)
+                    })
+                    .collect();
+                let mut outputs: Vec<HipSlice<f32>> = slots
+                    .iter()
+                    .map(|s| unsafe {
+                        HipSlice::<f32>::decode_view(s.output_ptr as *mut _, s.len)
+                    })
+                    .collect();
+                let input_refs: Vec<&HipSlice<f32>> = inputs.iter().collect();
+                let mut output_refs: Vec<&mut HipSlice<f32>> =
+                    outputs.iter_mut().collect();
+                leader_result =
+                    self.all_reduce_sum_f32_via_host(&input_refs, &mut output_refs);
+                // The views held DECODE_ALLOC_SENTINEL so their Drop is
+                // a no-op; explicit drop just for clarity.
+                drop(inputs);
+                drop(outputs);
+            }
+        }
+
+        // Restore leader's original current device before the second
+        // barrier so this thread resumes with the right HIP context.
+        if leader {
+            if let Some(d) = saved_dev {
+                let raw = hipdarc::driver::HipDevice::new(d as usize)
+                    .map_err(crate::Error::wrap)?;
+                raw.set_current().map_err(crate::Error::wrap)?;
+            }
+        }
+        if trace && leader {
+            eprintln!("[tp trace] rank={rank} leader finished reduce");
+        }
+        // Phase 3: wait for the leader to finish before anyone returns.
+        self.ar_barrier.wait();
+        if trace {
+            eprintln!("[tp trace] rank={rank} past barrier-2 done");
+        }
+
+        // Phase 4 (leader only): clear slots for the next call.
+        if leader {
+            let mut st = self.ar_state.lock().unwrap();
+            for slot in st.iter_mut() {
+                *slot = AllReduceSlot {
+                    input_ptr: std::ptr::null(),
+                    output_ptr: std::ptr::null_mut(),
+                    len: 0,
+                };
+            }
+        }
+
+        leader_result
     }
 
     /// Variable-length all-to-all: each rank sends `send[r]` bytes to

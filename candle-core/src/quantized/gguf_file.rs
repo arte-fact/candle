@@ -533,6 +533,254 @@ impl Content {
         )
     }
 
+    // ---------------------------------------------------------------------
+    // Per-rank tensor range readers (Phase X5)
+    //
+    // These read ONLY a sub-range of a tensor's bytes directly from the
+    // mmap'd blob and materialise a QTensor with the sliced shape. They
+    // exist so that parallel TP/EP workers can load only their shard from
+    // disk, avoiding the "load full → narrow on-device" 2× VRAM spike.
+    //
+    // All range reads are thread-safe (pread-backed) so multiple ranks
+    // can fan out across rayon workers on the same Content/blob.
+    // ---------------------------------------------------------------------
+
+    /// Read a `byte_len`-byte range of `name` starting at `byte_start`
+    /// (tensor-relative) and materialise a QTensor with the provided
+    /// `sliced_dims`. The byte range must be block-aligned
+    /// (`byte_start % type_size == 0`, same for `byte_len`) and the
+    /// product of `sliced_dims` must equal `byte_len / type_size * block_size`.
+    ///
+    /// Use the `tensor_expert_range_from_blob` / `tensor_row_range_from_blob` /
+    /// `tensor_column_range_from_blob` wrappers unless you need raw byte
+    /// slicing.
+    pub fn tensor_range_from_blob(
+        &self,
+        blob: &GgufBlob,
+        name: &str,
+        byte_start: usize,
+        byte_len: usize,
+        sliced_dims: &[usize],
+        device: &Device,
+    ) -> Result<QTensor> {
+        let tensor_info = match self.tensor_infos.get(name) {
+            Some(t) => t,
+            None => crate::bail!("tensor_range_from_blob: unknown tensor {name}"),
+        };
+        let block_size = tensor_info.ggml_dtype.block_size();
+        let type_size = tensor_info.ggml_dtype.type_size();
+        if byte_start % type_size != 0 || byte_len % type_size != 0 {
+            crate::bail!(
+                "tensor_range_from_blob({name}): unaligned range (start={byte_start}, len={byte_len}, type_size={type_size})"
+            );
+        }
+        let full_elems = tensor_info.shape.elem_count();
+        let full_bytes = full_elems / block_size * type_size;
+        if byte_start
+            .checked_add(byte_len)
+            .map_or(true, |end| end > full_bytes)
+        {
+            crate::bail!(
+                "tensor_range_from_blob({name}): [{byte_start}..+{byte_len}) exceeds tensor bytes {full_bytes}"
+            );
+        }
+        let slice_elems: usize = sliced_dims.iter().product();
+        let expected_bytes = slice_elems / block_size * type_size;
+        if expected_bytes != byte_len {
+            crate::bail!(
+                "tensor_range_from_blob({name}): sliced_dims elem_count={slice_elems} ↔ {expected_bytes} bytes, but byte_len={byte_len}"
+            );
+        }
+        let abs_offset = self.tensor_data_offset + tensor_info.offset + byte_start as u64;
+        let raw_data = blob.read_to_vec(abs_offset, byte_len)?;
+        super::ggml_file::qtensor_from_ggml(
+            tensor_info.ggml_dtype,
+            &raw_data,
+            sliced_dims.to_vec(),
+            device,
+        )
+    }
+
+    /// Load only experts `[e_start, e_start + e_count)` from a 3D MoE
+    /// expert tensor of shape `[E, D1, D2]`. Replaces the "load full +
+    /// narrow_experts" pattern, reading only this rank's shard from disk.
+    ///
+    /// Requires `D1 * D2 % block_size == 0` (always true for MoE
+    /// `intermediate × hidden` pairs; checked explicitly).
+    pub fn tensor_expert_range_from_blob(
+        &self,
+        blob: &GgufBlob,
+        name: &str,
+        e_start: usize,
+        e_count: usize,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let info = match self.tensor_infos.get(name) {
+            Some(t) => t,
+            None => crate::bail!("tensor_expert_range_from_blob: unknown tensor {name}"),
+        };
+        let dims = info.shape.dims().to_vec();
+        if dims.len() != 3 {
+            crate::bail!(
+                "tensor_expert_range_from_blob({name}): expected 3D tensor, got shape {:?}",
+                dims
+            );
+        }
+        let (e_total, d1, d2) = (dims[0], dims[1], dims[2]);
+        if e_start
+            .checked_add(e_count)
+            .map_or(true, |end| end > e_total)
+        {
+            crate::bail!(
+                "tensor_expert_range_from_blob({name}): [{e_start}..{end}) out of range num_experts={e_total}",
+                end = e_start + e_count
+            );
+        }
+        let block_size = info.ggml_dtype.block_size();
+        let type_size = info.ggml_dtype.type_size();
+        let per_expert_elems = d1 * d2;
+        if per_expert_elems % block_size != 0 {
+            crate::bail!(
+                "tensor_expert_range_from_blob({name}): per-expert elems {per_expert_elems} not divisible by block_size {block_size}"
+            );
+        }
+        let bytes_per_expert = per_expert_elems / block_size * type_size;
+        let byte_start = e_start * bytes_per_expert;
+        let byte_len = e_count * bytes_per_expert;
+        let sliced_dims = [e_count, d1, d2];
+        self.tensor_range_from_blob(blob, name, byte_start, byte_len, &sliced_dims, device)
+    }
+
+    /// Load only rows `[row_start, row_start + row_count)` from a 2D
+    /// weight tensor of shape `[rows, cols]`. Used for TP row-splits
+    /// (attention Q/K/V, FFN gate/up — i.e. the "output-sharded"
+    /// projections where each rank owns a contiguous head/channel range).
+    ///
+    /// Contiguous in the GGUF byte layout, so this is a single pread.
+    pub fn tensor_row_range_from_blob(
+        &self,
+        blob: &GgufBlob,
+        name: &str,
+        row_start: usize,
+        row_count: usize,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let info = match self.tensor_infos.get(name) {
+            Some(t) => t,
+            None => crate::bail!("tensor_row_range_from_blob: unknown tensor {name}"),
+        };
+        let dims = info.shape.dims().to_vec();
+        if dims.len() != 2 {
+            crate::bail!(
+                "tensor_row_range_from_blob({name}): expected 2D tensor, got shape {:?}",
+                dims
+            );
+        }
+        let (rows, cols) = (dims[0], dims[1]);
+        if row_start
+            .checked_add(row_count)
+            .map_or(true, |end| end > rows)
+        {
+            crate::bail!(
+                "tensor_row_range_from_blob({name}): [{row_start}..{end}) out of range rows={rows}",
+                end = row_start + row_count
+            );
+        }
+        let block_size = info.ggml_dtype.block_size();
+        let type_size = info.ggml_dtype.type_size();
+        if cols % block_size != 0 {
+            crate::bail!(
+                "tensor_row_range_from_blob({name}): cols={cols} not divisible by block_size={block_size}"
+            );
+        }
+        let bytes_per_row = cols / block_size * type_size;
+        let byte_start = row_start * bytes_per_row;
+        let byte_len = row_count * bytes_per_row;
+        let sliced_dims = [row_count, cols];
+        self.tensor_range_from_blob(blob, name, byte_start, byte_len, &sliced_dims, device)
+    }
+
+    /// Load only columns `[col_start, col_start + col_count)` from a 2D
+    /// weight tensor of shape `[rows, cols]`. Used for TP column-splits
+    /// (attention output proj, FFN down — the "input-sharded" projections
+    /// where each rank owns a contiguous intermediate range and an
+    /// all-reduce collapses ranks at the output).
+    ///
+    /// Column slicing is STRIDED in GGUF layout: one pread per row
+    /// contributes `col_count / block_size * type_size` bytes. That's
+    /// `rows` preads per tensor — ~5k pread calls on typical LLM
+    /// weights — small compared to the resulting tensor's byte
+    /// size. mmap + kernel page cache makes this effectively free
+    /// after the first load.
+    ///
+    /// Requires `col_start` and `col_count` to be multiples of
+    /// `block_size` so each row's slice stays block-aligned.
+    pub fn tensor_column_range_from_blob(
+        &self,
+        blob: &GgufBlob,
+        name: &str,
+        col_start: usize,
+        col_count: usize,
+        device: &Device,
+    ) -> Result<QTensor> {
+        let info = match self.tensor_infos.get(name) {
+            Some(t) => t,
+            None => crate::bail!("tensor_column_range_from_blob: unknown tensor {name}"),
+        };
+        let dims = info.shape.dims().to_vec();
+        if dims.len() != 2 {
+            crate::bail!(
+                "tensor_column_range_from_blob({name}): expected 2D tensor, got shape {:?}",
+                dims
+            );
+        }
+        let (rows, cols) = (dims[0], dims[1]);
+        if col_start
+            .checked_add(col_count)
+            .map_or(true, |end| end > cols)
+        {
+            crate::bail!(
+                "tensor_column_range_from_blob({name}): [{col_start}..{end}) out of range cols={cols}",
+                end = col_start + col_count
+            );
+        }
+        let block_size = info.ggml_dtype.block_size();
+        let type_size = info.ggml_dtype.type_size();
+        if col_start % block_size != 0 || col_count % block_size != 0 {
+            crate::bail!(
+                "tensor_column_range_from_blob({name}): col_start={col_start} / col_count={col_count} must be multiples of block_size={block_size}"
+            );
+        }
+        if cols % block_size != 0 {
+            crate::bail!(
+                "tensor_column_range_from_blob({name}): cols={cols} not divisible by block_size={block_size}"
+            );
+        }
+        // Bytes per FULL row (source stride).
+        let full_bytes_per_row = cols / block_size * type_size;
+        // Bytes per SLICED row (destination stride).
+        let slice_bytes_per_row = col_count / block_size * type_size;
+        // Byte offset within each row where the slice starts.
+        let col_byte_off = col_start / block_size * type_size;
+
+        let total_slice_bytes = rows * slice_bytes_per_row;
+        let mut host_buf = vec![0u8; total_slice_bytes];
+        let base_abs = self.tensor_data_offset + info.offset;
+
+        for r in 0..rows {
+            let src_abs = base_abs + (r * full_bytes_per_row + col_byte_off) as u64;
+            let dst_begin = r * slice_bytes_per_row;
+            let dst_end = dst_begin + slice_bytes_per_row;
+            blob.read_into(src_abs, &mut host_buf[dst_begin..dst_end])?;
+        }
+        super::ggml_file::qtensor_from_ggml(
+            info.ggml_dtype,
+            &host_buf,
+            vec![rows, col_count],
+            device,
+        )
+    }
+
     /// Open a (possibly split) GGUF file as a thread-safe `pread`-backed
     /// blob and return the parsed [`Content`] alongside an
     /// [`Arc<GgufBlob>`] that can be shared across worker threads. Tensor

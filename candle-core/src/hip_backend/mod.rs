@@ -25,11 +25,11 @@ pub use device::{HipDevice, DeviceId};
 pub use error::{HipError, WrapErr};
 pub use flash_attn::{flash_attn_decode_strided, flash_attn_decode_strided_split_k, flash_attn_fused, flash_attn_v2_fused, flash_attn_v2_kt_fused, flash_attn_v2_kt_strided_v, flash_attn_v2_kt_strided_v_dyn, gqa_attention_decode_gemv, gqa_attention_decode_mv, gqa_attention_decode_mv_decomposed};
 pub use fused_pointwise::{
-    fused_ffn_decode_q4_0, gelu_mul_quantize_q8_1_fused, gelu_mul_split_last_fused,
+    dot_last_dim_fused, fused_ffn_decode_q4_0, gelu_mul_quantize_q8_1_fused, gelu_mul_split_last_fused,
     gemma4_router_prep_fused, l2_norm_fused, masked_softmax_scale_fused,
     moe_combine_weighted_sum_fused, rms_norm_post_residual_fused, rmsnorm_q8_fused,
     rmsnorm_rope_decode_fused, rmsnorm_rope_decode_fused_out,
-    silu_mul_split_last_fused, softplus_fused,
+    silu_mul_quantize_q8_1_separate_fused, silu_mul_split_last_fused, softplus_fused,
     topk_moe_norm_fused, v_norm_fused, v_norm_fused_out,
 };
 pub use gated_delta_net::gated_delta_net_step_fused;

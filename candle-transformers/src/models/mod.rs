@@ -107,6 +107,8 @@ pub mod quantized_qwen35;
 pub mod quantized_qwen35_moe;
 pub mod quantized_qwen3next;
 pub mod quantized_gemma4;
+#[cfg(feature = "hip")]
+pub mod quantized_gemma4_tp;
 pub mod quantized_recurrent_gemma;
 pub mod quantized_rwkv_v5;
 pub mod quantized_rwkv_v6;

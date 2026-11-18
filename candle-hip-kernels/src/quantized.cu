@@ -3063,6 +3063,70 @@ mul_mat_vec_q8_0_q8_1_cuda1(
     }
 }
 
+// P24: 128-thread variant — one output row per block, 2 warps cooperating.
+// Mirrors llama.cpp's `mul_mat_vec_q<GGML_TYPE_Q8_0, 1, false>` on gfx906
+// where the GCN table_id picks nwarps=2. 4× more threads per row than the
+// 32-thread half-warp variant → better VMEM latency hiding on the block loop.
+// Expected: ~13-15 µs/call vs 20 µs baseline on Qwen3.6 decode shapes.
+//
+// Layout:
+//   Grid  = (nrows_x, 1, 1)
+//   Block = (128, 1, 1)  — two 64-wide waves
+// Each thread handles `blocks_per_row / 128` Q8_0 blocks.
+extern "C" __global__ void __launch_bounds__(128, 1)
+mul_mat_vec_q8_0_q8_1_cuda1_b128(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y;
+
+    const int tid = threadIdx.x;          // 0..127
+    const int row = blockIdx.x;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK8_0;
+    const block_q8_0 * x = (const block_q8_0 *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    for (int ib = tid; ib < blocks_per_row; ib += 128) {
+        const block_q8_0 * bq8_0 = x + ib;
+        const block_q8_1 * bq8_1 = y + ib;
+
+        const int4 v_lo = *((const int4 *)(bq8_0->qs));
+        const int4 v_hi = *((const int4 *)(bq8_0->qs + 16));
+        const int4 u_lo = *((const int4 *)(bq8_1->qs));
+        const int4 u_hi = *((const int4 *)(bq8_1->qs + 16));
+        int sumi = 0;
+        sumi = ggml_cuda_dp4a(v_lo.x, u_lo.x, sumi);
+        sumi = ggml_cuda_dp4a(v_lo.y, u_lo.y, sumi);
+        sumi = ggml_cuda_dp4a(v_lo.z, u_lo.z, sumi);
+        sumi = ggml_cuda_dp4a(v_lo.w, u_lo.w, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.x, u_hi.x, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.y, u_hi.y, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.z, u_hi.z, sumi);
+        sumi = ggml_cuda_dp4a(v_hi.w, u_hi.w, sumi);
+
+        const float d0 = __half2float(bq8_0->d);
+        const float d1 = __low2float(bq8_1->ds);
+        sumf += d0 * d1 * (float) sumi;
+    }
+
+    // Cross-warp reduce: warp-local first (DPP), then 2-entry LDS combine.
+    sumf = gfx906_warp_reduce_sum(sumf);
+    __shared__ float smem[2];
+    const int wave_id = tid >> 6;
+    const int lane_in_wave = tid & 63;
+    if (lane_in_wave == 0) {
+        smem[wave_id] = sumf;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        dst[row] = smem[0] + smem[1];
+    }
+}
+
 // ============================================================================
 // W3-rev2: MoE-aware warp-coop Q8_0 MMVQ (gfx906 occupancy fix)
 // ============================================================================
@@ -3785,6 +3849,46 @@ extern "C" __global__ void mul_mat_vec_q6_K_q8_1_cuda1(
         (vx, vy, dst, ncols_x, nrows_x, nrows_y, nrows_dst);
 }
 
+// T3 (2026-04-20): correct Q6K warp-coop using the canonical
+// `vec_dot_q6_K_q8_1` (not the broken _wc variant with simplified
+// bit-mask unpack). 2 rows/block, 32 threads per row (half-warp).
+// Each thread owns one iqs slot (0..31) and iterates all Q6K blocks
+// in a row, accumulating partial dots, then half-warp DPP reduce.
+// Drop-in replacement for `mul_mat_vec_q6_K_q8_1_cuda1` where the row
+// count is large and 256-thread template under-utilizes.
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_vec_q6_K_q8_1_wc_v2(
+    const void * __restrict__ vx, const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int nrows_y, const int nrows_dst) {
+
+    (void) nrows_y; (void) nrows_dst;
+    const int lane_id = threadIdx.x;
+    const int half_lane = lane_id & 31;              // 0..31 — iqs slot
+    const int row_offset = lane_id >> 5;             // 0 or 1
+    const int row = blockIdx.x * 2 + row_offset;
+    if (row >= nrows_x) return;
+
+    const int blocks_per_row = ncols_x / QK_K;       // QK_K=256
+    const block_q6_K * x = (const block_q6_K *) vx + row * blocks_per_row;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    float sumf = 0.0f;
+    const int iqs = half_lane;                       // 0..31
+    for (int kbx = 0; kbx < blocks_per_row; ++kbx) {
+        const block_q6_K * bx = x + kbx;
+        // Q6K block spans 256 elements → 8 Q8_1 blocks (QK8_1=32 each).
+        const block_q8_1 * by = y + kbx * (QK_K / QK8_1);
+        sumf += vec_dot_q6_K_q8_1(bx, by, iqs);
+    }
+
+    sumf = gfx906_half_warp_reduce_sum_dpp(sumf);
+    if (half_lane == 0) {
+        dst[row] = sumf;
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(64, 1)
 mul_mat_vec_q6_K_q8_1_wc(
     const void * __restrict__ vx, const void * __restrict__ vy,
@@ -4486,6 +4590,70 @@ static __device__ __forceinline__ float gelu_fwd_f32(float x) {
     const float a = x + 0.044715f * x * x * x;
     const float k = 0.7978845608028654f;   // sqrt(2/pi)
     return 0.5f * x * (1.0f + tanhf(k * a));
+}
+
+// P25 (2026-04-19): fused SiLU·up + Q8_1 quantise for MoE down-proj input.
+// Takes SEPARATE gate + up F32 tensors (output of the P21 gate+up fused
+// MMVQ). Writes directly to the block_q8_1 packed layout consumed by
+// `indexed_moe_forward_preq8`. Fuses silu_mul + quantize_q8_1 into a
+// single kernel launch, eliminating the intermediate F32 `activated`
+// tensor and its allocation.
+//
+// Input layout:
+//   gate, up : [batch, topk, inter] row-major F32, SAME shape.
+// Output layout:
+//   vy_q8_1  : block_q8_1 × (inter_padded / QK8_1 × topk × batch).
+//
+// Grid: (inter_padded/QK8_1, topk, batch). Block: (32, 1, 1).
+
+static __device__ __forceinline__ float silu_fwd_f32(float x) {
+    // SiLU / Swish: x * sigmoid(x) = x / (1 + exp(-x)).
+    return x / (1.0f + expf(-x));
+}
+
+extern "C" __global__ void __launch_bounds__(32, 1)
+silu_mul_quantize_q8_1_separate_f32(
+    const float * __restrict__ gate,
+    const float * __restrict__ up,
+    void * __restrict__ vy_q8_1,
+    const int inter,
+    const int inter_padded,
+    const int topk,
+    const int batch
+) {
+    (void) topk; (void) batch;
+    const int j_in_block = threadIdx.x;
+    const int block_x = blockIdx.x;
+    const int topk_slot = blockIdx.y;
+    const int batch_idx = blockIdx.z;
+
+    const int col = block_x * QK8_1 + j_in_block;
+    const int row = batch_idx * gridDim.y + topk_slot;
+
+    float val = 0.0f;
+    if (col < inter) {
+        const float g = gate[row * (size_t) inter + col];
+        const float u = up  [row * (size_t) inter + col];
+        val = silu_fwd_f32(g) * u;
+    }
+
+    float amax = fabsf(val);
+    float sum = val;
+    amax = gfx906_half_warp_reduce_max_dpp(amax);
+    sum = gfx906_half_warp_reduce_sum_dpp(sum);
+
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? (int8_t) 0 : (int8_t) roundf(val / d);
+
+    const int blocks_per_row = inter_padded / QK8_1;
+    block_q8_1 * y = (block_q8_1 *) vy_q8_1;
+    const size_t out_block = (size_t) row * blocks_per_row + block_x;
+
+    y[out_block].qs[j_in_block] = q;
+    if (j_in_block == 0) {
+        reinterpret_cast<half&>(y[out_block].ds.x) = d;
+        reinterpret_cast<half&>(y[out_block].ds.y) = sum;
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(32, 1)
@@ -5518,6 +5686,320 @@ extern "C" __global__ void
  * @param input_task_stride_bytes The stride in bytes to get from one quantized input vector to the next.
  * @param output_task_stride_elems The stride in elements (f32) to get from one output vector to the next.
  */
+// Single-warp variant of indexed_moe_forward — for small blocks_per_row_x
+// cases where the 4-warp kernel leaves ~3 warps entirely idle.
+//
+// Motivation (2026-04-19 rocprof on Qwen3.6-35B decode): the default 4-warp
+// kernel uses 256 threads/block. For Q4_K with hidden=2048 / QK_K=256,
+// `blocks_per_row_x = 8` and the K-loop only engages `blocks_per_row_x *
+// (qi/vdr) = 32` threads — 3 of the 4 warps are idle for the whole call.
+// Dropping to 1 warp = 64 threads cuts per-block waste from ~87% to ~50%
+// and doubles per-CU occupancy (same VGPR footprint, 4× blocks fit).
+//
+// No cross-warp reduction needed (single warp) — just a direct warp-reduce.
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void indexed_moe_forward_nw1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    const int current_batch = blockIdx.y;
+    const int current_topk  = blockIdx.z;
+    const int task_id = current_batch * gridDim.z + current_topk;
+    if (task_id >= gridDim.y * gridDim.z) return;
+
+    const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
+    const unsigned int expert_id = indices[task_id];
+
+    const size_t weight_block_size = sizeof(block_q_t);
+    const size_t input_block_size = sizeof(block_q8_1);
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
+    const size_t output_task_stride_elems = n;
+
+    const void * current_input_ptr  = (const char *)all_inputs  + input_idx * input_task_stride_bytes;
+    const void * current_weight_ptr = (const char *)all_weights + expert_id * weight_expert_stride_bytes;
+    float * current_output_ptr = all_outputs + task_id * output_task_stride_elems;
+
+    // Single-warp: no nwarps, no cross-warp reduce, no shared memory.
+    constexpr int nwarps = 1;
+    constexpr int rows_per_cuda_block = 1;
+
+    const int tid = threadIdx.x;           // threadIdx.y is always 0
+    const int row0 = rows_per_cuda_block * blockIdx.x;
+    if (row0 >= n) return;
+
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+    float tmp = 0.0f;
+    const block_q_t * w = (const block_q_t *) current_weight_ptr;
+    const block_q8_1 * x = (const block_q8_1 *) current_input_ptr;
+
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (tid % (qi / vdr));
+        tmp += vec_dot_q_cuda(&w[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
+    }
+
+    // Single-warp: warp_reduce_sum directly, no LDS needed.
+    tmp = warp_reduce_sum(tmp);
+    if (tid == 0) {
+        current_output_ptr[row0] = tmp;
+    }
+}
+
+// Multi-row variant — each block handles ROWS_PER_BLOCK output rows using
+// a 64-thread single-warp block, with `warp_size / ROWS_PER_BLOCK` lanes
+// per row. Saturates work-per-lane when `blocks_per_row_x * (qi/vdr)` is
+// smaller than 64.
+//
+// ROWS_PER_BLOCK=2: lanes 0-31 → row0, 32-63 → row1. Each half-warp does
+// an independent 32-wide reduction (width=32 in __shfl_xor).
+// ROWS_PER_BLOCK=4: quads of 16 lanes → 4 rows. width=16 reduction.
+//
+// Picked by the Rust dispatcher when nw1 would leave >= half the warp
+// idle (blocks_per_row_x * (qi/vdr) <= 32 → r2; <= 16 → r4).
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda,
+          int ROWS_PER_BLOCK>
+__device__ void indexed_moe_forward_nw1_multi_row(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    static_assert(ROWS_PER_BLOCK == 2 || ROWS_PER_BLOCK == 4,
+                  "ROWS_PER_BLOCK ∈ {2, 4}");
+    constexpr int LANES_PER_ROW = WARP_SIZE / ROWS_PER_BLOCK;
+
+    const int current_batch = blockIdx.y;
+    const int current_topk  = blockIdx.z;
+    const int task_id = current_batch * gridDim.z + current_topk;
+    if (task_id >= gridDim.y * gridDim.z) return;
+
+    const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
+    const unsigned int expert_id = indices[task_id];
+
+    const size_t weight_block_size = sizeof(block_q_t);
+    const size_t input_block_size = sizeof(block_q8_1);
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
+    const size_t output_task_stride_elems = n;
+
+    const void * current_input_ptr  = (const char *)all_inputs  + input_idx * input_task_stride_bytes;
+    const void * current_weight_ptr = (const char *)all_weights + expert_id * weight_expert_stride_bytes;
+    float * current_output_ptr = all_outputs + task_id * output_task_stride_elems;
+
+    const int tid      = threadIdx.x;                  // 0..63
+    const int row_slot = tid / LANES_PER_ROW;          // which row in the block this lane handles
+    const int sub_tid  = tid % LANES_PER_ROW;          // lane within that row's sub-warp
+
+    const int row0 = ROWS_PER_BLOCK * blockIdx.x;
+    const int row  = row0 + row_slot;
+    const bool row_valid = (row < n);
+
+    const int blocks_per_row_x = k / qk;
+    // Active work per sub-warp: LANES_PER_ROW lanes share the K-loop.
+    constexpr int blocks_per_iter_sub = vdr * LANES_PER_ROW / qi;
+
+    float tmp = 0.0f;
+    if (row_valid) {
+        const block_q_t   * w = (const block_q_t *) current_weight_ptr;
+        const block_q8_1  * x = (const block_q8_1 *) current_input_ptr;
+        for (int kbx = sub_tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter_sub) {
+            const int kby = kbx * (qk / QK8_1);
+            const int kqs = vdr * (sub_tid % (qi / vdr));
+            tmp += vec_dot_q_cuda(&w[kbx + row * blocks_per_row_x], &x[kby], kqs);
+        }
+    }
+
+    // Reduce within this lane's sub-warp of size LANES_PER_ROW.
+    // P29: use DPP-fused sub-warp reduce instead of __shfl_xor loop.
+    // ROWS_PER_BLOCK=2 → 32-wide DPP reduce; =4 → 16-wide DPP reduce.
+    if constexpr (ROWS_PER_BLOCK == 2) {
+        tmp = gfx906_half_warp_reduce_sum_dpp(tmp);
+    } else if constexpr (ROWS_PER_BLOCK == 4) {
+        tmp = gfx906_quarter_warp_reduce_sum_dpp(tmp);
+    } else {
+        #pragma unroll
+        for (int m = LANES_PER_ROW / 2; m > 0; m >>= 1) {
+            tmp += __shfl_xor(tmp, m, LANES_PER_ROW);
+        }
+    }
+
+    if (row_valid && sub_tid == 0) {
+        current_output_ptr[row] = tmp;
+    }
+}
+
+// P21 (2026-04-19): dual-weight nw1 variant for MoE routed gate+up.
+// One kernel launch computes BOTH gate_out[row0] and up_out[row0] per block.
+// Reads the shared Q8_1 input row once (amortised across two vec_dots).
+// Saves one HIP kernel-launch pair per MoE layer per token (~5-10 µs each).
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
+__device__ void indexed_moe_forward_gate_up_nw1(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ gate_outputs,
+    float * __restrict__ up_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    const int current_batch = blockIdx.y;
+    const int current_topk  = blockIdx.z;
+    const int task_id = current_batch * gridDim.z + current_topk;
+    if (task_id >= gridDim.y * gridDim.z) return;
+
+    const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
+    const unsigned int expert_id = indices[task_id];
+
+    const size_t weight_block_size = sizeof(block_q_t);
+    const size_t input_block_size = sizeof(block_q8_1);
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
+    const size_t output_task_stride_elems = n;
+
+    const void * current_input_ptr      = (const char *)all_inputs  + input_idx * input_task_stride_bytes;
+    const void * current_gate_w_ptr     = (const char *)gate_weights + expert_id * weight_expert_stride_bytes;
+    const void * current_up_w_ptr       = (const char *)up_weights   + expert_id * weight_expert_stride_bytes;
+    float * current_gate_out_ptr        = gate_outputs + task_id * output_task_stride_elems;
+    float * current_up_out_ptr          = up_outputs   + task_id * output_task_stride_elems;
+
+    constexpr int nwarps = 1;
+    constexpr int rows_per_cuda_block = 1;
+
+    const int tid = threadIdx.x;
+    const int row0 = rows_per_cuda_block * blockIdx.x;
+    if (row0 >= n) return;
+
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter = vdr * nwarps * WARP_SIZE / qi;
+
+    float tmp_gate = 0.0f;
+    float tmp_up   = 0.0f;
+    const block_q_t  * w_gate = (const block_q_t *) current_gate_w_ptr;
+    const block_q_t  * w_up   = (const block_q_t *) current_up_w_ptr;
+    const block_q8_1 * x      = (const block_q8_1 *) current_input_ptr;
+
+    for (int kbx = tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk / QK8_1);
+        const int kqs = vdr * (tid % (qi / vdr));
+        // Both dot products reuse the same x[kby] block (L1-hot after the
+        // first read).
+        tmp_gate += vec_dot_q_cuda(&w_gate[kbx + row0 * blocks_per_row_x], &x[kby], kqs);
+        tmp_up   += vec_dot_q_cuda(&w_up  [kbx + row0 * blocks_per_row_x], &x[kby], kqs);
+    }
+
+    tmp_gate = warp_reduce_sum(tmp_gate);
+    tmp_up   = warp_reduce_sum(tmp_up);
+    if (tid == 0) {
+        current_gate_out_ptr[row0] = tmp_gate;
+        current_up_out_ptr[row0]   = tmp_up;
+    }
+}
+
+// P30: multi-row variant of the gate+up fused nw1 kernel.
+// Mirrors `indexed_moe_forward_nw1_multi_row` but computes BOTH gate and up
+// dot products per lane, amortising the shared Q8_1 input load across both.
+// DPP sub-warp reduce (32-wide for r2, 16-wide for r4).
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda,
+          int ROWS_PER_BLOCK>
+__device__ void indexed_moe_forward_gate_up_nw1_multi_row(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ gate_outputs,
+    float * __restrict__ up_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+
+    static_assert(ROWS_PER_BLOCK == 2 || ROWS_PER_BLOCK == 4,
+                  "ROWS_PER_BLOCK ∈ {2, 4}");
+    constexpr int LANES_PER_ROW = WARP_SIZE / ROWS_PER_BLOCK;
+
+    const int current_batch = blockIdx.y;
+    const int current_topk  = blockIdx.z;
+    const int task_id = current_batch * gridDim.z + current_topk;
+    if (task_id >= gridDim.y * gridDim.z) return;
+
+    const int input_idx = (input_dim1 == 1) ? current_batch : task_id;
+    const unsigned int expert_id = indices[task_id];
+
+    const size_t weight_block_size = sizeof(block_q_t);
+    const size_t input_block_size = sizeof(block_q8_1);
+    const size_t weight_expert_stride_bytes = (size_t)(n * k) / qk * weight_block_size;
+    const size_t input_task_stride_bytes = (size_t)k_padded / QK8_1 * input_block_size;
+    const size_t output_task_stride_elems = n;
+
+    const void * current_input_ptr  = (const char *)all_inputs   + input_idx * input_task_stride_bytes;
+    const void * current_gate_w_ptr = (const char *)gate_weights + expert_id * weight_expert_stride_bytes;
+    const void * current_up_w_ptr   = (const char *)up_weights   + expert_id * weight_expert_stride_bytes;
+    float * current_gate_out_ptr    = gate_outputs + task_id * output_task_stride_elems;
+    float * current_up_out_ptr      = up_outputs   + task_id * output_task_stride_elems;
+
+    const int tid      = threadIdx.x;
+    const int row_slot = tid / LANES_PER_ROW;
+    const int sub_tid  = tid % LANES_PER_ROW;
+
+    const int row0 = ROWS_PER_BLOCK * blockIdx.x;
+    const int row  = row0 + row_slot;
+    const bool row_valid = (row < n);
+
+    const int blocks_per_row_x = k / qk;
+    constexpr int blocks_per_iter_sub = vdr * LANES_PER_ROW / qi;
+
+    float tmp_gate = 0.0f;
+    float tmp_up   = 0.0f;
+    if (row_valid) {
+        const block_q_t  * w_gate = (const block_q_t *) current_gate_w_ptr;
+        const block_q_t  * w_up   = (const block_q_t *) current_up_w_ptr;
+        const block_q8_1 * x      = (const block_q8_1 *) current_input_ptr;
+        for (int kbx = sub_tid / (qi / vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter_sub) {
+            const int kby = kbx * (qk / QK8_1);
+            const int kqs = vdr * (sub_tid % (qi / vdr));
+            tmp_gate += vec_dot_q_cuda(&w_gate[kbx + row * blocks_per_row_x], &x[kby], kqs);
+            tmp_up   += vec_dot_q_cuda(&w_up  [kbx + row * blocks_per_row_x], &x[kby], kqs);
+        }
+    }
+
+    if constexpr (ROWS_PER_BLOCK == 2) {
+        tmp_gate = gfx906_half_warp_reduce_sum_dpp(tmp_gate);
+        tmp_up   = gfx906_half_warp_reduce_sum_dpp(tmp_up);
+    } else {
+        tmp_gate = gfx906_quarter_warp_reduce_sum_dpp(tmp_gate);
+        tmp_up   = gfx906_quarter_warp_reduce_sum_dpp(tmp_up);
+    }
+
+    if (row_valid && sub_tid == 0) {
+        current_gate_out_ptr[row] = tmp_gate;
+        current_up_out_ptr[row]   = tmp_up;
+    }
+}
+
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 __device__ void indexed_moe_forward(
     const void * __restrict__ all_weights,
@@ -5652,7 +6134,213 @@ extern "C" __global__ void indexed_moe_forward_q4k_q8_1(
     const int k_padded,
     const int input_dim1) {
     indexed_moe_forward<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
-        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);     
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q4k_q8_1_nw1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_nw1<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q5k_q8_1_nw1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_nw1<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q6k_q8_1_nw1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_nw1<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q8_0_q8_1_nw1(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n,
+    const int k,
+    const int batch,
+    const int topk,
+    const int k_padded,
+    const int input_dim1) {
+    indexed_moe_forward_nw1<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+// P21 gate+up fused launches. One call computes BOTH outputs for a single
+// (batch, topk) slot — saves one HIP launch vs two separate calls.
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q4k_q8_1_gate_up_nw1(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ gate_outputs,
+    float * __restrict__ up_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_gate_up_nw1<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>
+        (gate_weights, up_weights, all_inputs, indices, gate_outputs, up_outputs,
+         n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q5k_q8_1_gate_up_nw1(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ gate_outputs,
+    float * __restrict__ up_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_gate_up_nw1<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>
+        (gate_weights, up_weights, all_inputs, indices, gate_outputs, up_outputs,
+         n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q8_0_q8_1_gate_up_nw1(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ gate_outputs,
+    float * __restrict__ up_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_gate_up_nw1<QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>
+        (gate_weights, up_weights, all_inputs, indices, gate_outputs, up_outputs,
+         n, k, batch, topk, k_padded, input_dim1);
+}
+
+// P30: multi-row r2 variants of gate+up. Only K-quants (Q4_K/Q5_K/Q6_K) —
+// Q8_0 is not needed (not used for MoE gate/up in our model lineup).
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q4k_q8_1_gate_up_nw1_r2(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ gate_outputs,
+    float * __restrict__ up_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_gate_up_nw1_multi_row<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 2>
+        (gate_weights, up_weights, all_inputs, indices, gate_outputs, up_outputs,
+         n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q5k_q8_1_gate_up_nw1_r2(
+    const void * __restrict__ gate_weights,
+    const void * __restrict__ up_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ gate_outputs,
+    float * __restrict__ up_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_gate_up_nw1_multi_row<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1, 2>
+        (gate_weights, up_weights, all_inputs, indices, gate_outputs, up_outputs,
+         n, k, batch, topk, k_padded, input_dim1);
+}
+
+// -- P14 multi-row variants (r2 = 2 rows per block, r4 = 4 rows per block).
+// Grid_x is halved (r2) / quartered (r4) vs the r1 variants.
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q4k_q8_1_nw1_r2(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_nw1_multi_row<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 2>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q4k_q8_1_nw1_r4(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_nw1_multi_row<QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1, 4>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q5k_q8_1_nw1_r2(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_nw1_multi_row<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1, 2>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q5k_q8_1_nw1_r4(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_nw1_multi_row<QK_K, QI5_K, block_q5_K, VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1, 4>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+indexed_moe_forward_q6k_q8_1_nw1_r2(
+    const void * __restrict__ all_weights,
+    const void * __restrict__ all_inputs,
+    const unsigned int * __restrict__ indices,
+    float * __restrict__ all_outputs,
+    const int n, const int k, const int batch, const int topk,
+    const int k_padded, const int input_dim1) {
+    indexed_moe_forward_nw1_multi_row<QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1, 2>
+        (all_weights, all_inputs, indices, all_outputs, n, k, batch, topk, k_padded, input_dim1);
 }
 
 extern "C" __global__ void indexed_moe_forward_q5k_q8_1(
@@ -7357,6 +8045,283 @@ mul_mat_q5_K_gfx906_v2f_tile32(
     const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
     const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
     mul_mat_q5_K_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// ----------------------------------------------------------------------------
+// Q5_K MMQ v3 — merged accumulators (no sumf_d[] / sumf_m[] intermediates).
+//
+// The original impl_fast keeps `sumf_d[TILE_N]` + `sumf_m[TILE_N]` = 2×TILE_N
+// intermediate floats live across the sub loop, to accumulate per-sub
+// (d-scale, min-scale) partial sums that are combined with `super_d` /
+// `super_dmin` once per super-block. At TILE_N=32 that's 64 VGPRs of
+// intermediates — probably what keeps the compiled kernel at VGPR=192
+// (→ 1 wave/SIMD on gfx906, the measured 3.5× gap vs turbo per MEMORY).
+//
+// v3 folds both partial contributions directly into `sums[c]` on every
+// sub-iter by pre-multiplying `super_d * sc_f` and `super_dmin * m_f`
+// outside the column loop. Same math, different reduction order; bit-
+// different in the last few ULPs.
+//
+// Gated by `CANDLE_Q5K_MMQ_V3=1` via the hip.rs dispatcher. Correctness
+// enforced by hip_q5k_mmq_vgpr_test against the v2f baseline.
+// ----------------------------------------------------------------------------
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q5_K_gfx906_impl_v3(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q5_K * x = (const block_q5_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK_K;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int q8_per_super = QK_K / QK8_1;
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        float super_d = 0.0f, super_dmin = 0.0f;
+        uint8_t sub_sc[8] = {0};
+        uint8_t sub_m[8]  = {0};
+        int qh_word[8] = {0};
+
+        const block_q5_K * bx = nullptr;
+        if (row_valid) {
+            bx = &x[row * blocks_per_row_x + ib];
+            const float2 dmf = __half22float2(bx->dm);
+            super_d    = dmf.x;
+            super_dmin = dmf.y;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                get_scale_min_k4(j, bx->scales, sub_sc[j], sub_m[j]);
+            }
+            const int * qh_ptr = (const int *) bx->qh;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                qh_word[j] = qh_ptr[j];
+            }
+        }
+
+        #pragma unroll
+        for (int sub = 0; sub < q8_per_super; ++sub) {
+            const int il   = sub >> 1;
+            const int half = sub & 1;
+
+            int v[8] = {0};
+            if (row_valid) {
+                const int * ql_ptr = (const int *) (bx->qs + 32 * il);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int ql_word = ql_ptr[j];
+                    const int vl = (half == 0)
+                        ? (ql_word & 0x0F0F0F0F)
+                        : ((ql_word >> 4) & 0x0F0F0F0F);
+                    const int vh = ((qh_word[j] >> sub) << 4) & 0x10101010;
+                    v[j] = vl | vh;
+                }
+            }
+
+            // Pre-combine super-level scales with per-sub scales — the
+            // column loop only needs `d8 * (scd * sumi_d - smm * sumi_y)`.
+            const float scd = super_d    * (float) sub_sc[sub];
+            const float smm = super_dmin * (float) sub_m[sub];
+
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int col = tile_n + c;
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib * q8_per_super + sub];
+                const float d8 = __half2float(__low2half(by->ds));
+                const int * y_packed = (const int *) by->qs;
+                int sumi_d = 0;
+                int sumi_y = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int y_j = y_packed[j];
+                    sumi_d = ggml_cuda_dp4a(v[j], y_j, sumi_d);
+                    sumi_y = ggml_cuda_dp4a(0x01010101, y_j, sumi_y);
+                }
+                sums[c] += d8 * (scd * (float) sumi_d - smm * (float) sumi_y);
+            }
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_q5_K_gfx906_v3_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q5_K_gfx906_impl_v3<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+// ============================================================================
+// Q4_K MMQ (Phase Q3.6.P2)
+// ----------------------------------------------------------------------------
+// gfx906-optimised Q4_K batched matmul — structurally identical to
+// `mul_mat_q5_K_gfx906_impl_fast` but without the `qh` high-bit handling
+// (Q4_K is strict 4-bit vs Q5_K's 5-bit). Used on prefill (b*m >= 9)
+// for Q4_K weights; decode still uses `mul_mat_vec_q4_K_q8_1_cuda` which
+// is already tuned for single-col matmul.
+//
+// Block layout (block_q4_K, 144 B / 256 elements):
+//   half2 dm          super-block d (x) and dmin (y)
+//   uint8_t scales[12] 6-bit packed (8 sub-scales + 8 sub-mins)
+//   uint8_t qs[128]   4-bit quants (2 elements per byte)
+//
+// Per-element value: v = nibble_from_qs   (no qh contribution).
+//
+// The 8 sub-blocks map to Q8_1 blocks `ib*8 .. ib*8+7` of the activation
+// column. For each sub-block `sub ∈ [0,7)`:
+//   il   = sub >> 1         // which 32-byte qs chunk
+//   half = sub & 1          // low (even sub) or high (odd sub) nibbles
+//
+// Correctness is guaranteed by matching llama.cpp's `vec_dot_q4_K_q8_1_impl_mmq`
+// arithmetic bit-for-bit; the only performance tweaks are gfx906-specific
+// (split accumulator + DPP reduction absent here because each thread owns
+// a whole row).
+// ============================================================================
+
+template <int TILE_N>
+static __device__ __forceinline__ void mul_mat_q4_K_gfx906_impl_fast(
+    const void * __restrict__ vx,
+    const void * __restrict__ vy,
+    float * __restrict__ dst,
+    const int ncols_x, const int nrows_x,
+    const int ncols_y, const int nrows_y,
+    const int nrows_dst) {
+
+    const int tile_m = blockIdx.x * WARP_SIZE;
+    const int tile_n = blockIdx.y * TILE_N;
+    const int tid = threadIdx.x;
+    const int row = tile_m + tid;
+    const bool row_valid = (row < nrows_x);
+
+    const block_q4_K * x = (const block_q4_K *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / QK_K;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int q8_per_super = QK_K / QK8_1;  // = 8
+
+    float sums[TILE_N] = {0.0f};
+
+    for (int ib = 0; ib < blocks_per_row_x; ++ib) {
+        float super_d = 0.0f, super_dmin = 0.0f;
+        uint8_t sub_sc[8] = {0};
+        uint8_t sub_m[8]  = {0};
+
+        const block_q4_K * bx = nullptr;
+        if (row_valid) {
+            bx = &x[row * blocks_per_row_x + ib];
+            const float2 dmf = __half22float2(bx->dm);
+            super_d    = dmf.x;
+            super_dmin = dmf.y;
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                get_scale_min_k4(j, bx->scales, sub_sc[j], sub_m[j]);
+            }
+        }
+
+        float sumf_d[TILE_N] = {0.0f};
+        float sumf_m[TILE_N] = {0.0f};
+
+        #pragma unroll
+        for (int sub = 0; sub < q8_per_super; ++sub) {
+            const int il   = sub >> 1;
+            const int half = sub & 1;
+
+            int v[8] = {0};
+            if (row_valid) {
+                const int * ql_ptr = (const int *) (bx->qs + 32 * il);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int ql_word = ql_ptr[j];
+                    // Low or high nibbles as 4 packed 4-bit values. No qh
+                    // merge — Q4_K is flat 4-bit, so v[j] = vl directly.
+                    v[j] = (half == 0)
+                        ? (ql_word & 0x0F0F0F0F)
+                        : ((ql_word >> 4) & 0x0F0F0F0F);
+                }
+            }
+
+            const float sc_f = (float) sub_sc[sub];
+            const float m_f  = (float) sub_m[sub];
+
+            // UNCONDITIONAL col loop (v2f fast path — no per-col bounds
+            // check; OOB cols are zero-padded and written back under
+            // the col<ncols_y guard below).
+            #pragma unroll
+            for (int c = 0; c < TILE_N; ++c) {
+                const int col = tile_n + c;
+                const block_q8_1 * by = &y[col * blocks_per_col_y + ib * q8_per_super + sub];
+                const float d8 = __half2float(__low2half(by->ds));
+                const int * y_packed = (const int *) by->qs;
+                int sumi_d = 0;
+                int sumi_y = 0;
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int y_j = y_packed[j];
+                    sumi_d = ggml_cuda_dp4a(v[j], y_j, sumi_d);
+                    sumi_y = ggml_cuda_dp4a(0x01010101, y_j, sumi_y);
+                }
+                sumf_d[c] += d8 * ((float) sumi_d) * sc_f;
+                sumf_m[c] += d8 * ((float) sumi_y) * m_f;
+            }
+        }
+
+        #pragma unroll
+        for (int c = 0; c < TILE_N; ++c) {
+            sums[c] += super_d * sumf_d[c] - super_dmin * sumf_m[c];
+        }
+    }
+
+    if (!row_valid) return;
+    #pragma unroll
+    for (int c = 0; c < TILE_N; ++c) {
+        const int col = tile_n + c;
+        if (col < ncols_y && row < nrows_dst) {
+            dst[col * nrows_dst + row] = sums[c];
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_q4_K_gfx906_v2f_tile8(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_K_gfx906_impl_fast<8>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_q4_K_gfx906_v2f_tile16(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_K_gfx906_impl_fast<16>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+extern "C" __global__ void __launch_bounds__(64, 1)
+mul_mat_q4_K_gfx906_v2f_tile32(
+    const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    mul_mat_q4_K_gfx906_impl_fast<32>(vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
 // ============================================================================

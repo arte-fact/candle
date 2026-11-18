@@ -97,6 +97,10 @@ impl QKvCache {
         (self.b, self.h_kv, self.t_max, self.d)
     }
 
+    pub fn dev(&self) -> &HipDevice {
+        &self.dev
+    }
+
     /// Quantise + pack an F32 `(B, H_kv, T_new, D)` tensor into the K
     /// slab at `current_seq_len`. Advances `current_seq_len` by `T_new`.
     pub fn append_k(&mut self, src: &Tensor) -> Result<()> {
@@ -128,6 +132,129 @@ impl QKvCache {
         }
         self.current_seq_len += t_new;
         Ok(())
+    }
+
+    /// F2 (2026-04-20): append K with interleaved rope applied inline,
+    /// then append V normally. Saves 1 rope kernel launch per decode
+    /// layer (no separate `rope_i_f32` call before `quantize_q8_0_append_f32`).
+    ///
+    /// `k_pre_rope` is F32 `(B, H_kv, T_new, D)` without rope applied.
+    /// `cos` / `sin` are `(max_seq, D/2)` F32 tables.
+    /// `v` is F32 `(B, H_kv, T_new, D)` (no rope).
+    ///
+    /// Caller must ensure `D` is a power of 2 multiple of QK8_0 and that
+    /// rope_dim == D (full rope). Partial-rope callers should fall back
+    /// to the 2-kernel `rope_i + append` path.
+    pub fn append_with_rope_k(
+        &mut self,
+        k_pre_rope: &Tensor,
+        v: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<()> {
+        let t_new_k = self.append_inner_with_rope(k_pre_rope, cos, sin)?;
+        let t_new_v = self.append_inner(v, /*is_v=*/ true)?;
+        if t_new_k != t_new_v {
+            crate::bail!(
+                "QKvCache::append_with_rope_k: K and V T_new disagree ({t_new_k} vs {t_new_v})"
+            );
+        }
+        self.current_seq_len += t_new_k;
+        Ok(())
+    }
+
+    fn append_inner_with_rope(
+        &mut self,
+        src: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<usize> {
+        let dims = src.dims();
+        if dims.len() != 4 {
+            crate::bail!("append_with_rope_k: expected (B,H,T,D), got {dims:?}");
+        }
+        let (b, h, t_new, d) = (dims[0], dims[1], dims[2], dims[3]);
+        if b != self.b || h != self.h_kv || d != self.d {
+            crate::bail!("append_with_rope_k: shape mismatch");
+        }
+        if src.dtype() != DType::F32 || cos.dtype() != DType::F32 || sin.dtype() != DType::F32 {
+            crate::bail!("append_with_rope_k: all inputs must be F32");
+        }
+        let t_offset = self.current_seq_len;
+        if t_offset + t_new > self.t_max {
+            crate::bail!("append_with_rope_k: overflow");
+        }
+        if t_new == 0 {
+            return Ok(0);
+        }
+
+        let src_contig = src.contiguous()?;
+        let (src_st, src_l) = src_contig.storage_and_layout();
+        let src_hip = match &*src_st {
+            Storage::Hip(s) => s,
+            _ => crate::bail!("append_with_rope_k: src not HIP"),
+        };
+        let src_slice = src_hip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+        let (lo, hi) = src_l.contiguous_offsets().ok_or_else(|| {
+            crate::Error::Msg("append_with_rope_k: src non-contig".into())
+        })?;
+        let src_view = src_slice.slice(lo..hi);
+
+        let (cos_st, cos_l) = cos.storage_and_layout();
+        let cos_hip = match &*cos_st {
+            Storage::Hip(s) => s,
+            _ => crate::bail!("append_with_rope_k: cos not HIP"),
+        };
+        let cos_slice = cos_hip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+        let (clo, chi) = cos_l.contiguous_offsets().ok_or_else(|| {
+            crate::Error::Msg("append_with_rope_k: cos non-contig".into())
+        })?;
+        let cos_view = cos_slice.slice(clo..chi);
+
+        let (sin_st, sin_l) = sin.storage_and_layout();
+        let sin_hip = match &*sin_st {
+            Storage::Hip(s) => s,
+            _ => crate::bail!("append_with_rope_k: sin not HIP"),
+        };
+        let sin_slice = sin_hip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+        let (slo, shi) = sin_l.contiguous_offsets().ok_or_else(|| {
+            crate::Error::Msg("append_with_rope_k: sin non-contig".into())
+        })?;
+        let sin_view = sin_slice.slice(slo..shi);
+
+        let func = self
+            .dev
+            .get_or_load_func("quantize_q8_0_append_rope_i_f32", &kernels::QUANTIZE_KV_Q8)?;
+
+        let cfg = LaunchConfig {
+            grid_dim: ((d / QK8_0) as u32, (h * t_new) as u32, b as u32),
+            block_dim: (QK8_0 as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let b_i = b as i32;
+        let h_i = h as i32;
+        let t_new_i = t_new as i32;
+        let d_i = d as i32;
+        let t_max_i = self.t_max as i32;
+        let t_offset_i = t_offset as i32;
+
+        let mut builder = func.builder();
+        builder.arg(&src_view);
+        builder.arg(&cos_view);
+        builder.arg(&sin_view);
+        builder.arg(&self.k);
+        builder.arg(&b_i);
+        builder.arg(&h_i);
+        builder.arg(&t_new_i);
+        builder.arg(&d_i);
+        builder.arg(&t_max_i);
+        builder.arg(&t_offset_i);
+        unsafe { builder.launch(cfg) }.w()?;
+
+        drop(src_st);
+        drop(cos_st);
+        drop(sin_st);
+        Ok(t_new)
     }
 
     fn append_inner(&mut self, src: &Tensor, is_v: bool) -> Result<usize> {
@@ -553,7 +680,39 @@ pub fn gqa_attention_decode_q8(
     mask: Option<&Tensor>,
     scale: f64,
 ) -> Result<Tensor> {
+    gqa_attention_decode_q8_with_fused_softmax(q, cache, l_k, mask, scale, false)
+}
+
+/// F3 (2026-04-20): variant that lets the caller opt into fused
+/// softmax+scale+mask. Saves ~6 kernel launches per decode attention but
+/// regresses on small B×H×L_q grids (Qwen3.6 MoE path). Callers that know
+/// their arch benefits (Devstral, Qwen3.5-27B, Llama-family dense) pass
+/// `use_fused_softmax=true`. Env override: `CANDLE_Q8_DECODE_SOFTMAX_FUSED={0,1}`.
+pub fn gqa_attention_decode_q8_with_fused_softmax(
+    q: &Tensor,
+    cache: &QKvCache,
+    l_k: usize,
+    mask: Option<&Tensor>,
+    scale: f64,
+    use_fused_softmax: bool,
+) -> Result<Tensor> {
     let scores = gqa_decode_gemv_qk_q8(q, cache, l_k)?;
+    let use_fused = match std::env::var("CANDLE_Q8_DECODE_SOFTMAX_FUSED").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => use_fused_softmax,
+    };
+    if use_fused {
+        if let Ok(scores_c) = scores.contiguous() {
+            if matches!(scores_c.device(), crate::Device::Hip(_))
+                && scores_c.dtype() == crate::DType::F32
+            {
+                if let Ok(p) = super::masked_softmax_scale_fused(&scores_c, mask, scale) {
+                    return gqa_decode_gemv_v_q8(&p, cache, l_k);
+                }
+            }
+        }
+    }
     let scaled = scores.affine(scale, 0.0)?;
     let masked = match mask {
         Some(m) => scaled.broadcast_add(m)?,
@@ -564,4 +723,278 @@ pub fn gqa_attention_decode_q8(
     let sum = e.sum_keepdim(crate::D::Minus1)?;
     let p = e.broadcast_div(&sum)?;
     gqa_decode_gemv_v_q8(&p, cache, l_k)
+}
+
+/// Fused Q·K + online-softmax + V·attn over a Q8_0 KV cache in a SINGLE
+/// kernel launch. Output shape `(B, H_q, 1, D)` F32.
+///
+/// This is the single-launch drop-in replacement for
+/// `gqa_attention_decode_q8` (which decomposes into 7 kernels) and for
+/// the dequant → `gqa_decode_mv_fast_d{256,512}_f32` chain. Designed
+/// for gemma4 decode where the dequant path uses a fused F32 kernel; the
+/// decomposed Q8 chain regresses, so we need the fusion AND the Q8
+/// bandwidth savings.
+///
+/// Supported `head_dim`: 128, 256, 512.
+///
+/// - `q`: (B, H_q, 1, D) F32, contiguous.
+/// - `cache`: packed Q8_0 KV.
+/// - `l_k`: effective K/V sequence length to iterate (≤ `cache.current_seq_len`).
+/// - `mask`: optional additive F32 of shape broadcastable to (B, H_q, 1, L_k).
+///   In practice for decode gemma4 it's `(1, 1, 1, L_k)` — see
+///   `mask_b_stride` handling below.
+/// - `scale`: softmax scale (e.g. 1/sqrt(D)).
+pub fn gqa_decode_mv_fast_q8(
+    q: &Tensor,
+    cache: &QKvCache,
+    l_k: usize,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor> {
+    let dims = q.dims();
+    if dims.len() != 4 || dims[2] != 1 {
+        crate::bail!("gqa_decode_mv_fast_q8: q must be (B, H_q, 1, D), got {dims:?}");
+    }
+    let (b, h_q, _, d) = (dims[0], dims[1], dims[2], dims[3]);
+    let (cb, h_kv, t_max, cd) = cache.dims();
+    if cb != b || cd != d {
+        crate::bail!(
+            "gqa_decode_mv_fast_q8: shape mismatch (q {dims:?} vs cache B={cb} D={cd})"
+        );
+    }
+    if h_q % h_kv != 0 {
+        crate::bail!("gqa_decode_mv_fast_q8: H_q ({h_q}) not a multiple of H_kv ({h_kv})");
+    }
+    if l_k > cache.current_seq_len() {
+        crate::bail!(
+            "gqa_decode_mv_fast_q8: L_k={l_k} > cache.current_seq_len={}",
+            cache.current_seq_len()
+        );
+    }
+    if !matches!(d, 128 | 256 | 512) {
+        crate::bail!("gqa_decode_mv_fast_q8: unsupported D={d} (need 128, 256, 512)");
+    }
+    if q.dtype() != DType::F32 {
+        crate::bail!("gqa_decode_mv_fast_q8: q dtype must be F32");
+    }
+    let n_rep = (h_q / h_kv) as i32;
+
+    let q_contig = q.contiguous()?;
+    let (q_st, q_l) = q_contig.storage_and_layout();
+    let q_hip = match &*q_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("gqa_decode_mv_fast_q8: q must be on HIP"),
+    };
+    let q_slice = q_hip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+    let (lo, hi) = q_l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("q not contiguous".into()))?;
+    let q_view = q_slice.slice(lo..hi);
+
+    // Mask is optional; when present, it's contiguous (1,1,1,L_k) in the
+    // caller. We expose `mask_b_stride` = L_k for each batch.
+    let mask_contig = match mask {
+        Some(m) => Some(m.contiguous()?),
+        None => None,
+    };
+    let mask_sl = mask_contig.as_ref().map(|mc| mc.storage_and_layout());
+    let (mask_view_opt, mask_b_stride_i) = if let (Some(mc), Some((ms, ml))) =
+        (mask_contig.as_ref(), mask_sl.as_ref())
+    {
+        let mhip = match &**ms {
+            Storage::Hip(s) => s,
+            _ => crate::bail!("gqa_decode_mv_fast_q8: mask must be on HIP"),
+        };
+        let slice = mhip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+        let (mlo, mhi) = ml
+            .contiguous_offsets()
+            .ok_or_else(|| crate::Error::Msg("mask not contiguous".into()))?;
+        let b_stride = if mc.dim(0)? == b { l_k as i32 } else { 0 };
+        (Some(slice.slice(mlo..mhi)), b_stride)
+    } else {
+        (None, 0)
+    };
+
+    let out_len = b * h_q * d;
+    // SAFETY: kernel writes every element of `out`.
+    let out = unsafe { cache.dev.alloc::<f32>(out_len)? };
+
+    // P10 dp4a: env-selectable dp4a Q·K variant (D ∈ {256, 512} only —
+    // D=128 has F_PER_LANE=2 which can't pack into int32 for dp4a).
+    let want_dp4a = matches!(d, 256 | 512)
+        && std::env::var("CANDLE_Q8_ATTN_DP4A").ok().as_deref() == Some("1");
+    let kn = match (d, want_dp4a) {
+        (128, _)    => "gqa_decode_mv_fast_q8_d128_f32",
+        (256, false) => "gqa_decode_mv_fast_q8_d256_f32",
+        (256, true)  => "gqa_decode_mv_fast_q8_dp4a_d256_f32",
+        (512, false) => "gqa_decode_mv_fast_q8_d512_f32",
+        (512, true)  => "gqa_decode_mv_fast_q8_dp4a_d512_f32",
+        _ => unreachable!(),
+    };
+    let func = cache
+        .dev
+        .get_or_load_func(kn, &kernels::ATTN_Q8_KV)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, h_q as u32, b as u32),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let l_k_i = l_k as i32;
+    let t_max_i = t_max as i32;
+    let h_q_i = h_q as i32;
+    let h_kv_i = h_kv as i32;
+    let scale_f = scale as f32;
+    let l_k_iter_i: i32 = -1; // -1 means "use l_k directly"
+
+    let mut builder = func.builder();
+    builder.arg(&q_view);
+    builder.arg(cache.k_slab());
+    builder.arg(cache.v_slab());
+    match mask_view_opt.as_ref() {
+        Some(mv) => builder.arg(mv),
+        None => builder.arg(&hipdarc::driver::NullDevicePtr::default()),
+    };
+    builder.arg(&out);
+    builder.arg(&h_q_i);
+    builder.arg(&h_kv_i);
+    builder.arg(&l_k_i);
+    builder.arg(&t_max_i);
+    builder.arg(&scale_f);
+    builder.arg(&n_rep);
+    builder.arg(&mask_b_stride_i);
+    builder.arg(&l_k_iter_i);
+    // SAFETY: shapes validated; kernel fully writes `out`.
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(q_st);
+
+    let storage = HipStorage::wrap_hip_slice(out, cache.dev.clone());
+    Ok(Tensor::from_storage(
+        Storage::Hip(storage),
+        Shape::from((b, h_q, 1, d)),
+        crate::op::BackpropOp::none(),
+        /* is_variable */ false,
+    ))
+}
+
+/// F4-M1: LDS-tile-Q fused Q8-KV attention wrapper. Launches
+/// `gqa_decode_fattn_tile_q8_d128_n4_f32` (D=128, NCOLS=4).
+/// Panics if unsupported (D,n_rep) combination — M1 only supports one shape.
+/// Correctness-only. Not wired into any model. See DESIGN-F4-Q8-FATTN-TILE.
+pub fn gqa_decode_fattn_tile_q8(
+    q: &Tensor,
+    cache: &QKvCache,
+    l_k: usize,
+    mask: Option<&Tensor>,
+    scale: f64,
+) -> Result<Tensor> {
+    let dims = q.dims();
+    if dims.len() != 4 || dims[2] != 1 {
+        crate::bail!("fattn_tile_q8: q must be (B, H_q, 1, D), got {dims:?}");
+    }
+    let (b, h_q, _, d) = (dims[0], dims[1], dims[2], dims[3]);
+    let (cb, h_kv, t_max, cd) = cache.dims();
+    if cb != b || cd != d {
+        crate::bail!("fattn_tile_q8: shape mismatch");
+    }
+    if h_q % h_kv != 0 {
+        crate::bail!("fattn_tile_q8: H_q not multiple of H_kv");
+    }
+    let n_rep = h_q / h_kv;
+    if d != 128 || n_rep != 4 {
+        crate::bail!("fattn_tile_q8 M1: only D=128 n_rep=4 (got D={d} n_rep={n_rep})");
+    }
+    if l_k > cache.current_seq_len() {
+        crate::bail!("fattn_tile_q8: L_k > cache.current_seq_len");
+    }
+    if q.dtype() != DType::F32 {
+        crate::bail!("fattn_tile_q8: q dtype must be F32");
+    }
+
+    let q_contig = q.contiguous()?;
+    let (q_st, q_l) = q_contig.storage_and_layout();
+    let q_hip = match &*q_st {
+        Storage::Hip(s) => s,
+        _ => crate::bail!("fattn_tile_q8: q must be on HIP"),
+    };
+    let q_slice = q_hip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+    let (lo, hi) = q_l
+        .contiguous_offsets()
+        .ok_or_else(|| crate::Error::Msg("q not contiguous".into()))?;
+    let q_view = q_slice.slice(lo..hi);
+
+    let mask_contig = match mask {
+        Some(m) => Some(m.contiguous()?),
+        None => None,
+    };
+    let mask_sl = mask_contig.as_ref().map(|mc| mc.storage_and_layout());
+    let (mask_view_opt, mask_b_stride_i) = if let (Some(mc), Some((ms, ml))) =
+        (mask_contig.as_ref(), mask_sl.as_ref())
+    {
+        let mhip = match &**ms {
+            Storage::Hip(s) => s,
+            _ => crate::bail!("fattn_tile_q8: mask must be on HIP"),
+        };
+        let slice = mhip.as_hip_slice::<f32>().map_err(crate::Error::wrap)?;
+        let (mlo, mhi) = ml
+            .contiguous_offsets()
+            .ok_or_else(|| crate::Error::Msg("mask not contiguous".into()))?;
+        let b_stride = if mc.dim(0)? == b { l_k as i32 } else { 0 };
+        (Some(slice.slice(mlo..mhi)), b_stride)
+    } else {
+        (None, 0)
+    };
+
+    let out_len = b * h_q * d;
+    // SAFETY: kernel writes every element.
+    let out = unsafe { cache.dev.alloc::<f32>(out_len)? };
+
+    let func = cache.dev.get_or_load_func(
+        "gqa_decode_fattn_tile_q8_d128_n4_f32",
+        &kernels::ATTN_Q8_KV,
+    )?;
+
+    // Block: 256 threads (4 warps × 64 lanes). Grid: (1, H_kv, B).
+    let cfg = LaunchConfig {
+        grid_dim: (1, h_kv as u32, b as u32),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let l_k_i = l_k as i32;
+    let t_max_i = t_max as i32;
+    let h_q_i = h_q as i32;
+    let h_kv_i = h_kv as i32;
+    let scale_f = scale as f32;
+    let n_rep_i = n_rep as i32;
+
+    let mut builder = func.builder();
+    builder.arg(&q_view);
+    builder.arg(cache.k_slab());
+    builder.arg(cache.v_slab());
+    match mask_view_opt.as_ref() {
+        Some(mv) => builder.arg(mv),
+        None => builder.arg(&hipdarc::driver::NullDevicePtr::default()),
+    };
+    builder.arg(&out);
+    builder.arg(&h_q_i);
+    builder.arg(&h_kv_i);
+    builder.arg(&l_k_i);
+    builder.arg(&t_max_i);
+    builder.arg(&scale_f);
+    builder.arg(&n_rep_i);
+    builder.arg(&mask_b_stride_i);
+    unsafe { builder.launch(cfg) }.w()?;
+
+    drop(q_st);
+
+    let storage = HipStorage::wrap_hip_slice(out, cache.dev.clone());
+    Ok(Tensor::from_storage(
+        Storage::Hip(storage),
+        Shape::from((b, h_q, 1, d)),
+        crate::op::BackpropOp::none(),
+        /* is_variable */ false,
+    ))
 }

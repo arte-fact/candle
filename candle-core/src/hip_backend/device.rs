@@ -29,10 +29,13 @@ pub struct ModuleStore {
 pub struct HipDevice {
     id: DeviceId,
     ordinal: usize,
+    // P33 triage: blas (rocBLAS handle) must drop BEFORE stream/blas_stream
+    // so `rocblas_destroy_handle` sees a still-valid HIP context for its
+    // stream-order allocator cleanup. Rust drops fields in declaration order.
+    pub(crate) blas: Arc<std::sync::OnceLock<RocBlas>>,
     stream: Arc<HipStream>,
     modules: Arc<RwLock<ModuleStore>>,
     custom_modules: Arc<RwLock<HashMap<String, Arc<HipModule>>>>,
-    pub(crate) blas: Arc<std::sync::OnceLock<RocBlas>>,
     blas_stream: Arc<HipStream>,
     // CPU-based RNG: generate on host, upload to device. hiprand/rocrand
     // segfaults on some ROCm installations so we avoid it entirely.

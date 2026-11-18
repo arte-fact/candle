@@ -7,6 +7,7 @@ extern crate accelerate_src;
 use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
+use candle::quantized::tokenizer::TokenizerFromGguf;
 
 use candle::quantized::{ggml_file, gguf_file};
 use candle::Tensor;
@@ -304,7 +305,8 @@ struct Args {
     force_dmmv: bool,
 
     /// Number of GPUs for layer-split parallelism (default: 1).
-    #[arg(long, default_value_t = 1)]
+    /// Alias `--n-gpus` matches the other candle binaries (quantized-qwen35/gemma4).
+    #[arg(long = "num-gpus", alias = "n-gpus", default_value_t = 1)]
     num_gpus: usize,
 }
 
@@ -485,6 +487,9 @@ fn main() -> anyhow::Result<()> {
         (candle_examples::device(args.cpu)?, None)
     };
 
+    // Hold a tokenizer extracted from GGUF metadata (if any) so main can
+    // prefer it over the HF-hub download that `Args::tokenizer` does.
+    let mut gguf_tokenizer: Option<Tokenizer> = None;
     let mut model = match model_path.extension().and_then(|v| v.to_str()) {
         Some("gguf") => {
             let model = gguf_file::Content::read(&mut file).map_err(|e| e.with_path(model_path))?;
@@ -500,6 +505,19 @@ fn main() -> anyhow::Result<()> {
                 &format_size(total_size_in_bytes),
                 start.elapsed().as_secs_f32(),
             );
+            // Try to extract the embedded tokenizer before handing off the
+            // Content (from_gguf/from_gguf_sharded consume it).
+            if args.tokenizer.is_none() {
+                match Tokenizer::from_gguf(&model) {
+                    Ok(t) => {
+                        println!("reading tokenizer from GGUF metadata...");
+                        gguf_tokenizer = Some(t);
+                    }
+                    Err(_) => {
+                        // No embedded tokenizer — fall back to --which HF lookup.
+                    }
+                }
+            }
             match &gpu_devices {
                 Some(devices) => ModelWeights::from_gguf_sharded(model, &mut file, devices)?,
                 None => ModelWeights::from_gguf(model, &mut file, &device)?,
@@ -553,7 +571,10 @@ fn main() -> anyhow::Result<()> {
     };
     println!("model built");
 
-    let tokenizer = args.tokenizer()?;
+    let tokenizer = match gguf_tokenizer {
+        Some(t) => t,
+        None => args.tokenizer()?,
+    };
     let mut tos = TokenOutputStream::new(tokenizer);
     let prompt = match args.prompt.as_deref() {
         Some("chat") => Prompt::Chat,
